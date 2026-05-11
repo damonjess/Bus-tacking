@@ -76,6 +76,7 @@ public class MainActivity extends Activity {
     private String geolocationOrigin;
     private boolean busTrackingReceiverRegistered;
     private SpeechRecognizer speechRecognizer;
+    private LocationListener arLocationListener;
     private String activeRouteFilter = "";
     private boolean arModeEnabled;
 
@@ -568,12 +569,27 @@ public class MainActivity extends Activity {
     }
 
     private AnimatedBusMarker findActiveBusMarker(String route) {
+        String normalizedRoute = normalizeRouteSearch(route);
+        if (normalizedRoute.isEmpty()) {
+            return null;
+        }
         for (AnimatedBusMarker marker : trackedBusMarkers.values()) {
-            if (marker.label.equalsIgnoreCase(route)) {
+            String normalizedLabel = normalizeRouteSearch(marker.label);
+            if (normalizedLabel.equals(normalizedRoute)
+                    || normalizedLabel.contains(normalizedRoute)
+                    || routeNumberTokenMatches(normalizedLabel, normalizedRoute)) {
                 return marker;
             }
         }
         return null;
+    }
+
+    private boolean routeNumberTokenMatches(String normalizedLabel, String normalizedRoute) {
+        return normalizedLabel.matches(".*(^|[^0-9])" + normalizedRoute + "([^0-9]|$).*");
+    }
+
+    private String normalizeRouteSearch(String value) {
+        return value == null ? "" : value.toLowerCase(Locale.UK).trim();
     }
 
     private void applyVoiceRouteFilter(String spokenText) {
@@ -789,7 +805,7 @@ public class MainActivity extends Activity {
                 + "window.__bodsRouteFilter='" + escapedRoute + "';"
                 + "Object.keys(window.__bodsMarkers||{}).forEach(function(key){"
                 + "var marker=window.__bodsMarkers[key];var route=(marker.dataset.route||marker.textContent||'').trim();"
-                + "marker.style.display=(!window.__bodsRouteFilter||route.toLowerCase()===window.__bodsRouteFilter.toLowerCase())?'flex':'none';"
+                + "marker.style.display=(!window.__bodsRouteFilter||route.toLowerCase().indexOf(window.__bodsRouteFilter.toLowerCase())!==-1)?'flex':'none';"
                 + "});"
                 + "return true;})();";
         webView.evaluateJavascript(script, ignored -> {
@@ -823,11 +839,57 @@ public class MainActivity extends Activity {
                 ? getBestLastKnownLocation((LocationManager) getSystemService(Context.LOCATION_SERVICE))
                 : null);
         arBusStopView.startAr();
+        startArLocationUpdates();
         bringNativeControlsToFront();
+    }
+
+    @SuppressLint("MissingPermission")
+    private void startArLocationUpdates() {
+        if (!hasLocationPermission() || arLocationListener != null) {
+            return;
+        }
+        LocationManager locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+        Criteria criteria = new Criteria();
+        criteria.setAccuracy(Criteria.ACCURACY_FINE);
+        String provider = locationManager.getBestProvider(criteria, true);
+        if (provider == null) {
+            return;
+        }
+        arLocationListener = new LocationListener() {
+            @Override
+            public void onLocationChanged(Location location) {
+                if (arModeEnabled) {
+                    arBusStopView.showStopsNear(location);
+                }
+            }
+
+            @Override
+            public void onStatusChanged(String provider, int status, Bundle extras) {
+            }
+
+            @Override
+            public void onProviderEnabled(String provider) {
+            }
+
+            @Override
+            public void onProviderDisabled(String provider) {
+            }
+        };
+        locationManager.requestLocationUpdates(provider, 1_000L, 1f, arLocationListener);
+    }
+
+    private void stopArLocationUpdates() {
+        if (arLocationListener == null) {
+            return;
+        }
+        LocationManager locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+        locationManager.removeUpdates(arLocationListener);
+        arLocationListener = null;
     }
 
     private void showStandardMap() {
         arModeEnabled = false;
+        stopArLocationUpdates();
         arBusStopView.destroyAr();
         arBusStopView.setVisibility(View.GONE);
         webView.setVisibility(View.VISIBLE);
@@ -969,7 +1031,7 @@ public class MainActivity extends Activity {
                         + "marker.dataset.lng=%f;marker.dataset.lat=%f;marker.dataset.bearing=%f;"
                         + "marker.dataset.lastSeen='%s';marker.title='Route %s\\nLast seen: %s\\nOccupancy: '+occupancy;"
                         + "marker.onclick=function(event){if(event)event.stopPropagation();if(window.BusMarkerBridge){window.BusMarkerBridge.showBusDetails('%s',marker.dataset.lastSeen,marker.dataset.occupancy,marker.dataset.lat,marker.dataset.lng);}};"
-                        + "if(window.__bodsRouteFilter){marker.style.display=(marker.dataset.route.toLowerCase()===window.__bodsRouteFilter.toLowerCase())?'flex':'none';}"
+                        + "if(window.__bodsRouteFilter){marker.style.display=(marker.dataset.route.toLowerCase().indexOf(window.__bodsRouteFilter.toLowerCase())!==-1)?'flex':'none';}"
                         + "window.__bodsPlaceMarker=function(m){var p=map.project([parseFloat(m.dataset.lng),parseFloat(m.dataset.lat)]);m.style.left=p.x+'px';m.style.top=p.y+'px';m.style.transform='rotate('+parseFloat(m.dataset.bearing)+'deg)';};"
                         + "window.__bodsPlaceMarker(marker);"
                         + "if(!window.__bodsMarkersListening){window.__bodsMarkersListening=true;var update=function(){Object.keys(window.__bodsMarkers).forEach(function(key){window.__bodsPlaceMarker(window.__bodsMarkers[key]);});};map.on&&map.on('move',update);map.on&&map.on('zoom',update);map.on&&map.on('resize',update);}"

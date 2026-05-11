@@ -18,6 +18,10 @@ val bodsBoundingBox = providers.gradleProperty("BODS_BOUNDING_BOX")
     .orElse(providers.environmentVariable("BODS_BOUNDING_BOX"))
     .orElse("")
     .get()
+val googleDirectionsApiKey = providers.gradleProperty("GOOGLE_DIRECTIONS_API_KEY")
+    .orElse(providers.environmentVariable("GOOGLE_DIRECTIONS_API_KEY"))
+    .orElse("")
+    .get()
 
 android {
     namespace = "org.bustimes.app"
@@ -25,7 +29,7 @@ android {
 
     defaultConfig {
         applicationId = "org.bustimes.app"
-        minSdk = 23
+        minSdk = 24
         targetSdk = 36
         versionCode = 1
         versionName = "1.0.0"
@@ -33,9 +37,15 @@ android {
         buildConfigField("String", "BODS_API_KEY", "\"${bodsApiKey.escapeForBuildConfig()}\"")
         buildConfigField("String", "BODS_API_BASE_URL", "\"${bodsApiBaseUrl.escapeForBuildConfig()}\"")
         buildConfigField("String", "BODS_BOUNDING_BOX", "\"${bodsBoundingBox.escapeForBuildConfig()}\"")
+        buildConfigField("String", "GOOGLE_DIRECTIONS_API_KEY", "\"${googleDirectionsApiKey.escapeForBuildConfig()}\"")
     }
 
     buildFeatures {
         buildConfig = true
     }
+}
+
+
+dependencies {
+    implementation("com.google.ar:core:1.48.0")
 }

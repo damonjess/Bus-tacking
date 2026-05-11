@@ -13,6 +13,7 @@ import android.graphics.SurfaceTexture;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
+import android.hardware.GeomagneticField;
 import android.hardware.SensorManager;
 import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
@@ -20,6 +21,7 @@ import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
 import android.location.Location;
+import android.net.Uri;
 import android.os.Build;
 import android.util.AttributeSet;
 import android.view.Gravity;
@@ -29,12 +31,26 @@ import android.view.ViewGroup;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class ArBusStopView extends FrameLayout implements SensorEventListener {
+    private static final float SCUNTHORPE_DECLINATION_DEGREES_EAST = 2.5f;
+    private static final float GPS_LOCK_ACCURACY_METERS = 10f;
+    private static final float REROUTE_THRESHOLD_METERS = 5f;
+    private static final int MAX_DIRECTIONS_POINTS = 160;
+
     private final TextureView cameraPreview;
     private final TextView statusView;
     private final PathOverlayView pathOverlayView;
@@ -43,6 +59,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
     private final Sensor rotationSensor;
     private final Sensor accelerometerSensor;
     private final Sensor magneticSensor;
+    private final ExecutorService directionsExecutor = Executors.newSingleThreadExecutor();
     private CameraDevice cameraDevice;
     private CameraCaptureSession captureSession;
     private String routeFilter = "";
@@ -56,6 +73,9 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
     private boolean cameraRequested;
     private Location userLocation;
     private NavigationTarget navigationTarget;
+    private long lastDirectionsRequestMs;
+    private boolean gpsLocked;
+    private boolean arCoreDepthReady;
 
     public ArBusStopView(Context context) {
         this(context, null);
@@ -110,6 +130,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
 
     public void startAr() {
         cameraRequested = true;
+        initializeArCoreDepthAndPlaneDetection();
         startCompass();
         if (cameraPreview.isAvailable()) {
             openCamera();
@@ -135,24 +156,41 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
     public void setNavigationTarget(String name, double latitude, double longitude) {
         navigationTarget = new NavigationTarget(name, latitude, longitude);
         pathOverlayView.setTarget(navigationTarget);
-        updateStatus("AR wayfinding path locked to " + name + " — follow the glowing pavement line.");
+        updateStatus("AR wayfinding path locked to " + name + " — follow the glowing pavement ribbon.");
+        requestWalkingRouteIfReady(true);
     }
 
     public void clearNavigationTarget() {
         navigationTarget = null;
         pathOverlayView.setTarget(null);
+        pathOverlayView.setRoute(Collections.emptyList());
         renderPins();
     }
 
     public void showStopsNear(Location location) {
-        userLocation = smoothLocation(userLocation, location, 0.22f);
-        pathOverlayView.setUserLocation(userLocation);
-        stopPins.clear();
-        if (userLocation == null) {
-            updateStatus("Location-Based AR active — enable location to find nearby bus stops.");
+        gpsLocked = location != null && (!location.hasAccuracy() || location.getAccuracy() <= GPS_LOCK_ACCURACY_METERS);
+        if (!gpsLocked) {
+            userLocation = location;
+            pathOverlayView.setUserLocation(null);
+            pathOverlayView.setCalibrating(true);
+            stopPins.clear();
+            String message = location == null
+                    ? "Calibrating… waiting for GPS lock before placing AR stops."
+                    : String.format(Locale.UK, "Calibrating… GPS accuracy %.0fm. Hold still until it is under %.0fm.",
+                            location.getAccuracy(), GPS_LOCK_ACCURACY_METERS);
+            updateStatus(message);
             renderPins();
             return;
         }
+
+        userLocation = smoothLocation(userLocation, location, 0.22f);
+        if (navigationTarget == null) {
+            updateStatus("Location-Based AR active — GPS locked, rotation-vector heading corrected to true north.");
+        }
+        pathOverlayView.setCalibrating(false);
+        pathOverlayView.setUserLocation(userLocation);
+        requestWalkingRouteIfReady(false);
+        stopPins.clear();
 
         stopPins.add(new BusStopPin("Nearest stop", firstRoute(), userLocation.getLatitude() + 0.00045,
                 userLocation.getLongitude() + 0.00025));
@@ -184,6 +222,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         if (Float.isNaN(rawBearing)) {
             return;
         }
+        rawBearing = trueNorthBearing(rawBearing);
         compassBearing = lowPassBearing(rawBearing, compassBearing, 0.12f);
         smoothedCompassBearing = lerpBearing(smoothedCompassBearing, compassBearing, 0.18f);
         pathOverlayView.setBearing(smoothedCompassBearing);
@@ -199,7 +238,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             return;
         }
         if (rotationSensor != null) {
-            sensorManager.registerListener(this, rotationSensor, SensorManager.SENSOR_DELAY_UI);
+            sensorManager.registerListener(this, rotationSensor, SensorManager.SENSOR_DELAY_GAME);
         } else {
             if (accelerometerSensor != null) {
                 sensorManager.registerListener(this, accelerometerSensor, SensorManager.SENSOR_DELAY_UI);
@@ -336,6 +375,9 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         while (getChildCount() > 3) {
             removeViewAt(3);
         }
+        if (!gpsLocked) {
+            return;
+        }
         int visiblePins = 0;
         for (BusStopPin pin : stopPins) {
             if (!routeFilter.isEmpty() && !pin.route.equalsIgnoreCase(routeFilter)) {
@@ -388,6 +430,218 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         }
         SensorManager.getOrientation(rotationMatrix, orientation);
         return (float) ((Math.toDegrees(orientation[0]) + 360.0) % 360.0);
+    }
+
+
+    private float trueNorthBearing(float magneticBearing) {
+        return (magneticBearing + magneticDeclination() + 360f) % 360f;
+    }
+
+    private float magneticDeclination() {
+        if (userLocation == null) {
+            return SCUNTHORPE_DECLINATION_DEGREES_EAST;
+        }
+        GeomagneticField field = new GeomagneticField(
+                (float) userLocation.getLatitude(),
+                (float) userLocation.getLongitude(),
+                userLocation.hasAltitude() ? (float) userLocation.getAltitude() : 0f,
+                System.currentTimeMillis());
+        return field.getDeclination();
+    }
+
+    private void requestWalkingRouteIfReady(boolean force) {
+        if (!gpsLocked || userLocation == null || navigationTarget == null) {
+            return;
+        }
+        if (!force && !pathOverlayView.isRouteEmpty() && distanceFromRoute(userLocation, pathOverlayView.routePoints) <= REROUTE_THRESHOLD_METERS) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (!force && now - lastDirectionsRequestMs < 8_000L) {
+            return;
+        }
+        lastDirectionsRequestMs = now;
+        Location origin = new Location(userLocation);
+        NavigationTarget target = navigationTarget;
+        if (BuildConfig.GOOGLE_DIRECTIONS_API_KEY.isEmpty()) {
+            pathOverlayView.setRoute(smoothRoute(fallbackRoute(origin, target)));
+            return;
+        }
+        directionsExecutor.execute(() -> {
+            List<Location> route = fetchWalkingDirections(origin, target);
+            if (route.isEmpty()) {
+                route = fallbackRoute(origin, target);
+            }
+            List<Location> smoothed = smoothRoute(route);
+            post(() -> pathOverlayView.setRoute(smoothed));
+        });
+    }
+
+    private List<Location> fetchWalkingDirections(Location origin, NavigationTarget target) {
+        HttpURLConnection connection = null;
+        try {
+            Uri uri = Uri.parse("https://maps.googleapis.com/maps/api/directions/json").buildUpon()
+                    .appendQueryParameter("origin", origin.getLatitude() + "," + origin.getLongitude())
+                    .appendQueryParameter("destination", target.latitude + "," + target.longitude)
+                    .appendQueryParameter("mode", "walking")
+                    .appendQueryParameter("key", BuildConfig.GOOGLE_DIRECTIONS_API_KEY)
+                    .build();
+            connection = (HttpURLConnection) new URL(uri.toString()).openConnection();
+            connection.setConnectTimeout(8_000);
+            connection.setReadTimeout(12_000);
+            connection.setRequestProperty("Accept", "application/json");
+            if (connection.getResponseCode() < 200 || connection.getResponseCode() >= 300) {
+                return Collections.emptyList();
+            }
+            JSONObject json = new JSONObject(readString(connection.getInputStream()));
+            JSONArray routes = json.optJSONArray("routes");
+            if (routes == null || routes.length() == 0) {
+                return Collections.emptyList();
+            }
+            JSONArray legs = routes.getJSONObject(0).optJSONArray("legs");
+            if (legs == null || legs.length() == 0) {
+                return Collections.emptyList();
+            }
+            JSONArray steps = legs.getJSONObject(0).optJSONArray("steps");
+            if (steps == null) {
+                return Collections.emptyList();
+            }
+            List<Location> points = new ArrayList<>();
+            for (int i = 0; i < steps.length() && points.size() < MAX_DIRECTIONS_POINTS; i++) {
+                JSONObject polyline = steps.getJSONObject(i).optJSONObject("polyline");
+                if (polyline != null) {
+                    points.addAll(decodePolyline(polyline.optString("points", "")));
+                }
+            }
+            return points;
+        } catch (Exception exception) {
+            return Collections.emptyList();
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
+
+    private String readString(InputStream stream) throws Exception {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        byte[] buffer = new byte[4096];
+        int read;
+        while ((read = stream.read(buffer)) != -1) {
+            output.write(buffer, 0, read);
+        }
+        return output.toString("UTF-8");
+    }
+
+    private List<Location> decodePolyline(String encoded) {
+        List<Location> polyline = new ArrayList<>();
+        int index = 0;
+        int latitude = 0;
+        int longitude = 0;
+        while (index < encoded.length()) {
+            int[] latitudeResult = decodePolylineValue(encoded, index);
+            latitude += latitudeResult[0];
+            index = latitudeResult[1];
+            int[] longitudeResult = decodePolylineValue(encoded, index);
+            longitude += longitudeResult[0];
+            index = longitudeResult[1];
+            Location point = new Location("directions");
+            point.setLatitude(latitude / 100000.0);
+            point.setLongitude(longitude / 100000.0);
+            polyline.add(point);
+        }
+        return polyline;
+    }
+
+    private int[] decodePolylineValue(String encoded, int startIndex) {
+        int result = 0;
+        int shift = 0;
+        int index = startIndex;
+        int value;
+        do {
+            value = encoded.charAt(index++) - 63;
+            result |= (value & 0x1f) << shift;
+            shift += 5;
+        } while (value >= 0x20 && index < encoded.length());
+        int delta = (result & 1) != 0 ? ~(result >> 1) : (result >> 1);
+        return new int[] { delta, index };
+    }
+
+    private List<Location> fallbackRoute(Location origin, NavigationTarget target) {
+        List<Location> route = new ArrayList<>();
+        route.add(new Location(origin));
+        Location end = new Location("target");
+        end.setLatitude(target.latitude);
+        end.setLongitude(target.longitude);
+        route.add(end);
+        return route;
+    }
+
+    private List<Location> smoothRoute(List<Location> route) {
+        if (route.size() < 3) {
+            return route;
+        }
+        List<Location> control = new ArrayList<>();
+        control.add(route.get(0));
+        control.addAll(route);
+        control.add(route.get(route.size() - 1));
+        List<Location> smoothed = new ArrayList<>();
+        for (int i = 0; i + 3 < control.size(); i++) {
+            Location p0 = control.get(i);
+            Location p1 = control.get(i + 1);
+            Location p2 = control.get(i + 2);
+            Location p3 = control.get(i + 3);
+            for (int step = 0; step <= 8; step++) {
+                double t = step / 8.0;
+                smoothed.add(bSplinePoint(p0, p1, p2, p3, t));
+            }
+        }
+        return smoothed;
+    }
+
+    private Location bSplinePoint(Location p0, Location p1, Location p2, Location p3, double t) {
+        double t2 = t * t;
+        double t3 = t2 * t;
+        double b0 = (-t3 + 3 * t2 - 3 * t + 1) / 6.0;
+        double b1 = (3 * t3 - 6 * t2 + 4) / 6.0;
+        double b2 = (-3 * t3 + 3 * t2 + 3 * t + 1) / 6.0;
+        double b3 = t3 / 6.0;
+        Location point = new Location("bspline");
+        point.setLatitude(p0.getLatitude() * b0 + p1.getLatitude() * b1 + p2.getLatitude() * b2 + p3.getLatitude() * b3);
+        point.setLongitude(p0.getLongitude() * b0 + p1.getLongitude() * b1 + p2.getLongitude() * b2 + p3.getLongitude() * b3);
+        return point;
+    }
+
+    private float distanceFromRoute(Location location, List<Location> route) {
+        if (route.isEmpty()) {
+            return Float.MAX_VALUE;
+        }
+        float minDistance = Float.MAX_VALUE;
+        for (Location point : route) {
+            minDistance = Math.min(minDistance, location.distanceTo(point));
+        }
+        return minDistance;
+    }
+
+    private void initializeArCoreDepthAndPlaneDetection() {
+        try {
+            Class<?> sessionClass = Class.forName("com.google.ar.core.Session");
+            Class<?> configClass = Class.forName("com.google.ar.core.Config");
+            Object session = sessionClass.getConstructor(Context.class).newInstance(getContext());
+            Object config = configClass.getConstructor(sessionClass).newInstance(session);
+            Class<?> depthModeClass = Class.forName("com.google.ar.core.Config$DepthMode");
+            Class<?> planeModeClass = Class.forName("com.google.ar.core.Config$PlaneFindingMode");
+            Object automaticDepth = Enum.valueOf((Class<Enum>) depthModeClass.asSubclass(Enum.class), "AUTOMATIC");
+            Object horizontalPlanes = Enum.valueOf((Class<Enum>) planeModeClass.asSubclass(Enum.class), "HORIZONTAL");
+            configClass.getMethod("setDepthMode", depthModeClass).invoke(config, automaticDepth);
+            configClass.getMethod("setPlaneFindingMode", planeModeClass).invoke(config, horizontalPlanes);
+            sessionClass.getMethod("configure", configClass).invoke(session, config);
+            sessionClass.getMethod("close").invoke(session);
+            arCoreDepthReady = true;
+        } catch (Exception exception) {
+            arCoreDepthReady = false;
+        }
+        pathOverlayView.setDepthOcclusionEnabled(arCoreDepthReady);
     }
 
     private void lowPassVector(float[] input, float[] output, float alpha) {
@@ -451,6 +705,12 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         statusView.setText(text);
     }
 
+    @Override
+    protected void onDetachedFromWindow() {
+        directionsExecutor.shutdownNow();
+        super.onDetachedFromWindow();
+    }
+
     private int dp(int value) {
         return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
     }
@@ -458,28 +718,36 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
 
     private final class PathOverlayView extends ViewGroup {
         private final Paint glowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint linePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint dotPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint ribbonPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint arrowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint calibratingPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private Location currentLocation;
         private NavigationTarget target;
+        private final List<Location> routePoints = new ArrayList<>();
         private float bearing;
+        private boolean calibrating;
+        private boolean depthOcclusionEnabled;
+        private long animationStartedAt = System.currentTimeMillis();
 
         PathOverlayView(Context context) {
             super(context);
             setWillNotDraw(false);
-            glowPaint.setColor(Color.argb(170, 255, 214, 0));
+            glowPaint.setColor(Color.argb(120, 0, 176, 255));
             glowPaint.setStyle(Paint.Style.STROKE);
             glowPaint.setStrokeCap(Paint.Cap.ROUND);
             glowPaint.setStrokeJoin(Paint.Join.ROUND);
-            glowPaint.setStrokeWidth(dp(18));
-            glowPaint.setMaskFilter(new BlurMaskFilter(dp(10), BlurMaskFilter.Blur.NORMAL));
-            linePaint.setColor(Color.rgb(255, 245, 125));
-            linePaint.setStyle(Paint.Style.STROKE);
-            linePaint.setStrokeCap(Paint.Cap.ROUND);
-            linePaint.setStrokeJoin(Paint.Join.ROUND);
-            linePaint.setStrokeWidth(dp(7));
-            dotPaint.setColor(Color.WHITE);
-            dotPaint.setStyle(Paint.Style.FILL);
+            glowPaint.setStrokeWidth(dp(52));
+            glowPaint.setMaskFilter(new BlurMaskFilter(dp(18), BlurMaskFilter.Blur.NORMAL));
+            ribbonPaint.setColor(Color.argb(185, 255, 214, 0));
+            ribbonPaint.setStyle(Paint.Style.STROKE);
+            ribbonPaint.setStrokeCap(Paint.Cap.ROUND);
+            ribbonPaint.setStrokeJoin(Paint.Join.ROUND);
+            ribbonPaint.setStrokeWidth(dp(34));
+            arrowPaint.setColor(Color.argb(235, 255, 255, 255));
+            arrowPaint.setStyle(Paint.Style.FILL);
+            calibratingPaint.setColor(Color.WHITE);
+            calibratingPaint.setTextSize(dp(15));
+            calibratingPaint.setTextAlign(Paint.Align.CENTER);
         }
 
         void setUserLocation(Location currentLocation) {
@@ -497,6 +765,27 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             invalidate();
         }
 
+        void setRoute(List<Location> route) {
+            routePoints.clear();
+            routePoints.addAll(route);
+            animationStartedAt = System.currentTimeMillis();
+            invalidate();
+        }
+
+        void setCalibrating(boolean calibrating) {
+            this.calibrating = calibrating;
+            invalidate();
+        }
+
+        void setDepthOcclusionEnabled(boolean depthOcclusionEnabled) {
+            this.depthOcclusionEnabled = depthOcclusionEnabled;
+            invalidate();
+        }
+
+        boolean isRouteEmpty() {
+            return routePoints.isEmpty();
+        }
+
         @Override
         protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
         }
@@ -504,24 +793,89 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
+            if (calibrating) {
+                canvas.drawText("Calibrating… locking GPS and AR floor", getWidth() / 2f, getHeight() / 2f, calibratingPaint);
+                return;
+            }
             if (currentLocation == null || target == null || getWidth() == 0 || getHeight() == 0) {
                 return;
             }
-            Location targetLocation = new Location("ar-target");
-            targetLocation.setLatitude(target.latitude);
-            targetLocation.setLongitude(target.longitude);
-            float distance = Math.max(1f, currentLocation.distanceTo(targetLocation));
-            float relativeBearing = (currentLocation.bearingTo(targetLocation) - bearing + 540f) % 360f - 180f;
-            float startX = getWidth() / 2f;
-            float startY = getHeight() - dp(52);
-            float endX = Math.max(dp(38), Math.min(getWidth() - dp(38), startX + relativeBearing * dp(5)));
-            float endY = Math.max(dp(140), startY - Math.min(getHeight() * 0.58f, distance * dp(3)));
-            Path path = new Path();
-            path.moveTo(startX, startY);
-            path.cubicTo(startX, startY - dp(120), endX, endY + dp(120), endX, endY);
-            canvas.drawPath(path, glowPaint);
-            canvas.drawPath(path, linePaint);
-            canvas.drawCircle(endX, endY, dp(8), dotPaint);
+            List<Location> drawableRoute = routePoints.isEmpty() ? fallbackRoute(currentLocation, target) : routePoints;
+            List<float[]> projectedPoints = projectRoute(drawableRoute);
+            if (projectedPoints.size() < 2) {
+                return;
+            }
+
+            Path ribbon = new Path();
+            float[] first = projectedPoints.get(0);
+            ribbon.moveTo(first[0], first[1]);
+            for (int i = 1; i < projectedPoints.size(); i++) {
+                float[] previous = projectedPoints.get(i - 1);
+                float[] point = projectedPoints.get(i);
+                ribbon.quadTo(previous[0], previous[1], (previous[0] + point[0]) / 2f, (previous[1] + point[1]) / 2f);
+            }
+            canvas.drawPath(ribbon, glowPaint);
+            canvas.drawPath(ribbon, ribbonPaint);
+            drawAnimatedArrows(canvas, projectedPoints);
+            if (!depthOcclusionEnabled) {
+                canvas.drawText("ARCore depth unavailable — floor ribbon fallback", getWidth() / 2f, getHeight() - dp(18), calibratingPaint);
+            }
+            postInvalidateOnAnimation();
+        }
+
+        private List<float[]> projectRoute(List<Location> route) {
+            List<float[]> projected = new ArrayList<>();
+            for (Location point : route) {
+                float distance = Math.max(0.5f, currentLocation.distanceTo(point));
+                if (distance > 65f) {
+                    continue;
+                }
+                float relativeBearing = (currentLocation.bearingTo(point) - bearing + 540f) % 360f - 180f;
+                if (Math.abs(relativeBearing) > 70f) {
+                    continue;
+                }
+                float horizon = getHeight() * 0.42f;
+                float ground = getHeight() - dp(42);
+                float depth = Math.min(1f, distance / 65f);
+                float x = getWidth() / 2f + relativeBearing * dp(6);
+                float y = ground - (ground - horizon) * depth;
+                float alpha = Math.max(0.18f, 1f - depth);
+                projected.add(new float[] { x, y, alpha });
+            }
+            return projected;
+        }
+
+        private void drawAnimatedArrows(Canvas canvas, List<float[]> points) {
+            if (points.size() < 2) {
+                return;
+            }
+            float phase = ((System.currentTimeMillis() - animationStartedAt) % 1400L) / 1400f;
+            for (int i = 1; i < points.size(); i += 4) {
+                if (((i / 4f) + phase) % 1f > 0.35f) {
+                    continue;
+                }
+                float[] previous = points.get(i - 1);
+                float[] point = points.get(i);
+                float angle = (float) Math.atan2(point[1] - previous[1], point[0] - previous[0]);
+                float alpha = Math.min(previous[2], point[2]);
+                arrowPaint.setAlpha((int) (220 * alpha));
+                drawArrow(canvas, point[0], point[1], angle);
+            }
+        }
+
+        private void drawArrow(Canvas canvas, float x, float y, float angle) {
+            float size = dp(13);
+            Path arrow = new Path();
+            arrow.moveTo(size, 0);
+            arrow.lineTo(-size * 0.7f, -size * 0.55f);
+            arrow.lineTo(-size * 0.35f, 0);
+            arrow.lineTo(-size * 0.7f, size * 0.55f);
+            arrow.close();
+            canvas.save();
+            canvas.translate(x, y);
+            canvas.rotate((float) Math.toDegrees(angle));
+            canvas.drawPath(arrow, arrowPaint);
+            canvas.restore();
         }
     }
 

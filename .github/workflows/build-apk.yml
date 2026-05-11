@@ -45,6 +45,7 @@ jobs:
           BODS_API_KEY: ${{ secrets.BODS_API_KEY }}
           BODS_BOUNDING_BOX: ${{ vars.BODS_BOUNDING_BOX }}
           BODS_API_BASE_URL: ${{ vars.BODS_API_BASE_URL }}
+          GOOGLE_DIRECTIONS_API_KEY: ${{ secrets.GOOGLE_DIRECTIONS_API_KEY }}
         run: gradle --no-daemon :app:assembleDebug
 
       - name: Upload debug APK
