@@ -12,6 +12,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.location.Criteria;
@@ -43,13 +46,17 @@ import android.widget.TextView;
 import android.widget.Toast;
 import android.view.animation.LinearInterpolator;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 
 public class MainActivity extends Activity {
     private static final int LOCATION_PERMISSION_REQUEST = 1001;
     private static final int CENTER_MAP_PERMISSION_REQUEST = 1002;
+    private static final int AUDIO_PERMISSION_REQUEST = 1003;
+    private static final int CAMERA_PERMISSION_REQUEST = 1004;
     private static final String SAVED_URL = "saved_url";
     private static final String MAP_URL = "https://bustimes.org/map";
     private static final long BUS_MARKER_ANIMATION_MS = 5_000L;
@@ -57,13 +64,20 @@ public class MainActivity extends Activity {
     private WebView webView;
     private ProgressBar progressBar;
     private Button locateButton;
+    private Button refreshButton;
+    private Button microphoneButton;
+    private Button arToggleButton;
     private LinearLayout zoomControls;
     private TextView helperChip;
+    private ArBusStopView arBusStopView;
     private final Map<String, AnimatedBusMarker> trackedBusMarkers = new HashMap<>();
     private final BroadcastReceiver busTrackingReceiver = new BusTrackingReceiver();
     private GeolocationPermissions.Callback geolocationCallback;
     private String geolocationOrigin;
     private boolean busTrackingReceiverRegistered;
+    private SpeechRecognizer speechRecognizer;
+    private String activeRouteFilter = "";
+    private boolean arModeEnabled;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -73,10 +87,18 @@ public class MainActivity extends Activity {
         webView = new WebView(this);
         progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         locateButton = createLocateButton();
+        refreshButton = createRefreshButton();
+        microphoneButton = createMicrophoneButton();
+        arToggleButton = createArToggleButton();
         zoomControls = createZoomControls();
         helperChip = createHelperChip();
+        arBusStopView = new ArBusStopView(this);
+        arBusStopView.setVisibility(View.GONE);
 
         root.addView(webView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+        root.addView(arBusStopView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
 
@@ -90,6 +112,21 @@ public class MainActivity extends Activity {
                 Gravity.BOTTOM | Gravity.END);
         locateParams.setMargins(0, 0, dp(20), dp(28));
         root.addView(locateButton, locateParams);
+
+        FrameLayout.LayoutParams refreshParams = new FrameLayout.LayoutParams(dp(56), dp(56),
+                Gravity.BOTTOM | Gravity.START);
+        refreshParams.setMargins(dp(20), 0, 0, dp(28));
+        root.addView(refreshButton, refreshParams);
+
+        FrameLayout.LayoutParams microphoneParams = new FrameLayout.LayoutParams(dp(56), dp(56),
+                Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        microphoneParams.setMargins(0, 0, 0, dp(28));
+        root.addView(microphoneButton, microphoneParams);
+
+        FrameLayout.LayoutParams arToggleParams = new FrameLayout.LayoutParams(dp(112), dp(48),
+                Gravity.TOP | Gravity.START);
+        arToggleParams.setMargins(dp(14), dp(72), 0, 0);
+        root.addView(arToggleButton, arToggleParams);
 
         FrameLayout.LayoutParams zoomParams = new FrameLayout.LayoutParams(dp(52),
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -157,6 +194,42 @@ public class MainActivity extends Activity {
         return button;
     }
 
+    private Button createRefreshButton() {
+        Button button = new Button(this);
+        button.setText("↻");
+        button.setTextSize(26);
+        button.setTypeface(Typeface.DEFAULT_BOLD);
+        button.setTextColor(Color.WHITE);
+        button.setBackgroundColor(Color.rgb(17, 76, 141));
+        button.setContentDescription("Refresh the live bus map");
+        button.setOnClickListener(v -> refreshLiveMap());
+        return button;
+    }
+
+    private Button createMicrophoneButton() {
+        Button button = new Button(this);
+        button.setText("🎙");
+        button.setTextSize(22);
+        button.setTypeface(Typeface.DEFAULT_BOLD);
+        button.setTextColor(Color.WHITE);
+        button.setBackgroundColor(Color.rgb(17, 76, 141));
+        button.setContentDescription("Voice search for a bus route");
+        button.setOnClickListener(v -> startVoiceSearch());
+        return button;
+    }
+
+    private Button createArToggleButton() {
+        Button button = new Button(this);
+        button.setText("AR View");
+        button.setTextSize(13);
+        button.setTypeface(Typeface.DEFAULT_BOLD);
+        button.setTextColor(Color.WHITE);
+        button.setBackgroundColor(Color.rgb(17, 76, 141));
+        button.setContentDescription("Switch between standard map and AR bus stop finder");
+        button.setOnClickListener(v -> toggleArMode());
+        return button;
+    }
+
     private LinearLayout createZoomControls() {
         LinearLayout controls = new LinearLayout(this);
         controls.setOrientation(LinearLayout.VERTICAL);
@@ -194,6 +267,15 @@ public class MainActivity extends Activity {
         return button;
     }
 
+    private void refreshLiveMap() {
+        hideAdsOnPage();
+        webView.reload();
+        Intent intent = new Intent(this, BusTrackingService.class);
+        intent.setAction(BusTrackingService.ACTION_REFRESH_NOW);
+        startService(intent);
+        Toast.makeText(this, "Refreshing live bus map", Toast.LENGTH_SHORT).show();
+    }
+
     private void zoomWebMap(boolean zoomIn) {
         String selector = zoomIn
                 ? ".maplibregl-ctrl-zoom-in, .mapboxgl-ctrl-zoom-in, .leaflet-control-zoom-in, [aria-label='Zoom in']"
@@ -216,7 +298,7 @@ public class MainActivity extends Activity {
 
     private TextView createHelperChip() {
         TextView chip = new TextView(this);
-        chip.setText("Live map: tap buses for route numbers/last seen, tap stops for departures");
+        chip.setText("Tap mic to filter a route, AR for bus stop finder, buses for last seen");
         chip.setTextColor(Color.WHITE);
         chip.setTextSize(13);
         chip.setTypeface(Typeface.DEFAULT_BOLD);
@@ -258,6 +340,8 @@ public class MainActivity extends Activity {
             marker.cancelAnimation();
         }
         trackedBusMarkers.clear();
+        stopVoiceSearch();
+        arBusStopView.destroyAr();
         if (webView != null) {
             webView.destroy();
         }
@@ -287,6 +371,18 @@ public class MainActivity extends Activity {
                 centerMapOnUserLocation();
             } else {
                 Toast.makeText(this, "Location permission is needed to find you on the map", Toast.LENGTH_LONG).show();
+            }
+        } else if (requestCode == AUDIO_PERMISSION_REQUEST) {
+            if (granted) {
+                startVoiceSearch();
+            } else {
+                Toast.makeText(this, "Microphone permission is needed for voice route search", Toast.LENGTH_LONG).show();
+            }
+        } else if (requestCode == CAMERA_PERMISSION_REQUEST) {
+            if (granted) {
+                showArView();
+            } else {
+                Toast.makeText(this, "Camera permission is needed for AR bus stop finder", Toast.LENGTH_LONG).show();
             }
         }
     }
@@ -384,6 +480,242 @@ public class MainActivity extends Activity {
         webView.loadUrl(url);
     }
 
+    private void stopVoiceSearch() {
+        if (speechRecognizer != null) {
+            speechRecognizer.cancel();
+            speechRecognizer.destroy();
+            speechRecognizer = null;
+        }
+    }
+
+    private void startVoiceSearch() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] { Manifest.permission.RECORD_AUDIO }, AUDIO_PERMISSION_REQUEST);
+            return;
+        }
+
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            Toast.makeText(this, "Voice recognition is not available on this device", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        if (speechRecognizer == null) {
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+            speechRecognizer.setRecognitionListener(new RouteRecognitionListener());
+        }
+
+        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "Say a bus route number, for example 350");
+        speechRecognizer.startListening(intent);
+        Toast.makeText(this, "Listening for bus number…", Toast.LENGTH_SHORT).show();
+    }
+
+    private void applyVoiceRouteFilter(String spokenText) {
+        String route = extractRouteNumber(spokenText);
+        if (route.isEmpty()) {
+            Toast.makeText(this, "I couldn't hear a bus route number", Toast.LENGTH_LONG).show();
+            stopVoiceSearch();
+            return;
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("Did you mean route " + route + "?")
+                .setMessage("I heard: "" + spokenText + """)
+                .setPositiveButton("Yes", (dialog, which) -> {
+                    applyConfirmedRouteFilter(route);
+                    stopVoiceSearch();
+                })
+                .setNegativeButton("Try again", (dialog, which) -> {
+                    stopVoiceSearch();
+                    startVoiceSearch();
+                })
+                .show();
+    }
+
+    private void applyConfirmedRouteFilter(String route) {
+        activeRouteFilter = route;
+        arBusStopView.setRouteFilter(activeRouteFilter);
+        filterMapMarkersForRoute(activeRouteFilter);
+        Toast.makeText(this, "Showing route " + activeRouteFilter, Toast.LENGTH_LONG).show();
+    }
+
+    private String extractRouteNumber(String text) {
+        if (text == null) {
+            return "";
+        }
+
+        String direct = text.replaceAll("[^0-9A-Za-z]", " ").trim();
+        for (String token : direct.split("\\s+")) {
+            if (token.matches("[0-9]{1,4}[A-Za-z]?")) {
+                return token.toUpperCase(Locale.UK);
+            }
+        }
+
+        String normalized = text.toLowerCase(Locale.UK)
+                .replace('-', ' ')
+                .replaceAll("[^a-z ]", " ")
+                .replaceAll("\\s+", " ")
+                .trim();
+        String wordsAsDigits = spokenNumberToRoute(normalized);
+        return wordsAsDigits.matches("[0-9]{1,4}[A-Za-z]?") ? wordsAsDigits : "";
+    }
+
+    private String spokenNumberToRoute(String text) {
+        if (text.isEmpty()) {
+            return "";
+        }
+
+        Map<String, String> digitWords = new LinkedHashMap<>();
+        digitWords.put("zero", "0");
+        digitWords.put("oh", "0");
+        digitWords.put("o", "0");
+        digitWords.put("one", "1");
+        digitWords.put("two", "2");
+        digitWords.put("to", "2");
+        digitWords.put("too", "2");
+        digitWords.put("three", "3");
+        digitWords.put("four", "4");
+        digitWords.put("for", "4");
+        digitWords.put("five", "5");
+        digitWords.put("six", "6");
+        digitWords.put("seven", "7");
+        digitWords.put("eight", "8");
+        digitWords.put("ate", "8");
+        digitWords.put("nine", "9");
+
+        Map<String, String> hundredsPhrases = new LinkedHashMap<>();
+        hundredsPhrases.put("one hundred", "100");
+        hundredsPhrases.put("two hundred", "200");
+        hundredsPhrases.put("three hundred", "300");
+        hundredsPhrases.put("four hundred", "400");
+        hundredsPhrases.put("five hundred", "500");
+        hundredsPhrases.put("six hundred", "600");
+        hundredsPhrases.put("seven hundred", "700");
+        hundredsPhrases.put("eight hundred", "800");
+        hundredsPhrases.put("nine hundred", "900");
+
+        for (Map.Entry<String, String> entry : hundredsPhrases.entrySet()) {
+            text = text.replace(entry.getKey(), entry.getValue());
+        }
+
+        Map<String, String> tensWords = new LinkedHashMap<>();
+        tensWords.put("ten", "10");
+        tensWords.put("eleven", "11");
+        tensWords.put("twelve", "12");
+        tensWords.put("thirteen", "13");
+        tensWords.put("fourteen", "14");
+        tensWords.put("fifteen", "15");
+        tensWords.put("sixteen", "16");
+        tensWords.put("seventeen", "17");
+        tensWords.put("eighteen", "18");
+        tensWords.put("nineteen", "19");
+        tensWords.put("twenty", "20");
+        tensWords.put("thirty", "30");
+        tensWords.put("forty", "40");
+        tensWords.put("fifty", "50");
+        tensWords.put("sixty", "60");
+        tensWords.put("seventy", "70");
+        tensWords.put("eighty", "80");
+        tensWords.put("ninety", "90");
+
+        StringBuilder result = new StringBuilder();
+        String[] words = text.split(" ");
+        for (int i = 0; i < words.length; i++) {
+            String word = words[i];
+            if (word.matches("[0-9]+")) {
+                result.append(word);
+            } else if (digitWords.containsKey(word)) {
+                result.append(digitWords.get(word));
+            } else if (tensWords.containsKey(word)) {
+                result.append(tensWords.get(word));
+            }
+        }
+
+        return result.toString();
+    }
+
+    private void filterMapMarkersForRoute(String route) {
+        String escapedRoute = escapeJs(route);
+        String script = "(function(){"
+                + "window.__bodsRouteFilter='" + escapedRoute + "';"
+                + "Object.keys(window.__bodsMarkers||{}).forEach(function(key){"
+                + "var marker=window.__bodsMarkers[key];var route=(marker.dataset.route||marker.textContent||'').trim();"
+                + "marker.style.display=(!window.__bodsRouteFilter||route.toLowerCase()===window.__bodsRouteFilter.toLowerCase())?'flex':'none';"
+                + "});"
+                + "return true;})();";
+        webView.evaluateJavascript(script, ignored -> {
+        });
+    }
+
+    private void toggleArMode() {
+        if (arModeEnabled) {
+            showStandardMap();
+            return;
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                && checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] { Manifest.permission.CAMERA }, CAMERA_PERMISSION_REQUEST);
+            return;
+        }
+
+        showArView();
+    }
+
+    private void showArView() {
+        arModeEnabled = true;
+        webView.setVisibility(View.GONE);
+        arBusStopView.setVisibility(View.VISIBLE);
+        arToggleButton.setText("Map View");
+        refreshButton.setVisibility(View.GONE);
+        zoomControls.setVisibility(View.GONE);
+        arBusStopView.setRouteFilter(activeRouteFilter);
+        arBusStopView.showStopsNear(hasLocationPermission()
+                ? getBestLastKnownLocation((LocationManager) getSystemService(Context.LOCATION_SERVICE))
+                : null);
+        arBusStopView.startAr();
+        bringNativeControlsToFront();
+    }
+
+    private void showStandardMap() {
+        arModeEnabled = false;
+        arBusStopView.destroyAr();
+        arBusStopView.setVisibility(View.GONE);
+        webView.setVisibility(View.VISIBLE);
+        arToggleButton.setText("AR View");
+        refreshButton.setVisibility(View.VISIBLE);
+        zoomControls.setVisibility(View.VISIBLE);
+        bringNativeControlsToFront();
+    }
+
+
+    private void hideAdsOnPage() {
+        String script = "(function(){"
+                + "var css='#bustimes-native-ad-hide,'"
+                + ".adsbygoogle,ins.adsbygoogle,[id*=\"google_ads\"],[id*=\"div-gpt-ad\"],"
+                + "[id^=\"google_ads\"],[id^=\"ad-\"],[id$=\"-ad\"],"
+                + "[class*=\"adsbygoogle\"],[class*=\"advert\"],[class*=\" ad-\"],"
+                + "iframe[src*=\"googlesyndication\"],iframe[src*=\"doubleclick\"],"
+                + "iframe[src*=\"googleads\"]{display:none!important;visibility:hidden!important;height:0!important;max-height:0!important;overflow:hidden!important;}';"
+                + "var style=document.getElementById('bustimes-native-ad-hide');"
+                + "if(!style){style=document.createElement('style');style.id='bustimes-native-ad-hide';document.head.appendChild(style);}"
+                + "style.textContent=css;"
+                + "document.querySelectorAll('.adsbygoogle,ins.adsbygoogle,[id*=\"google_ads\"],[id*=\"div-gpt-ad\"],[id^=\"ad-\"],[id$=\"-ad\"],[class*=\"advert\"],iframe[src*=\"googlesyndication\"],iframe[src*=\"doubleclick\"]').forEach(function(el){el.remove();});"
+                + "return true;})();";
+        webView.evaluateJavascript(script, ignored -> {
+        });
+    }
+
+    private void bringNativeControlsToFront() {
+        locateButton.bringToFront();
+        refreshButton.bringToFront();
+        microphoneButton.bringToFront();
+        arToggleButton.bringToFront();
+        zoomControls.bringToFront();
+        helperChip.bringToFront();
+    }
 
     private void registerBusTrackingReceiver() {
         IntentFilter filter = new IntentFilter();
@@ -469,16 +801,17 @@ public class MainActivity extends Activity {
                         + "if(!marker){marker=document.createElement('div');marker.className='native-bods-bus-marker';"
                         + "marker.style.cssText='position:absolute;z-index:50;width:34px;height:34px;margin-left:-17px;margin-top:-17px;border-radius:17px;background:#114c8d;color:white;border:2px solid white;box-shadow:0 2px 6px rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;font:bold 12px sans-serif;pointer-events:auto;cursor:pointer;transform-origin:center center;';"
                         + "container.appendChild(marker);window.__bodsMarkers['%s']=marker;}"
-                        + "marker.textContent='%s';"
+                        + "marker.textContent='%s';marker.dataset.route='%s';"
                         + "marker.dataset.lng=%f;marker.dataset.lat=%f;marker.dataset.bearing=%f;"
                         + "marker.dataset.lastSeen='%s';marker.title='Route %s\\nLast seen: %s';"
                         + "marker.onclick=function(event){if(event)event.stopPropagation();if(window.BusMarkerBridge){window.BusMarkerBridge.showBusDetails('%s',marker.dataset.lastSeen);}};"
+                        + "if(window.__bodsRouteFilter){marker.style.display=(marker.dataset.route.toLowerCase()===window.__bodsRouteFilter.toLowerCase())?'flex':'none';}"
                         + "window.__bodsPlaceMarker=function(m){var p=map.project([parseFloat(m.dataset.lng),parseFloat(m.dataset.lat)]);m.style.left=p.x+'px';m.style.top=p.y+'px';m.style.transform='rotate('+parseFloat(m.dataset.bearing)+'deg)';};"
                         + "window.__bodsPlaceMarker(marker);"
                         + "if(!window.__bodsMarkersListening){window.__bodsMarkersListening=true;var update=function(){Object.keys(window.__bodsMarkers).forEach(function(key){window.__bodsPlaceMarker(window.__bodsMarkers[key]);});};map.on&&map.on('move',update);map.on&&map.on('zoom',update);map.on&&map.on('resize',update);}"
                         + "return true;})();",
-                escapeJs(id), escapeJs(id), escapeJs(label), longitude, latitude, bearing, escapeJs(lastSeen),
-                escapeJs(label), escapeJs(lastSeen), escapeJs(label));
+                escapeJs(id), escapeJs(id), escapeJs(label), escapeJs(label), longitude, latitude, bearing,
+                escapeJs(lastSeen), escapeJs(label), escapeJs(lastSeen), escapeJs(label));
         webView.evaluateJavascript(script, ignored -> {
         });
     }
@@ -524,6 +857,32 @@ public class MainActivity extends Activity {
 
         openOutsideApp(uri);
         return true;
+    }
+
+    private class RouteRecognitionListener implements RecognitionListener {
+        @Override public void onReadyForSpeech(Bundle params) { }
+        @Override public void onBeginningOfSpeech() { }
+        @Override public void onRmsChanged(float rmsdB) { }
+        @Override public void onBufferReceived(byte[] buffer) { }
+        @Override public void onEndOfSpeech() { }
+        @Override public void onPartialResults(Bundle partialResults) { }
+        @Override public void onEvent(int eventType, Bundle params) { }
+
+        @Override
+        public void onError(int error) {
+            Toast.makeText(MainActivity.this, "Voice search did not hear a route number", Toast.LENGTH_SHORT).show();
+            stopVoiceSearch();
+        }
+
+        @Override
+        public void onResults(Bundle results) {
+            ArrayList<String> matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+            if (matches == null || matches.isEmpty()) {
+                Toast.makeText(MainActivity.this, "No bus number heard", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            applyVoiceRouteFilter(matches.get(0));
+        }
     }
 
     private class BusMarkerBridge {
@@ -606,6 +965,12 @@ public class MainActivity extends Activity {
 
     private class BusTimesWebViewClient extends WebViewClient {
         @Override
+        public void onPageFinished(WebView view, String url) {
+            hideAdsOnPage();
+            bringNativeControlsToFront();
+        }
+
+        @Override
         public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
             return handleNavigation(request.getUrl());
         }
@@ -622,9 +987,8 @@ public class MainActivity extends Activity {
             progressBar.setProgress(newProgress);
             progressBar.setVisibility(newProgress >= 100 ? View.GONE : View.VISIBLE);
             if (newProgress >= 100) {
-                locateButton.bringToFront();
-                zoomControls.bringToFront();
-                helperChip.bringToFront();
+                hideAdsOnPage();
+                bringNativeControlsToFront();
             }
         }
 

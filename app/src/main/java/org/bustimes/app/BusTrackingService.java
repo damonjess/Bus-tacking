@@ -27,6 +27,7 @@ import javax.xml.parsers.DocumentBuilderFactory;
 public class BusTrackingService extends Service {
     static final String ACTION_BUS_POSITION = "org.bustimes.app.action.BUS_POSITION";
     static final String ACTION_TRACKING_STATUS = "org.bustimes.app.action.TRACKING_STATUS";
+    static final String ACTION_REFRESH_NOW = "org.bustimes.app.action.REFRESH_NOW";
     static final String EXTRA_STATUS_MESSAGE = "status_message";
 
     private static final String TAG = "BusTrackingService";
@@ -50,9 +51,14 @@ public class BusTrackingService extends Service {
             return START_NOT_STICKY;
         }
 
+        boolean refreshRequested = intent != null && ACTION_REFRESH_NOW.equals(intent.getAction());
+        if (refreshRequested) {
+            executorService.execute(this::pollBodsVehicleLocations);
+        }
+
         if (!pollingStarted) {
             executorService.scheduleWithFixedDelay(this::pollBodsVehicleLocations,
-                    0,
+                    refreshRequested ? POLL_INTERVAL_SECONDS : 0,
                     POLL_INTERVAL_SECONDS,
                     TimeUnit.SECONDS);
             pollingStarted = true;
