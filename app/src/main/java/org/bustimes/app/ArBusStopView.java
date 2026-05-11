@@ -4,7 +4,11 @@ import android.Manifest;
 import android.annotation.SuppressLint;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.graphics.BlurMaskFilter;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.SurfaceTexture;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
@@ -33,16 +37,25 @@ import java.util.Locale;
 public class ArBusStopView extends FrameLayout implements SensorEventListener {
     private final TextureView cameraPreview;
     private final TextView statusView;
+    private final PathOverlayView pathOverlayView;
     private final List<BusStopPin> stopPins = new ArrayList<>();
     private final SensorManager sensorManager;
     private final Sensor rotationSensor;
+    private final Sensor accelerometerSensor;
+    private final Sensor magneticSensor;
     private CameraDevice cameraDevice;
     private CameraCaptureSession captureSession;
     private String routeFilter = "";
+    private final float[] smoothedAcceleration = new float[3];
+    private final float[] smoothedMagneticField = new float[3];
+    private boolean hasAcceleration;
+    private boolean hasMagneticField;
     private float compassBearing;
+    private float smoothedCompassBearing;
     private boolean sensorsRunning;
     private boolean cameraRequested;
     private Location userLocation;
+    private NavigationTarget navigationTarget;
 
     public ArBusStopView(Context context) {
         this(context, null);
@@ -53,6 +66,8 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         setBackgroundColor(Color.rgb(12, 22, 34));
         sensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
         rotationSensor = sensorManager == null ? null : sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
+        accelerometerSensor = sensorManager == null ? null : sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+        magneticSensor = sensorManager == null ? null : sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
 
         cameraPreview = new TextureView(context);
         cameraPreview.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
@@ -78,6 +93,9 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             }
         });
         addView(cameraPreview, new LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        pathOverlayView = new PathOverlayView(context);
+        addView(pathOverlayView, new LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         statusView = new TextView(context);
         statusView.setTextColor(Color.WHITE);
@@ -114,34 +132,61 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         renderPins();
     }
 
+    public void setNavigationTarget(String name, double latitude, double longitude) {
+        navigationTarget = new NavigationTarget(name, latitude, longitude);
+        pathOverlayView.setTarget(navigationTarget);
+        updateStatus("AR wayfinding path locked to " + name + " — follow the glowing pavement line.");
+    }
+
+    public void clearNavigationTarget() {
+        navigationTarget = null;
+        pathOverlayView.setTarget(null);
+        renderPins();
+    }
+
     public void showStopsNear(Location location) {
-        userLocation = location;
+        userLocation = smoothLocation(userLocation, location, 0.22f);
+        pathOverlayView.setUserLocation(userLocation);
         stopPins.clear();
-        if (location == null) {
+        if (userLocation == null) {
             updateStatus("Location-Based AR active — enable location to find nearby bus stops.");
             renderPins();
             return;
         }
 
-        stopPins.add(new BusStopPin("Nearest stop", firstRoute(), location.getLatitude() + 0.00045,
-                location.getLongitude() + 0.00025));
-        stopPins.add(new BusStopPin("Opposite stop", firstRoute(), location.getLatitude() - 0.00035,
-                location.getLongitude() + 0.00035));
-        stopPins.add(new BusStopPin("Next stop ahead", firstRoute(), location.getLatitude() + 0.00080,
-                location.getLongitude() - 0.00018));
+        stopPins.add(new BusStopPin("Nearest stop", firstRoute(), userLocation.getLatitude() + 0.00045,
+                userLocation.getLongitude() + 0.00025));
+        stopPins.add(new BusStopPin("Opposite stop", firstRoute(), userLocation.getLatitude() - 0.00035,
+                userLocation.getLongitude() + 0.00035));
+        stopPins.add(new BusStopPin("Next stop ahead", firstRoute(), userLocation.getLatitude() + 0.00080,
+                userLocation.getLongitude() - 0.00018));
         renderPins();
     }
 
     @Override
     public void onSensorChanged(SensorEvent event) {
-        if (event.sensor.getType() != Sensor.TYPE_ROTATION_VECTOR) {
+        float rawBearing = Float.NaN;
+        if (event.sensor.getType() == Sensor.TYPE_ROTATION_VECTOR) {
+            float[] rotationMatrix = new float[9];
+            float[] orientation = new float[3];
+            SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values);
+            SensorManager.getOrientation(rotationMatrix, orientation);
+            rawBearing = (float) ((Math.toDegrees(orientation[0]) + 360.0) % 360.0);
+        } else if (event.sensor.getType() == Sensor.TYPE_ACCELEROMETER) {
+            lowPassVector(event.values, smoothedAcceleration, 0.15f);
+            hasAcceleration = true;
+            rawBearing = fallbackCompassBearing();
+        } else if (event.sensor.getType() == Sensor.TYPE_MAGNETIC_FIELD) {
+            lowPassVector(event.values, smoothedMagneticField, 0.15f);
+            hasMagneticField = true;
+            rawBearing = fallbackCompassBearing();
+        }
+        if (Float.isNaN(rawBearing)) {
             return;
         }
-        float[] rotationMatrix = new float[9];
-        float[] orientation = new float[3];
-        SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values);
-        SensorManager.getOrientation(rotationMatrix, orientation);
-        compassBearing = (float) ((Math.toDegrees(orientation[0]) + 360.0) % 360.0);
+        compassBearing = lowPassBearing(rawBearing, compassBearing, 0.12f);
+        smoothedCompassBearing = lerpBearing(smoothedCompassBearing, compassBearing, 0.18f);
+        pathOverlayView.setBearing(smoothedCompassBearing);
         renderPins();
     }
 
@@ -150,11 +195,20 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
     }
 
     private void startCompass() {
-        if (sensorManager == null || rotationSensor == null || sensorsRunning) {
+        if (sensorManager == null || sensorsRunning) {
             return;
         }
-        sensorManager.registerListener(this, rotationSensor, SensorManager.SENSOR_DELAY_UI);
-        sensorsRunning = true;
+        if (rotationSensor != null) {
+            sensorManager.registerListener(this, rotationSensor, SensorManager.SENSOR_DELAY_UI);
+        } else {
+            if (accelerometerSensor != null) {
+                sensorManager.registerListener(this, accelerometerSensor, SensorManager.SENSOR_DELAY_UI);
+            }
+            if (magneticSensor != null) {
+                sensorManager.registerListener(this, magneticSensor, SensorManager.SENSOR_DELAY_UI);
+            }
+        }
+        sensorsRunning = rotationSensor != null || (accelerometerSensor != null && magneticSensor != null);
     }
 
     private void stopCompass() {
@@ -263,9 +317,24 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         }
     }
 
+    private float lowPassBearing(float input, float previous, float alpha) {
+        if (previous == 0f) {
+            return input;
+        }
+        return previous + shortestBearingDelta(previous, input) * alpha;
+    }
+
+    private float lerpBearing(float from, float to, float fraction) {
+        return from + shortestBearingDelta(from, to) * fraction;
+    }
+
+    private float shortestBearingDelta(float from, float to) {
+        return ((to - from + 540f) % 360f) - 180f;
+    }
+
     private void renderPins() {
-        while (getChildCount() > 2) {
-            removeViewAt(2);
+        while (getChildCount() > 3) {
+            removeViewAt(3);
         }
         int visiblePins = 0;
         for (BusStopPin pin : stopPins) {
@@ -274,15 +343,61 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             }
             visiblePins++;
             TextView marker = createPinView(pin);
+            float targetX = screenXFor(pin);
+            float targetY = screenYFor(pin, visiblePins);
+            pin.displayedX = Float.isNaN(pin.displayedX) ? targetX : lerp(pin.displayedX, targetX, 0.20f);
+            pin.displayedY = Float.isNaN(pin.displayedY) ? targetY : lerp(pin.displayedY, targetY, 0.20f);
+            if (navigationTarget == null && visiblePins == 1) {
+                setNavigationTarget(pin.name, pin.latitude, pin.longitude);
+            }
             LayoutParams params = new LayoutParams(dp(160), ViewGroup.LayoutParams.WRAP_CONTENT);
-            params.leftMargin = dp(screenXFor(pin));
-            params.topMargin = dp(screenYFor(pin, visiblePins));
+            params.leftMargin = dp((int) pin.displayedX);
+            params.topMargin = dp((int) pin.displayedY);
             addView(marker, params);
         }
 
         if (visiblePins == 0 && !stopPins.isEmpty()) {
             updateStatus(String.format(Locale.UK, "No AR bus stop pins match route %s.", routeFilter));
         }
+    }
+
+    private Location smoothLocation(Location previous, Location next, float alpha) {
+        if (next == null) {
+            return previous;
+        }
+        if (previous == null) {
+            return new Location(next);
+        }
+        Location smoothed = new Location(next);
+        smoothed.setLatitude(lerp((float) previous.getLatitude(), (float) next.getLatitude(), alpha));
+        smoothed.setLongitude(lerp((float) previous.getLongitude(), (float) next.getLongitude(), alpha));
+        if (next.hasAccuracy()) {
+            smoothed.setAccuracy(next.getAccuracy());
+        }
+        return smoothed;
+    }
+
+    private float fallbackCompassBearing() {
+        if (!hasAcceleration || !hasMagneticField) {
+            return Float.NaN;
+        }
+        float[] rotationMatrix = new float[9];
+        float[] orientation = new float[3];
+        if (!SensorManager.getRotationMatrix(rotationMatrix, null, smoothedAcceleration, smoothedMagneticField)) {
+            return Float.NaN;
+        }
+        SensorManager.getOrientation(rotationMatrix, orientation);
+        return (float) ((Math.toDegrees(orientation[0]) + 360.0) % 360.0);
+    }
+
+    private void lowPassVector(float[] input, float[] output, float alpha) {
+        for (int i = 0; i < output.length && i < input.length; i++) {
+            output[i] = output[i] == 0f ? input[i] : output[i] + alpha * (input[i] - output[i]);
+        }
+    }
+
+    private float lerp(float from, float to, float fraction) {
+        return from + (to - from) * fraction;
     }
 
     private TextView createPinView(BusStopPin pin) {
@@ -297,7 +412,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
     }
 
     private int screenXFor(BusStopPin pin) {
-        float relativeBearing = (bearingTo(pin) - compassBearing + 540f) % 360f - 180f;
+        float relativeBearing = (bearingTo(pin) - smoothedCompassBearing + 540f) % 360f - 180f;
         int center = Math.max(0, getWidth() / 2 - dp(80));
         int offset = (int) (relativeBearing * dp(4));
         int max = Math.max(0, getWidth() - dp(170));
@@ -340,11 +455,95 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
     }
 
+
+    private final class PathOverlayView extends ViewGroup {
+        private final Paint glowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint linePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint dotPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private Location currentLocation;
+        private NavigationTarget target;
+        private float bearing;
+
+        PathOverlayView(Context context) {
+            super(context);
+            setWillNotDraw(false);
+            glowPaint.setColor(Color.argb(170, 255, 214, 0));
+            glowPaint.setStyle(Paint.Style.STROKE);
+            glowPaint.setStrokeCap(Paint.Cap.ROUND);
+            glowPaint.setStrokeJoin(Paint.Join.ROUND);
+            glowPaint.setStrokeWidth(dp(18));
+            glowPaint.setMaskFilter(new BlurMaskFilter(dp(10), BlurMaskFilter.Blur.NORMAL));
+            linePaint.setColor(Color.rgb(255, 245, 125));
+            linePaint.setStyle(Paint.Style.STROKE);
+            linePaint.setStrokeCap(Paint.Cap.ROUND);
+            linePaint.setStrokeJoin(Paint.Join.ROUND);
+            linePaint.setStrokeWidth(dp(7));
+            dotPaint.setColor(Color.WHITE);
+            dotPaint.setStyle(Paint.Style.FILL);
+        }
+
+        void setUserLocation(Location currentLocation) {
+            this.currentLocation = currentLocation;
+            invalidate();
+        }
+
+        void setTarget(NavigationTarget target) {
+            this.target = target;
+            invalidate();
+        }
+
+        void setBearing(float bearing) {
+            this.bearing = bearing;
+            invalidate();
+        }
+
+        @Override
+        protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            if (currentLocation == null || target == null || getWidth() == 0 || getHeight() == 0) {
+                return;
+            }
+            Location targetLocation = new Location("ar-target");
+            targetLocation.setLatitude(target.latitude);
+            targetLocation.setLongitude(target.longitude);
+            float distance = Math.max(1f, currentLocation.distanceTo(targetLocation));
+            float relativeBearing = (currentLocation.bearingTo(targetLocation) - bearing + 540f) % 360f - 180f;
+            float startX = getWidth() / 2f;
+            float startY = getHeight() - dp(52);
+            float endX = Math.max(dp(38), Math.min(getWidth() - dp(38), startX + relativeBearing * dp(5)));
+            float endY = Math.max(dp(140), startY - Math.min(getHeight() * 0.58f, distance * dp(3)));
+            Path path = new Path();
+            path.moveTo(startX, startY);
+            path.cubicTo(startX, startY - dp(120), endX, endY + dp(120), endX, endY);
+            canvas.drawPath(path, glowPaint);
+            canvas.drawPath(path, linePaint);
+            canvas.drawCircle(endX, endY, dp(8), dotPaint);
+        }
+    }
+
+    private static final class NavigationTarget {
+        final String name;
+        final double latitude;
+        final double longitude;
+
+        NavigationTarget(String name, double latitude, double longitude) {
+            this.name = name;
+            this.latitude = latitude;
+            this.longitude = longitude;
+        }
+    }
+
     private static final class BusStopPin {
         final String name;
         final String route;
         final double latitude;
         final double longitude;
+        float displayedX = Float.NaN;
+        float displayedY = Float.NaN;
 
         BusStopPin(String name, String route, double latitude, double longitude) {
             this.name = name;

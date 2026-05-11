@@ -11,13 +11,19 @@ import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Calendar;
 import java.util.Locale;
+import java.util.TimeZone;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -114,7 +120,7 @@ public class BusTrackingService extends Service {
             connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
             connection.setReadTimeout(READ_TIMEOUT_MS);
             connection.setRequestMethod("GET");
-            connection.setRequestProperty("Accept", "application/xml,text/xml,*/*");
+            connection.setRequestProperty("Accept", "application/json,application/xml,text/xml,*/*");
 
             int responseCode = connection.getResponseCode();
             if (responseCode < 200 || responseCode >= 300) {
@@ -148,9 +154,18 @@ public class BusTrackingService extends Service {
     }
 
     private List<BusPosition> parseSiriVehiclePositions(InputStream stream) throws Exception {
+        byte[] body = readAllBytes(stream);
+        String payload = new String(body, "UTF-8").trim();
+        if (payload.startsWith("{") || payload.startsWith("[")) {
+            return parseJsonVehiclePositions(payload);
+        }
+        return parseXmlVehiclePositions(body);
+    }
+
+    private List<BusPosition> parseXmlVehiclePositions(byte[] body) throws Exception {
         DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
         factory.setNamespaceAware(true);
-        Document document = factory.newDocumentBuilder().parse(stream);
+        Document document = factory.newDocumentBuilder().parse(new ByteArrayInputStream(body));
         NodeList activities = document.getElementsByTagNameNS("*", "VehicleActivity");
         List<BusPosition> positions = new ArrayList<>();
 
@@ -182,11 +197,109 @@ public class BusTrackingService extends Service {
             String id = firstNonEmpty(vehicleRef, datedJourneyRef, lineRef + ":" + i);
             float bearing = parseFloat(text(journey, "Bearing"), Float.NaN);
             String recordedAt = text(activity, "RecordedAtTime");
+            String occupancy = normalizeOccupancy(firstNonEmpty(
+                    text(journey, "Occupancy"),
+                    text(journey, "VehicleOccupancy"),
+                    text(journey, "PassengerCount"),
+                    text(activity, "Occupancy")));
+            if (TextUtils.isEmpty(occupancy)) {
+                occupancy = inferOccupancy(latitude, longitude);
+            }
 
-            positions.add(new BusPosition(id, firstNonEmpty(lineName, lineRef, "Bus"), latitude, longitude, bearing, recordedAt));
+            positions.add(new BusPosition(id, firstNonEmpty(lineName, lineRef, "Bus"), latitude, longitude, bearing, recordedAt, occupancy));
         }
 
         return positions;
+    }
+
+    private List<BusPosition> parseJsonVehiclePositions(String payload) throws Exception {
+        List<BusPosition> positions = new ArrayList<>();
+        Object root = payload.startsWith("[") ? new JSONArray(payload) : new JSONObject(payload);
+        collectJsonVehicleActivities(root, positions);
+        return positions;
+    }
+
+    private void collectJsonVehicleActivities(Object node, List<BusPosition> positions) throws Exception {
+        if (node instanceof JSONObject) {
+            JSONObject object = (JSONObject) node;
+            JSONObject journey = object.optJSONObject("MonitoredVehicleJourney");
+            if (journey != null) {
+                BusPosition position = positionFromJsonVehicleActivity(object, journey, positions.size());
+                if (position != null) {
+                    positions.add(position);
+                }
+            }
+            JSONArray names = object.names();
+            if (names == null) {
+                return;
+            }
+            for (int i = 0; i < names.length(); i++) {
+                collectJsonVehicleActivities(object.opt(names.getString(i)), positions);
+            }
+        } else if (node instanceof JSONArray) {
+            JSONArray array = (JSONArray) node;
+            for (int i = 0; i < array.length(); i++) {
+                collectJsonVehicleActivities(array.opt(i), positions);
+            }
+        }
+    }
+
+    private BusPosition positionFromJsonVehicleActivity(JSONObject activity, JSONObject journey, int index) {
+        JSONObject location = journey.optJSONObject("VehicleLocation");
+        if (location == null) {
+            return null;
+        }
+        double latitude = location.optDouble("Latitude", Double.NaN);
+        double longitude = location.optDouble("Longitude", Double.NaN);
+        if (Double.isNaN(latitude) || Double.isNaN(longitude)) {
+            return null;
+        }
+
+        String vehicleRef = jsonText(journey, "VehicleRef");
+        String datedJourneyRef = jsonText(journey, "DatedVehicleJourneyRef");
+        String lineRef = jsonText(journey, "LineRef");
+        String lineName = jsonText(journey, "PublishedLineName");
+        String id = firstNonEmpty(vehicleRef, datedJourneyRef, lineRef + ":" + index);
+        float bearing = parseFloat(jsonText(journey, "Bearing"), Float.NaN);
+        String recordedAt = jsonText(activity, "RecordedAtTime");
+        String occupancy = normalizeOccupancy(firstNonEmpty(
+                jsonText(journey, "Occupancy"),
+                jsonText(journey, "VehicleOccupancy"),
+                jsonText(journey, "PassengerCount"),
+                jsonText(activity, "Occupancy"),
+                jsonNestedText(journey, "VehicleJourney", "Occupancy"),
+                jsonNestedText(activity, "VehicleJourney", "Occupancy")));
+        if (TextUtils.isEmpty(occupancy)) {
+            occupancy = inferOccupancy(latitude, longitude);
+        }
+        return new BusPosition(id, firstNonEmpty(lineName, lineRef, "Bus"), latitude, longitude, bearing, recordedAt, occupancy);
+    }
+
+    private static String jsonNestedText(JSONObject parent, String objectName, String key) {
+        JSONObject object = parent == null ? null : parent.optJSONObject(objectName);
+        return object == null ? "" : jsonText(object, key);
+    }
+
+    private static String jsonText(JSONObject parent, String key) {
+        if (parent == null || !parent.has(key) || parent.isNull(key)) {
+            return "";
+        }
+        Object value = parent.opt(key);
+        if (value instanceof JSONObject) {
+            JSONObject object = (JSONObject) value;
+            return firstNonEmpty(object.optString("value", ""), object.optString("Value", ""), object.toString());
+        }
+        return String.valueOf(value).trim();
+    }
+
+    private static byte[] readAllBytes(InputStream stream) throws Exception {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        int read;
+        while ((read = stream.read(buffer)) != -1) {
+            output.write(buffer, 0, read);
+        }
+        return output.toByteArray();
     }
 
     private void broadcastPosition(BusPosition position) {
@@ -198,6 +311,7 @@ public class BusTrackingService extends Service {
         intent.putExtra(BusPosition.EXTRA_LONGITUDE, position.longitude);
         intent.putExtra(BusPosition.EXTRA_BEARING, position.bearing);
         intent.putExtra(BusPosition.EXTRA_RECORDED_AT, position.recordedAt);
+        intent.putExtra(BusPosition.EXTRA_OCCUPANCY, position.occupancy);
         sendBroadcast(intent);
     }
 
@@ -230,7 +344,49 @@ public class BusTrackingService extends Service {
                 return value;
             }
         }
-        return "unknown";
+        return "";
+    }
+
+    private static String normalizeOccupancy(String value) {
+        if (TextUtils.isEmpty(value)) {
+            return "";
+        }
+        String lower = value.toLowerCase(Locale.UK).replace("_", "").replace("-", "").replace(" ", "");
+        if (lower.contains("full") || lower.contains("standingroomonly")
+                || lower.contains("crushedstandingroomonly") || lower.contains("notacceptingpassengers")
+                || lower.contains("high") || lower.contains("busy")) {
+            return "Full";
+        }
+        if (lower.contains("medium") || lower.contains("fewseatsavailable")
+                || lower.contains("standingavailable")) {
+            return "Medium";
+        }
+        if (lower.contains("low") || lower.contains("quiet") || lower.contains("empty")
+                || lower.contains("seatsavailable")) {
+            return "Low";
+        }
+        try {
+            int passengerCount = Integer.parseInt(value.trim());
+            if (passengerCount >= 45) {
+                return "Full";
+            }
+            if (passengerCount >= 20) {
+                return "Medium";
+            }
+            return "Low";
+        } catch (NumberFormatException exception) {
+            return "";
+        }
+    }
+
+    private static String inferOccupancy(double latitude, double longitude) {
+        Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("Europe/London"));
+        int day = calendar.get(Calendar.DAY_OF_WEEK);
+        boolean weekday = day >= Calendar.MONDAY && day <= Calendar.FRIDAY;
+        int minutes = calendar.get(Calendar.HOUR_OF_DAY) * 60 + calendar.get(Calendar.MINUTE);
+        boolean peak = (minutes >= 8 * 60 && minutes <= 9 * 60) || (minutes >= (15 * 60) + 30 && minutes <= 17 * 60);
+        boolean scunthorpeArea = latitude > 53.50 && latitude < 53.66 && longitude > -0.78 && longitude < -0.50;
+        return weekday && peak && scunthorpeArea ? "Likely Busy" : "Unknown";
     }
 
     private static float parseFloat(String value, float fallback) {
