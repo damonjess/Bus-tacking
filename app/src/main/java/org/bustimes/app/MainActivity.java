@@ -1,12 +1,16 @@
 package org.bustimes.app;
 
 import android.Manifest;
+import android.animation.ValueAnimator;
+import android.app.AlertDialog;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.DownloadManager;
 import android.content.ActivityNotFoundException;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -24,6 +28,7 @@ import android.view.ViewGroup;
 import android.webkit.CookieManager;
 import android.webkit.DownloadListener;
 import android.webkit.GeolocationPermissions;
+import android.webkit.JavascriptInterface;
 import android.webkit.URLUtil;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
@@ -32,22 +37,33 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.view.animation.LinearInterpolator;
+
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
 
 public class MainActivity extends Activity {
     private static final int LOCATION_PERMISSION_REQUEST = 1001;
     private static final int CENTER_MAP_PERMISSION_REQUEST = 1002;
     private static final String SAVED_URL = "saved_url";
     private static final String MAP_URL = "https://bustimes.org/map";
+    private static final long BUS_MARKER_ANIMATION_MS = 5_000L;
 
     private WebView webView;
     private ProgressBar progressBar;
     private Button locateButton;
+    private LinearLayout zoomControls;
     private TextView helperChip;
+    private final Map<String, AnimatedBusMarker> trackedBusMarkers = new HashMap<>();
+    private final BroadcastReceiver busTrackingReceiver = new BusTrackingReceiver();
     private GeolocationPermissions.Callback geolocationCallback;
     private String geolocationOrigin;
+    private boolean busTrackingReceiverRegistered;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -57,6 +73,7 @@ public class MainActivity extends Activity {
         webView = new WebView(this);
         progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         locateButton = createLocateButton();
+        zoomControls = createZoomControls();
         helperChip = createHelperChip();
 
         root.addView(webView, new FrameLayout.LayoutParams(
@@ -74,6 +91,12 @@ public class MainActivity extends Activity {
         locateParams.setMargins(0, 0, dp(20), dp(28));
         root.addView(locateButton, locateParams);
 
+        FrameLayout.LayoutParams zoomParams = new FrameLayout.LayoutParams(dp(52),
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP | Gravity.END);
+        zoomParams.setMargins(0, dp(72), dp(14), 0);
+        root.addView(zoomControls, zoomParams);
+
         FrameLayout.LayoutParams helperParams = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -89,6 +112,8 @@ public class MainActivity extends Activity {
             url = savedInstanceState.getString(SAVED_URL, MAP_URL);
         }
         webView.loadUrl(url);
+        registerBusTrackingReceiver();
+        startService(new Intent(this, BusTrackingService.class));
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -114,6 +139,7 @@ public class MainActivity extends Activity {
         }
 
         webView.setBackgroundColor(Color.WHITE);
+        webView.addJavascriptInterface(new BusMarkerBridge(), "BusMarkerBridge");
         webView.setWebViewClient(new BusTimesWebViewClient());
         webView.setWebChromeClient(new BusTimesChromeClient());
         webView.setDownloadListener(new BusTimesDownloadListener());
@@ -131,9 +157,66 @@ public class MainActivity extends Activity {
         return button;
     }
 
+    private LinearLayout createZoomControls() {
+        LinearLayout controls = new LinearLayout(this);
+        controls.setOrientation(LinearLayout.VERTICAL);
+        controls.setGravity(Gravity.CENTER);
+        controls.setBackgroundColor(Color.argb(235, 255, 255, 255));
+        controls.setContentDescription("Map zoom controls");
+
+        Button zoomInButton = createZoomButton("+", "Zoom in on the live bus map");
+        zoomInButton.setOnClickListener(v -> zoomWebMap(true));
+        controls.addView(zoomInButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(48)));
+
+        Button zoomOutButton = createZoomButton("−", "Zoom out on the live bus map");
+        zoomOutButton.setOnClickListener(v -> zoomWebMap(false));
+        controls.addView(zoomOutButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(48)));
+
+        return controls;
+    }
+
+    private Button createZoomButton(String label, String description) {
+        Button button = new Button(this);
+        button.setText(label);
+        button.setTextSize(24);
+        button.setTypeface(Typeface.DEFAULT_BOLD);
+        button.setTextColor(Color.rgb(17, 76, 141));
+        button.setBackgroundColor(Color.TRANSPARENT);
+        button.setContentDescription(description);
+        button.setAllCaps(false);
+        button.setMinWidth(0);
+        button.setMinHeight(0);
+        button.setPadding(0, 0, 0, 0);
+        return button;
+    }
+
+    private void zoomWebMap(boolean zoomIn) {
+        String selector = zoomIn
+                ? ".maplibregl-ctrl-zoom-in, .mapboxgl-ctrl-zoom-in, .leaflet-control-zoom-in, [aria-label='Zoom in']"
+                : ".maplibregl-ctrl-zoom-out, .mapboxgl-ctrl-zoom-out, .leaflet-control-zoom-out, [aria-label='Zoom out']";
+        String script = "(function(){"
+                + "var button=document.querySelector(\"" + selector + "\");"
+                + "if(button){button.click();return true;}"
+                + "return false;"
+                + "})();";
+        webView.evaluateJavascript(script, clicked -> {
+            if (!"true".equals(clicked)) {
+                if (zoomIn) {
+                    webView.zoomIn();
+                } else {
+                    webView.zoomOut();
+                }
+            }
+        });
+    }
+
     private TextView createHelperChip() {
         TextView chip = new TextView(this);
-        chip.setText("Live map: tap buses for route numbers, tap stops for departures");
+        chip.setText("Live map: tap buses for route numbers/last seen, tap stops for departures");
         chip.setTextColor(Color.WHITE);
         chip.setTextSize(13);
         chip.setTypeface(Typeface.DEFAULT_BOLD);
@@ -167,6 +250,14 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (busTrackingReceiverRegistered) {
+            unregisterReceiver(busTrackingReceiver);
+            busTrackingReceiverRegistered = false;
+        }
+        for (AnimatedBusMarker marker : trackedBusMarkers.values()) {
+            marker.cancelAnimation();
+        }
+        trackedBusMarkers.clear();
         if (webView != null) {
             webView.destroy();
         }
@@ -293,6 +384,105 @@ public class MainActivity extends Activity {
         webView.loadUrl(url);
     }
 
+
+    private void registerBusTrackingReceiver() {
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(BusTrackingService.ACTION_BUS_POSITION);
+        filter.addAction(BusTrackingService.ACTION_TRACKING_STATUS);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(busTrackingReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(busTrackingReceiver, filter);
+        }
+        busTrackingReceiverRegistered = true;
+    }
+
+    private void updateTrackedBusMarker(Intent intent) {
+        String id = intent.getStringExtra(BusPosition.EXTRA_ID);
+        if (id == null || id.trim().isEmpty()) {
+            return;
+        }
+
+        String lineName = intent.getStringExtra(BusPosition.EXTRA_LINE_NAME);
+        String recordedAt = intent.getStringExtra(BusPosition.EXTRA_RECORDED_AT);
+        double nextLatitude = intent.getDoubleExtra(BusPosition.EXTRA_LATITUDE, Double.NaN);
+        double nextLongitude = intent.getDoubleExtra(BusPosition.EXTRA_LONGITUDE, Double.NaN);
+        float nextBearing = intent.getFloatExtra(BusPosition.EXTRA_BEARING, Float.NaN);
+        if (Double.isNaN(nextLatitude) || Double.isNaN(nextLongitude)) {
+            return;
+        }
+
+        AnimatedBusMarker marker = trackedBusMarkers.get(id);
+        if (marker == null) {
+            marker = new AnimatedBusMarker(id, firstNonEmpty(lineName, "Bus"), nextLatitude, nextLongitude,
+                    Float.isNaN(nextBearing) ? 0f : nextBearing, firstNonEmpty(recordedAt, "Unknown"));
+            trackedBusMarkers.put(id, marker);
+            marker.renderAt(nextLatitude, nextLongitude, marker.bearing);
+            return;
+        }
+
+        float bearing = Float.isNaN(nextBearing)
+                ? bearingBetween(marker.latitude, marker.longitude, nextLatitude, nextLongitude)
+                : nextBearing;
+        marker.animateTo(nextLatitude, nextLongitude, bearing, firstNonEmpty(recordedAt, "Unknown"));
+    }
+
+    private float bearingBetween(double startLatitude, double startLongitude, double endLatitude, double endLongitude) {
+        double startLatRadians = Math.toRadians(startLatitude);
+        double endLatRadians = Math.toRadians(endLatitude);
+        double deltaLongitudeRadians = Math.toRadians(endLongitude - startLongitude);
+        double y = Math.sin(deltaLongitudeRadians) * Math.cos(endLatRadians);
+        double x = Math.cos(startLatRadians) * Math.sin(endLatRadians)
+                - Math.sin(startLatRadians) * Math.cos(endLatRadians) * Math.cos(deltaLongitudeRadians);
+        return (float) ((Math.toDegrees(Math.atan2(y, x)) + 360.0) % 360.0);
+    }
+
+    private String firstNonEmpty(String... values) {
+        for (String value : values) {
+            if (value != null && !value.trim().isEmpty()) {
+                return value;
+            }
+        }
+        return "";
+    }
+
+    private String escapeJs(String value) {
+        return value.replace("\\", "\\\\")
+                .replace("'", "\\'")
+                .replace("\n", "\\n")
+                .replace("\r", "");
+    }
+
+    private void renderNativeBusMarker(String id, String label, double latitude, double longitude, float bearing,
+            String lastSeen) {
+        String script = String.format(Locale.US,
+                "(function(){"
+                        + "window.__bodsMarkers=window.__bodsMarkers||{};"
+                        + "window.__bodsFindMap=window.__bodsFindMap||function(){"
+                        + "if(window.map&&window.map.project)return window.map;"
+                        + "for(var k in window){try{var v=window[k];if(v&&v.project&&v.getContainer)return v;}catch(e){}}"
+                        + "return null;};"
+                        + "var map=window.__bodsFindMap();if(!map)return false;"
+                        + "var container=map.getContainer();"
+                        + "if(getComputedStyle(container).position==='static')container.style.position='relative';"
+                        + "var marker=window.__bodsMarkers['%s'];"
+                        + "if(!marker){marker=document.createElement('div');marker.className='native-bods-bus-marker';"
+                        + "marker.style.cssText='position:absolute;z-index:50;width:34px;height:34px;margin-left:-17px;margin-top:-17px;border-radius:17px;background:#114c8d;color:white;border:2px solid white;box-shadow:0 2px 6px rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;font:bold 12px sans-serif;pointer-events:auto;cursor:pointer;transform-origin:center center;';"
+                        + "container.appendChild(marker);window.__bodsMarkers['%s']=marker;}"
+                        + "marker.textContent='%s';"
+                        + "marker.dataset.lng=%f;marker.dataset.lat=%f;marker.dataset.bearing=%f;"
+                        + "marker.dataset.lastSeen='%s';marker.title='Route %s\\nLast seen: %s';"
+                        + "marker.onclick=function(event){if(event)event.stopPropagation();if(window.BusMarkerBridge){window.BusMarkerBridge.showBusDetails('%s',marker.dataset.lastSeen);}};"
+                        + "window.__bodsPlaceMarker=function(m){var p=map.project([parseFloat(m.dataset.lng),parseFloat(m.dataset.lat)]);m.style.left=p.x+'px';m.style.top=p.y+'px';m.style.transform='rotate('+parseFloat(m.dataset.bearing)+'deg)';};"
+                        + "window.__bodsPlaceMarker(marker);"
+                        + "if(!window.__bodsMarkersListening){window.__bodsMarkersListening=true;var update=function(){Object.keys(window.__bodsMarkers).forEach(function(key){window.__bodsPlaceMarker(window.__bodsMarkers[key]);});};map.on&&map.on('move',update);map.on&&map.on('zoom',update);map.on&&map.on('resize',update);}"
+                        + "return true;})();",
+                escapeJs(id), escapeJs(id), escapeJs(label), longitude, latitude, bearing, escapeJs(lastSeen),
+                escapeJs(label), escapeJs(lastSeen), escapeJs(label));
+        webView.evaluateJavascript(script, ignored -> {
+        });
+    }
+
     private void openOutsideApp(Uri uri) {
         Intent intent = new Intent(Intent.ACTION_VIEW, uri);
         try {
@@ -336,6 +526,84 @@ public class MainActivity extends Activity {
         return true;
     }
 
+    private class BusMarkerBridge {
+        @JavascriptInterface
+        public void showBusDetails(String route, String lastSeen) {
+            runOnUiThread(() -> new AlertDialog.Builder(MainActivity.this)
+                    .setTitle("Route " + firstNonEmpty(route, "Bus"))
+                    .setMessage("Last seen: " + firstNonEmpty(lastSeen, "Unknown"))
+                    .setPositiveButton(android.R.string.ok, null)
+                    .show());
+        }
+    }
+
+    private class AnimatedBusMarker {
+        private final String id;
+        private final String label;
+        private double latitude;
+        private double longitude;
+        private float bearing;
+        private String lastSeen;
+        private ValueAnimator animator;
+
+        AnimatedBusMarker(String id, String label, double latitude, double longitude, float bearing, String lastSeen) {
+            this.id = id;
+            this.label = label;
+            this.latitude = latitude;
+            this.longitude = longitude;
+            this.bearing = bearing;
+            this.lastSeen = lastSeen;
+        }
+
+        void animateTo(double nextLatitude, double nextLongitude, float nextBearing, String nextLastSeen) {
+            cancelAnimation();
+            double startLatitude = latitude;
+            double startLongitude = longitude;
+            float startBearing = bearing;
+            lastSeen = nextLastSeen;
+            animator = ValueAnimator.ofFloat(0f, 1f);
+            animator.setDuration(BUS_MARKER_ANIMATION_MS);
+            animator.setInterpolator(new LinearInterpolator());
+            animator.addUpdateListener(animation -> {
+                float fraction = (float) animation.getAnimatedValue();
+                latitude = startLatitude + ((nextLatitude - startLatitude) * fraction);
+                longitude = startLongitude + ((nextLongitude - startLongitude) * fraction);
+                bearing = startBearing + shortestBearingDelta(startBearing, nextBearing) * fraction;
+                renderAt(latitude, longitude, bearing);
+            });
+            animator.start();
+        }
+
+        void renderAt(double latitude, double longitude, float bearing) {
+            renderNativeBusMarker(id, label, latitude, longitude, bearing, lastSeen);
+        }
+
+        void cancelAnimation() {
+            if (animator != null) {
+                animator.cancel();
+            }
+        }
+
+        private float shortestBearingDelta(float from, float to) {
+            return ((to - from + 540f) % 360f) - 180f;
+        }
+    }
+
+    private class BusTrackingReceiver extends BroadcastReceiver {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if (BusTrackingService.ACTION_BUS_POSITION.equals(action)) {
+                updateTrackedBusMarker(intent);
+            } else if (BusTrackingService.ACTION_TRACKING_STATUS.equals(action)) {
+                String message = intent.getStringExtra(BusTrackingService.EXTRA_STATUS_MESSAGE);
+                if (message != null && message.startsWith("Add a BODS_API_KEY")) {
+                    Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
+                }
+            }
+        }
+    }
+
     private class BusTimesWebViewClient extends WebViewClient {
         @Override
         public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
@@ -355,6 +623,7 @@ public class MainActivity extends Activity {
             progressBar.setVisibility(newProgress >= 100 ? View.GONE : View.VISIBLE);
             if (newProgress >= 100) {
                 locateButton.bringToFront();
+                zoomControls.bringToFront();
                 helperChip.bringToFront();
             }
         }
