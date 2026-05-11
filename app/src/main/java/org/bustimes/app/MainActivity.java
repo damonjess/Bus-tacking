@@ -22,9 +22,12 @@ import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
 import android.net.Uri;
+import android.provider.Settings;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -81,6 +84,8 @@ public class MainActivity extends Activity {
     private boolean busTrackingReceiverRegistered;
     private SpeechRecognizer speechRecognizer;
     private LocationListener arLocationListener;
+    private LocationListener locateLocationListener;
+    private final Handler locateHandler = new Handler(Looper.getMainLooper());
     private String activeRouteFilter = "";
     private boolean arModeEnabled;
 
@@ -165,6 +170,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onStop() {
+        stopLocateUpdates();
         setMapTrackingActive(false);
         super.onStop();
     }
@@ -364,6 +370,7 @@ public class MainActivity extends Activity {
             marker.cancelAnimation();
         }
         trackedBusMarkers.clear();
+        stopLocateUpdates();
         stopVoiceSearch();
         arBusStopView.destroyAr();
         if (webView != null) {
@@ -417,6 +424,11 @@ public class MainActivity extends Activity {
                 || checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
     }
 
+    private boolean hasFineLocationPermission() {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.M
+                || checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+    }
+
     private void requestLocationForWebsite(String origin, GeolocationPermissions.Callback callback) {
         if (hasLocationPermission()) {
             callback.invoke(origin, true, false);
@@ -443,18 +455,27 @@ public class MainActivity extends Activity {
         }
 
         LocationManager locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
-        Location location = getBestLastKnownLocation(locationManager);
-        if (location != null) {
-            loadMapAtLocation(location);
+        if (locationManager == null) {
+            Toast.makeText(this, "Location service is not available on this device", Toast.LENGTH_LONG).show();
             return;
         }
 
-        requestFreshLocation(locationManager);
+        Location location = getBestLastKnownLocation(locationManager);
+        if (location != null && isRecentEnough(location)) {
+            loadMapAtLocation(location);
+            requestFreshLocation(locationManager, false);
+            return;
+        }
+
+        requestFreshLocation(locationManager, true);
     }
 
     @SuppressLint("MissingPermission")
     private Location getBestLastKnownLocation(LocationManager locationManager) {
         Location bestLocation = null;
+        if (locationManager == null) {
+            return null;
+        }
         for (String provider : locationManager.getProviders(true)) {
             Location location = locationManager.getLastKnownLocation(provider);
             if (location == null) {
@@ -467,20 +488,48 @@ public class MainActivity extends Activity {
         return bestLocation;
     }
 
+    private boolean isRecentEnough(Location location) {
+        return location.getTime() > 0 && System.currentTimeMillis() - location.getTime() < 120_000L;
+    }
+
     @SuppressLint("MissingPermission")
-    private void requestFreshLocation(LocationManager locationManager) {
-        Criteria criteria = new Criteria();
-        criteria.setAccuracy(Criteria.ACCURACY_FINE);
-        String provider = locationManager.getBestProvider(criteria, true);
-        if (provider == null) {
-            Toast.makeText(this, "Turn on location services to find buses near you", Toast.LENGTH_LONG).show();
+    private void requestFreshLocation(LocationManager locationManager, boolean showWaitingMessage) {
+        stopLocateUpdates();
+        if (locationManager == null) {
+            Toast.makeText(this, "Location service is not available on this device", Toast.LENGTH_LONG).show();
             return;
         }
 
-        Toast.makeText(this, "Finding your location…", Toast.LENGTH_SHORT).show();
-        locationManager.requestSingleUpdate(provider, new LocationListener() {
+        java.util.List<String> providers = new ArrayList<>();
+        if (hasFineLocationPermission() && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+            providers.add(LocationManager.GPS_PROVIDER);
+        }
+        if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+            providers.add(LocationManager.NETWORK_PROVIDER);
+        }
+        if (providers.isEmpty()) {
+            for (String provider : locationManager.getProviders(true)) {
+                if (!providers.contains(provider)) {
+                    providers.add(provider);
+                }
+            }
+        }
+        if (providers.isEmpty()) {
+            Toast.makeText(this, "Turn on location services to find buses near you", Toast.LENGTH_LONG).show();
+            try {
+                startActivity(new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS));
+            } catch (Exception ignored) {
+            }
+            return;
+        }
+
+        if (showWaitingMessage) {
+            Toast.makeText(this, "Finding your location…", Toast.LENGTH_SHORT).show();
+        }
+        locateLocationListener = new LocationListener() {
             @Override
             public void onLocationChanged(Location location) {
+                stopLocateUpdates();
                 loadMapAtLocation(location);
             }
 
@@ -494,14 +543,66 @@ public class MainActivity extends Activity {
 
             @Override
             public void onProviderDisabled(String provider) {
-                Toast.makeText(MainActivity.this, "Turn on location services to find buses near you", Toast.LENGTH_LONG).show();
             }
-        }, null);
+        };
+
+        for (String provider : providers) {
+            try {
+                locationManager.requestLocationUpdates(provider, 0L, 0f, locateLocationListener);
+            } catch (SecurityException exception) {
+                // The user may have granted approximate location only; keep trying providers allowed by that grant.
+            }
+        }
+        locateHandler.postDelayed(() -> {
+            if (locateLocationListener == null) {
+                return;
+            }
+            stopLocateUpdates();
+            Location fallback = getBestLastKnownLocation(locationManager);
+            if (fallback != null) {
+                loadMapAtLocation(fallback);
+            } else {
+                Toast.makeText(this, "Still waiting for GPS. Move near a window or turn on High accuracy location.", Toast.LENGTH_LONG).show();
+            }
+        }, 10_000L);
+    }
+
+    private void stopLocateUpdates() {
+        locateHandler.removeCallbacksAndMessages(null);
+        if (locateLocationListener == null) {
+            return;
+        }
+        LocationManager locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+        if (locationManager != null) {
+            locationManager.removeUpdates(locateLocationListener);
+        }
+        locateLocationListener = null;
     }
 
     private void loadMapAtLocation(Location location) {
-        String url = MAP_URL + "#16/" + location.getLatitude() + "/" + location.getLongitude();
-        webView.loadUrl(url);
+        if (location == null) {
+            return;
+        }
+        double latitude = location.getLatitude();
+        double longitude = location.getLongitude();
+        String url = String.format(Locale.US, "%s#16/%f/%f", MAP_URL, latitude, longitude);
+        String script = String.format(Locale.US,
+                "(function(){"
+                        + "var lat=%f,lng=%f,zoom=16;"
+                        + "var map=window.__bodsFindMap&&window.__bodsFindMap();"
+                        + "if(map){"
+                        + "if(map.flyTo){map.flyTo({center:[lng,lat],zoom:zoom});location.hash='#'+zoom+'/'+lat+'/'+lng;return true;}"
+                        + "if(map.setView){map.setView([lat,lng],zoom);location.hash='#'+zoom+'/'+lat+'/'+lng;return true;}"
+                        + "if(map.easeTo){map.easeTo({center:[lng,lat],zoom:zoom});location.hash='#'+zoom+'/'+lat+'/'+lng;return true;}"
+                        + "}"
+                        + "location.href='%s';return false;})();",
+                latitude, longitude, escapeJs(url));
+        webView.evaluateJavascript(script, centred -> {
+            if (!"true".equals(centred)) {
+                webView.loadUrl(url);
+            }
+        });
+        Toast.makeText(this, "Map centred on your location", Toast.LENGTH_SHORT).show();
     }
 
     private void stopVoiceSearch() {
@@ -850,6 +951,9 @@ public class MainActivity extends Activity {
             return;
         }
         LocationManager locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+        if (locationManager == null) {
+            return;
+        }
         Criteria criteria = new Criteria();
         criteria.setAccuracy(Criteria.ACCURACY_FINE);
         String provider = locationManager.getBestProvider(criteria, true);

@@ -499,7 +499,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
 
     private String explainDelay(String lineName, String etaText, String occupancy) {
         if (etaText == null || !etaText.contains("Arriving in")) {
-            return "Predictor: awaiting live ETA";
+            return "AI Delay Predictor: awaiting live ETA";
         }
         int minutes = 0;
         String[] parts = etaText.split(" ");
@@ -511,12 +511,12 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             }
         }
         if (minutes >= 8) {
-            return String.format(Locale.UK, "Route %s may be delayed by traffic or weather near Scunthorpe town centre.", lineName);
+            return String.format(Locale.UK, "AI Delay Predictor: Route %s may be delayed by traffic or weather near Scunthorpe town centre.", lineName);
         }
         if ("Full/Crowded".equals(occupancy)) {
-            return String.format(Locale.UK, "Route %s boarding may be slower because the bus is crowded.", lineName);
+            return String.format(Locale.UK, "AI Delay Predictor: Route %s boarding may be slower because the bus is crowded.", lineName);
         }
-        return "Predictor: running on time";
+        return "AI Delay Predictor: running on time";
     }
 
     private void renderBusBillboards() {
@@ -1131,8 +1131,8 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             canvas.drawRoundRect(new RectF(left, top, right, bottom), dp(12), dp(12), miniMapPaint);
             canvas.drawText("Future HUD", left + dp(12), top + dp(22), calibratingPaint);
             canvas.drawText(directionsStatus, left + dp(12), top + dp(43), calibratingPaint);
-            canvas.drawText("Ghost buses: " + nearbyBusCount(), left + dp(12), top + dp(64), calibratingPaint);
-            canvas.drawText("Traffic/Weather AI: local predictor", left + dp(12), top + dp(84), calibratingPaint);
+            canvas.drawText("X-Ray ghost buses: " + nearbyBusCount(), left + dp(12), top + dp(64), calibratingPaint);
+            canvas.drawText("AI Delay Predictor: local", left + dp(12), top + dp(84), calibratingPaint);
         }
 
         private int nearbyBusCount() {
@@ -1171,7 +1171,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
                 canvas.drawRoundRect(new RectF(x - dp(28), y - dp(18), x + dp(28), y + dp(18)), dp(12), dp(12), ghostPaint);
                 canvas.drawCircle(x - dp(14), y + dp(18), dp(5 + (int) (pulse * 5)), ghostPaint);
                 canvas.drawCircle(x + dp(14), y + dp(18), dp(5 + (int) (pulse * 5)), ghostPaint);
-                canvas.drawText("Ghost " + billboard.lineName + " " + Math.round(distance) + "m", x, y - dp(28), calibratingPaint);
+                canvas.drawText("X-Ray " + billboard.lineName + " " + Math.round(distance) + "m", x, y - dp(28), calibratingPaint);
             }
         }
 
@@ -1188,8 +1188,8 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
                 float y = screenYFor(pin, 1);
                 RectF shelter = new RectF(x - dp(50), y - dp(65), x + dp(50), y + dp(25));
                 canvas.drawRoundRect(shelter, dp(10), dp(10), shelterPaint);
-                canvas.drawText("Virtual Shelter", x, y - dp(42), calibratingPaint);
-                canvas.drawText("Live departures + occupancy heat-map", x, y - dp(20), calibratingPaint);
+                canvas.drawText("Virtual AR Bus Shelter", x, y - dp(42), calibratingPaint);
+                canvas.drawText("Live board + occupancy heat-map", x, y - dp(20), calibratingPaint);
             }
         }
 
@@ -1273,24 +1273,6 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         }
     }
 
-    private static final class BusBillboard {
-        final String id;
-        String lineName = "Bus";
-        String destinationName = "destination unknown";
-        String etaText = "ETA unknown";
-        String occupancy = "Information Unknown";
-        public String delayExplanation;
-        double latitude;
-        double longitude;
-        long lastUpdatedMs;
-        float displayedX = Float.NaN;
-        float displayedY = Float.NaN;
-
-        BusBillboard(String id) {
-            this.id = id;
-            this.delayExplanation = "";
-        }
-    }
 
     private static final class BusStopPin {
         final String name;
