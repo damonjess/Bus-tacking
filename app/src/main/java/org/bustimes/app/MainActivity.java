@@ -500,10 +500,9 @@ public class MainActivity extends Activity {
             return;
         }
 
-        if (speechRecognizer == null) {
-            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
-            speechRecognizer.setRecognitionListener(new RouteRecognitionListener());
-        }
+        stopVoiceSearch();
+        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+        speechRecognizer.setRecognitionListener(new RouteRecognitionListener());
 
         Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
@@ -522,7 +521,7 @@ public class MainActivity extends Activity {
 
         new AlertDialog.Builder(this)
                 .setTitle("Did you mean route " + route + "?")
-                .setMessage("I heard: "" + spokenText + """)
+                .setMessage("I heard: \"" + spokenText + "\"")
                 .setPositiveButton("Yes", (dialog, which) -> {
                     applyConfirmedRouteFilter(route);
                     stopVoiceSearch();
@@ -531,6 +530,7 @@ public class MainActivity extends Activity {
                     stopVoiceSearch();
                     startVoiceSearch();
                 })
+                .setOnCancelListener(dialog -> stopVoiceSearch())
                 .show();
     }
 
@@ -879,6 +879,7 @@ public class MainActivity extends Activity {
             ArrayList<String> matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
             if (matches == null || matches.isEmpty()) {
                 Toast.makeText(MainActivity.this, "No bus number heard", Toast.LENGTH_SHORT).show();
+                stopVoiceSearch();
                 return;
             }
             applyVoiceRouteFilter(matches.get(0));
