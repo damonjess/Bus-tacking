@@ -9,6 +9,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Path;
+import android.graphics.RectF;
 import android.graphics.SurfaceTexture;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
@@ -61,6 +62,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
     private final PathOverlayView pathOverlayView;
     private final List<BusStopPin> stopPins = new ArrayList<>();
     private final List<BusBillboard> busBillboards = new ArrayList<>();
+    private final List<AnchorPoint> routeAnchors = new ArrayList<>();
     private final SensorManager sensorManager;
     private final Sensor rotationSensor;
     private final Sensor accelerometerSensor;
@@ -178,7 +180,8 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
     public void setNavigationTarget(String name, double latitude, double longitude) {
         navigationTarget = new NavigationTarget(name, latitude, longitude);
         pathOverlayView.setTarget(navigationTarget);
-        updateStatus("AR wayfinding path locked to " + name + " — follow the glowing pavement ribbon.");
+        pathOverlayView.setDirectionsStatus("Directions API: Loading");
+        updateStatus("AR wayfinding path locked to " + name + " — follow the glowing neon wall.");
         requestWalkingRouteIfReady(true);
     }
 
@@ -209,6 +212,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         billboard.destinationName = destinationName == null || destinationName.trim().isEmpty() ? "destination unknown" : destinationName.trim();
         billboard.etaText = etaText == null || etaText.trim().isEmpty() ? "ETA unknown" : etaText.trim();
         billboard.occupancy = occupancy == null || occupancy.trim().isEmpty() ? "Information Unknown" : occupancy.trim();
+        billboard.delayExplanation = explainDelay(billboard.lineName, billboard.etaText, billboard.occupancy);
         billboard.latitude = latitude;
         billboard.longitude = longitude;
         billboard.lastUpdatedMs = System.currentTimeMillis();
@@ -493,6 +497,28 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
     }
 
 
+    private String explainDelay(String lineName, String etaText, String occupancy) {
+        if (etaText == null || !etaText.contains("Arriving in")) {
+            return "Predictor: awaiting live ETA";
+        }
+        int minutes = 0;
+        String[] parts = etaText.split(" ");
+        for (String part : parts) {
+            try {
+                minutes = Integer.parseInt(part);
+                break;
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        if (minutes >= 8) {
+            return String.format(Locale.UK, "Route %s may be delayed by traffic or weather near Scunthorpe town centre.", lineName);
+        }
+        if ("Full/Crowded".equals(occupancy)) {
+            return String.format(Locale.UK, "Route %s boarding may be slower because the bus is crowded.", lineName);
+        }
+        return "Predictor: running on time";
+    }
+
     private void renderBusBillboards() {
         long now = System.currentTimeMillis();
         for (BusBillboard billboard : busBillboards) {
@@ -516,9 +542,9 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
 
     private TextView createBusBillboardView(BusBillboard billboard) {
         TextView view = new TextView(getContext());
-        view.setText(String.format(Locale.UK, "%s %s\n%s\nStatus: %s",
+        view.setText(String.format(Locale.UK, "%s %s\n%s\nStatus: %s\n%s",
                 occupancyIcon(billboard.occupancy), billboardTitle(billboard),
-                billboard.etaText, billboard.occupancy));
+                billboard.etaText, billboard.occupancy, billboard.delayExplanation));
         view.setTextColor(Color.WHITE);
         view.setTextSize(14);
         view.setGravity(Gravity.CENTER);
@@ -626,17 +652,36 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         Location origin = new Location(userLocation);
         NavigationTarget target = navigationTarget;
         if (BuildConfig.GOOGLE_DIRECTIONS_API_KEY.isEmpty()) {
-            pathOverlayView.setRoute(smoothRoute(fallbackRoute(origin, target)));
+            List<Location> fallback = smoothRoute(fallbackRoute(origin, target));
+            createGpsAnchorsForRoute(fallback);
+            pathOverlayView.setDirectionsStatus("Directions API: Failed");
+            pathOverlayView.setRoute(fallback);
             return;
         }
+        pathOverlayView.setDirectionsStatus("Directions API: Loading");
         directionsExecutor.execute(() -> {
             List<Location> route = fetchWalkingDirections(origin, target);
-            if (route.isEmpty()) {
+            boolean directionsOk = !route.isEmpty();
+            if (!directionsOk) {
                 route = fallbackRoute(origin, target);
             }
             List<Location> smoothed = smoothRoute(route);
-            post(() -> pathOverlayView.setRoute(smoothed));
+            createGpsAnchorsForRoute(smoothed);
+            post(() -> {
+                pathOverlayView.setDirectionsStatus(directionsOk ? "Directions API: OK" : "Directions API: Failed");
+                pathOverlayView.setRoute(smoothed);
+            });
         });
+    }
+
+    private void createGpsAnchorsForRoute(List<Location> route) {
+        synchronized (routeAnchors) {
+            routeAnchors.clear();
+            for (int i = 0; i < route.size(); i += Math.max(1, route.size() / 24)) {
+                Location point = route.get(i);
+                routeAnchors.add(new AnchorPoint(point.getLatitude(), point.getLongitude(), 0f));
+            }
+        }
     }
 
     private List<Location> fetchWalkingDirections(Location origin, NavigationTarget target) {
@@ -896,6 +941,11 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         private final Paint glowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint ribbonPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint arrowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint wallPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint miniMapPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint miniMapPathPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint ghostPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint shelterPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint calibratingPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private Location currentLocation;
         private NavigationTarget target;
@@ -903,6 +953,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         private float bearing;
         private boolean calibrating;
         private boolean depthOcclusionEnabled;
+        private String directionsStatus = "Directions API: Failed";
         private long animationStartedAt = System.currentTimeMillis();
 
         PathOverlayView(Context context) {
@@ -921,6 +972,20 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             ribbonPaint.setStrokeWidth(dp(34));
             arrowPaint.setColor(Color.argb(235, 255, 255, 255));
             arrowPaint.setStyle(Paint.Style.FILL);
+            wallPaint.setColor(Color.argb(170, 255, 235, 59));
+            wallPaint.setStyle(Paint.Style.FILL);
+            wallPaint.setMaskFilter(new BlurMaskFilter(dp(14), BlurMaskFilter.Blur.NORMAL));
+            miniMapPaint.setColor(Color.argb(185, 0, 0, 0));
+            miniMapPaint.setStyle(Paint.Style.FILL);
+            miniMapPathPaint.setColor(Color.rgb(33, 150, 243));
+            miniMapPathPaint.setStyle(Paint.Style.STROKE);
+            miniMapPathPaint.setStrokeWidth(dp(4));
+            miniMapPathPaint.setStrokeCap(Paint.Cap.ROUND);
+            ghostPaint.setColor(Color.argb(120, 0, 229, 255));
+            ghostPaint.setStyle(Paint.Style.FILL_AND_STROKE);
+            shelterPaint.setColor(Color.argb(95, 0, 255, 180));
+            shelterPaint.setStyle(Paint.Style.STROKE);
+            shelterPaint.setStrokeWidth(dp(3));
             calibratingPaint.setColor(Color.WHITE);
             calibratingPaint.setTextSize(dp(15));
             calibratingPaint.setTextAlign(Paint.Align.CENTER);
@@ -948,6 +1013,11 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             invalidate();
         }
 
+        void setDirectionsStatus(String directionsStatus) {
+            this.directionsStatus = directionsStatus;
+            invalidate();
+        }
+
         void setCalibrating(boolean calibrating) {
             this.calibrating = calibrating;
             invalidate();
@@ -969,34 +1039,158 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
+            drawFutureHud(canvas);
             if (calibrating) {
                 canvas.drawText("Calibrating… locking GPS and AR floor", getWidth() / 2f, getHeight() / 2f, calibratingPaint);
                 return;
             }
-            if (currentLocation == null || target == null || getWidth() == 0 || getHeight() == 0) {
+            if (currentLocation == null || getWidth() == 0 || getHeight() == 0) {
+                return;
+            }
+            drawGhostBuses(canvas);
+            drawVirtualShelters(canvas);
+            if (target == null) {
+                drawMiniMap(canvas, Collections.emptyList());
                 return;
             }
             List<Location> drawableRoute = routePoints.isEmpty() ? fallbackRoute(currentLocation, target) : routePoints;
             List<float[]> projectedPoints = projectRoute(drawableRoute);
+            drawMiniMap(canvas, drawableRoute);
             if (projectedPoints.size() < 2) {
                 return;
             }
 
-            Path ribbon = new Path();
-            float[] first = projectedPoints.get(0);
-            ribbon.moveTo(first[0], first[1]);
-            for (int i = 1; i < projectedPoints.size(); i++) {
-                float[] previous = projectedPoints.get(i - 1);
-                float[] point = projectedPoints.get(i);
-                ribbon.quadTo(previous[0], previous[1], (previous[0] + point[0]) / 2f, (previous[1] + point[1]) / 2f);
-            }
-            canvas.drawPath(ribbon, glowPaint);
-            canvas.drawPath(ribbon, ribbonPaint);
+            drawVerticalNavigationWall(canvas, projectedPoints);
             drawAnimatedArrows(canvas, projectedPoints);
             if (!depthOcclusionEnabled) {
-                canvas.drawText("ARCore depth unavailable — floor ribbon fallback", getWidth() / 2f, getHeight() - dp(18), calibratingPaint);
+                canvas.drawText("ARCore depth unavailable — GPS anchor wall fallback", getWidth() / 2f, getHeight() - dp(18), calibratingPaint);
             }
             postInvalidateOnAnimation();
+        }
+
+
+        private void drawVerticalNavigationWall(Canvas canvas, List<float[]> points) {
+            for (int i = 1; i < points.size(); i++) {
+                float[] previous = points.get(i - 1);
+                float[] point = points.get(i);
+                float alpha = Math.min(previous[2], point[2]);
+                wallPaint.setAlpha((int) (190 * alpha));
+                Path wall = new Path();
+                wall.moveTo(previous[0], previous[1]);
+                wall.lineTo(point[0], point[1]);
+                wall.lineTo(point[0], Math.max(dp(90), point[1] - dp(120)));
+                wall.lineTo(previous[0], Math.max(dp(90), previous[1] - dp(120)));
+                wall.close();
+                canvas.drawPath(wall, wallPaint);
+            }
+            Path topEdge = new Path();
+            float[] first = points.get(0);
+            topEdge.moveTo(first[0], Math.max(dp(90), first[1] - dp(120)));
+            for (int i = 1; i < points.size(); i++) {
+                float[] point = points.get(i);
+                topEdge.lineTo(point[0], Math.max(dp(90), point[1] - dp(120)));
+            }
+            canvas.drawPath(topEdge, glowPaint);
+        }
+
+        private void drawMiniMap(Canvas canvas, List<Location> route) {
+            float radius = dp(62);
+            float centerX = getWidth() - radius - dp(18);
+            float centerY = getHeight() - radius - dp(28);
+            canvas.drawCircle(centerX, centerY, radius, miniMapPaint);
+            miniMapPathPaint.setColor(Color.rgb(33, 150, 243));
+            canvas.drawCircle(centerX, centerY, dp(4), arrowPaint);
+            if (route == null || route.size() < 2 || currentLocation == null) {
+                return;
+            }
+            Path miniPath = new Path();
+            boolean started = false;
+            for (Location point : route) {
+                float distance = Math.min(250f, currentLocation.distanceTo(point));
+                float relativeBearing = (currentLocation.bearingTo(point) - bearing + 540f) % 360f - 180f;
+                double angle = Math.toRadians(relativeBearing - 90f);
+                float scaled = (distance / 250f) * (radius - dp(10));
+                float x = centerX + (float) Math.cos(angle) * scaled;
+                float y = centerY + (float) Math.sin(angle) * scaled;
+                if (!started) {
+                    miniPath.moveTo(x, y);
+                    started = true;
+                } else {
+                    miniPath.lineTo(x, y);
+                }
+            }
+            canvas.drawPath(miniPath, miniMapPathPaint);
+            canvas.drawText("MAP", centerX, centerY + radius - dp(8), calibratingPaint);
+        }
+
+        private void drawFutureHud(Canvas canvas) {
+            float left = dp(10);
+            float top = dp(76);
+            float right = Math.min(getWidth() - dp(10), left + dp(245));
+            float bottom = top + dp(92);
+            canvas.drawRoundRect(new RectF(left, top, right, bottom), dp(12), dp(12), miniMapPaint);
+            canvas.drawText("Future HUD", left + dp(12), top + dp(22), calibratingPaint);
+            canvas.drawText(directionsStatus, left + dp(12), top + dp(43), calibratingPaint);
+            canvas.drawText("Ghost buses: " + nearbyBusCount(), left + dp(12), top + dp(64), calibratingPaint);
+            canvas.drawText("Traffic/Weather AI: local predictor", left + dp(12), top + dp(84), calibratingPaint);
+        }
+
+        private int nearbyBusCount() {
+            if (currentLocation == null) {
+                return 0;
+            }
+            int count = 0;
+            long now = System.currentTimeMillis();
+            for (BusBillboard billboard : busBillboards) {
+                if (now - billboard.lastUpdatedMs <= 120_000L
+                        && distanceTo(billboard.latitude, billboard.longitude) <= 1000f) {
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        private void drawGhostBuses(Canvas canvas) {
+            if (currentLocation == null) {
+                return;
+            }
+            long now = System.currentTimeMillis();
+            for (BusBillboard billboard : busBillboards) {
+                if (now - billboard.lastUpdatedMs > 120_000L) {
+                    continue;
+                }
+                float distance = distanceTo(billboard.latitude, billboard.longitude);
+                if (distance > 1000f) {
+                    continue;
+                }
+                float relativeBearing = (bearingTo(billboard.latitude, billboard.longitude) - bearing + 540f) % 360f - 180f;
+                float x = getWidth() / 2f + relativeBearing * dp(5);
+                float y = Math.max(dp(145), getHeight() * 0.58f - Math.min(dp(180), distance / 4f));
+                float pulse = 0.45f + 0.55f * (1f - Math.min(1f, distance / 1000f));
+                ghostPaint.setAlpha((int) (80 + 120 * pulse));
+                canvas.drawRoundRect(new RectF(x - dp(28), y - dp(18), x + dp(28), y + dp(18)), dp(12), dp(12), ghostPaint);
+                canvas.drawCircle(x - dp(14), y + dp(18), dp(5 + (int) (pulse * 5)), ghostPaint);
+                canvas.drawCircle(x + dp(14), y + dp(18), dp(5 + (int) (pulse * 5)), ghostPaint);
+                canvas.drawText("Ghost " + billboard.lineName + " " + Math.round(distance) + "m", x, y - dp(28), calibratingPaint);
+            }
+        }
+
+        private void drawVirtualShelters(Canvas canvas) {
+            if (currentLocation == null) {
+                return;
+            }
+            for (BusStopPin pin : stopPins) {
+                float distance = distanceTo(pin.latitude, pin.longitude);
+                if (distance > 90f) {
+                    continue;
+                }
+                float x = screenXFor(pin) + dp(80);
+                float y = screenYFor(pin, 1);
+                RectF shelter = new RectF(x - dp(50), y - dp(65), x + dp(50), y + dp(25));
+                canvas.drawRoundRect(shelter, dp(10), dp(10), shelterPaint);
+                canvas.drawText("Virtual Shelter", x, y - dp(42), calibratingPaint);
+                canvas.drawText("Live departures + occupancy heat-map", x, y - dp(20), calibratingPaint);
+            }
         }
 
         private List<float[]> projectRoute(List<Location> route) {
@@ -1067,12 +1261,25 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         }
     }
 
+    private static final class AnchorPoint {
+        final double latitude;
+        final double longitude;
+        final float altitudeMeters;
+
+        AnchorPoint(double latitude, double longitude, float altitudeMeters) {
+            this.latitude = latitude;
+            this.longitude = longitude;
+            this.altitudeMeters = altitudeMeters;
+        }
+    }
+
     private static final class BusBillboard {
         final String id;
         String lineName = "Bus";
         String destinationName = "destination unknown";
         String etaText = "ETA unknown";
         String occupancy = "Information Unknown";
+        public String delayExplanation;
         double latitude;
         double longitude;
         long lastUpdatedMs;
@@ -1081,6 +1288,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
 
         BusBillboard(String id) {
             this.id = id;
+            this.delayExplanation = "";
         }
     }
 

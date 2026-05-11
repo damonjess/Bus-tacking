@@ -373,6 +373,16 @@ public class BusTrackingService extends Service {
                 || lower.contains("low") || lower.contains("quiet") || lower.contains("easy")) {
             return "Easy Seating";
         }
+        int percentage = parseOccupancyPercentage(value);
+        if (percentage >= 0) {
+            if (percentage > 70) {
+                return "Full/Crowded";
+            }
+            if (percentage >= 40) {
+                return "Standing Room Only";
+            }
+            return "Easy Seating";
+        }
         try {
             int passengerCount = Integer.parseInt(value.trim());
             if (passengerCount >= 45) {
@@ -384,6 +394,27 @@ public class BusTrackingService extends Service {
             return "Easy Seating";
         } catch (NumberFormatException exception) {
             return "Information Unknown";
+        }
+    }
+
+    private static int parseOccupancyPercentage(String value) {
+        StringBuilder digits = new StringBuilder();
+        for (int i = 0; i < value.length(); i++) {
+            char character = value.charAt(i);
+            if (Character.isDigit(character)) {
+                digits.append(character);
+            } else if (digits.length() > 0) {
+                break;
+            }
+        }
+        if (digits.length() == 0) {
+            return -1;
+        }
+        try {
+            int parsed = Integer.parseInt(digits.toString());
+            return value.contains("%") || parsed <= 100 ? parsed : -1;
+        } catch (NumberFormatException exception) {
+            return -1;
         }
     }
 
