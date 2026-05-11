@@ -39,8 +39,3 @@ android {
         buildConfig = true
     }
 }
-
-
-dependencies {
-    implementation("com.google.ar:core:1.54.0")
-}

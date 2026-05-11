@@ -1,34 +1,47 @@
 package org.bustimes.app;
 
+import android.Manifest;
+import android.annotation.SuppressLint;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.SurfaceTexture;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
+import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraDevice;
+import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CaptureRequest;
 import android.location.Location;
+import android.os.Build;
 import android.util.AttributeSet;
 import android.view.Gravity;
+import android.view.Surface;
+import android.view.TextureView;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 
-import com.google.ar.core.Config;
-import com.google.ar.core.Session;
-
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 
 public class ArBusStopView extends FrameLayout implements SensorEventListener {
+    private final TextureView cameraPreview;
     private final TextView statusView;
     private final List<BusStopPin> stopPins = new ArrayList<>();
     private final SensorManager sensorManager;
     private final Sensor rotationSensor;
-    private Session arSession;
+    private CameraDevice cameraDevice;
+    private CameraCaptureSession captureSession;
     private String routeFilter = "";
     private float compassBearing;
     private boolean sensorsRunning;
+    private boolean cameraRequested;
     private Location userLocation;
 
     public ArBusStopView(Context context) {
@@ -40,45 +53,60 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         setBackgroundColor(Color.rgb(12, 22, 34));
         sensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
         rotationSensor = sensorManager == null ? null : sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
+
+        cameraPreview = new TextureView(context);
+        cameraPreview.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
+            @Override
+            public void onSurfaceTextureAvailable(SurfaceTexture surface, int width, int height) {
+                if (cameraRequested) {
+                    openCamera();
+                }
+            }
+
+            @Override
+            public void onSurfaceTextureSizeChanged(SurfaceTexture surface, int width, int height) {
+            }
+
+            @Override
+            public boolean onSurfaceTextureDestroyed(SurfaceTexture surface) {
+                stopCamera();
+                return true;
+            }
+
+            @Override
+            public void onSurfaceTextureUpdated(SurfaceTexture surface) {
+            }
+        });
+        addView(cameraPreview, new LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
         statusView = new TextView(context);
         statusView.setTextColor(Color.WHITE);
         statusView.setTextSize(16);
         statusView.setGravity(Gravity.CENTER);
         statusView.setPadding(dp(16), dp(16), dp(16), dp(16));
+        statusView.setBackgroundColor(Color.argb(140, 0, 0, 0));
         addView(statusView, new LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP));
-        updateStatus("Location-Based AR Bus Stop Finder\nUses GPS + compass to place stop pins down the street.");
+        updateStatus("Location-Based AR Bus Stop Finder\nUses live camera + GPS + compass to place stop pins.");
     }
 
     public void startAr() {
-        try {
-            if (arSession == null) {
-                arSession = new Session(getContext());
-                Config config = new Config(arSession);
-                config.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE);
-                arSession.configure(config);
-            }
-            arSession.resume();
-            startCompass();
-            updateStatus("Location-Based AR active — GPS + compass place nearest bus stop pins.");
-        } catch (Exception exception) {
-            updateStatus("Location-Based AR is not available on this device: " + exception.getMessage());
+        cameraRequested = true;
+        startCompass();
+        if (cameraPreview.isAvailable()) {
+            openCamera();
         }
+        updateStatus("Location-Based AR active — camera, GPS and compass place nearest bus stop pins.");
     }
 
     public void pauseAr() {
+        cameraRequested = false;
         stopCompass();
-        if (arSession != null) {
-            arSession.pause();
-        }
+        stopCamera();
     }
 
     public void destroyAr() {
-        stopCompass();
-        if (arSession != null) {
-            arSession.close();
-            arSession = null;
-        }
+        pauseAr();
     }
 
     public void setRouteFilter(String routeFilter) {
@@ -136,9 +164,108 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         sensorsRunning = false;
     }
 
+    @SuppressLint("MissingPermission")
+    private void openCamera() {
+        if (!cameraRequested || cameraDevice != null) {
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                && getContext().checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            updateStatus("Camera permission is needed for AR bus stop finder.");
+            return;
+        }
+
+        try {
+            CameraManager cameraManager = (CameraManager) getContext().getSystemService(Context.CAMERA_SERVICE);
+            String cameraId = findBackCameraId(cameraManager);
+            cameraManager.openCamera(cameraId, new CameraDevice.StateCallback() {
+                @Override
+                public void onOpened(CameraDevice camera) {
+                    cameraDevice = camera;
+                    startCameraPreview();
+                }
+
+                @Override
+                public void onDisconnected(CameraDevice camera) {
+                    camera.close();
+                    cameraDevice = null;
+                }
+
+                @Override
+                public void onError(CameraDevice camera, int error) {
+                    camera.close();
+                    cameraDevice = null;
+                    updateStatus("Unable to open AR camera preview.");
+                }
+            }, null);
+        } catch (Exception exception) {
+            updateStatus("Unable to start AR camera preview: " + exception.getMessage());
+        }
+    }
+
+    private String findBackCameraId(CameraManager cameraManager) throws Exception {
+        String fallbackCameraId = null;
+        for (String cameraId : cameraManager.getCameraIdList()) {
+            if (fallbackCameraId == null) {
+                fallbackCameraId = cameraId;
+            }
+            CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(cameraId);
+            Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
+            if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
+                return cameraId;
+            }
+        }
+        if (fallbackCameraId == null) {
+            throw new IllegalStateException("No camera found");
+        }
+        return fallbackCameraId;
+    }
+
+    private void startCameraPreview() {
+        if (cameraDevice == null || !cameraPreview.isAvailable()) {
+            return;
+        }
+        try {
+            SurfaceTexture texture = cameraPreview.getSurfaceTexture();
+            texture.setDefaultBufferSize(Math.max(1, cameraPreview.getWidth()), Math.max(1, cameraPreview.getHeight()));
+            Surface surface = new Surface(texture);
+            CaptureRequest.Builder requestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            requestBuilder.addTarget(surface);
+            cameraDevice.createCaptureSession(Collections.singletonList(surface), new CameraCaptureSession.StateCallback() {
+                @Override
+                public void onConfigured(CameraCaptureSession session) {
+                    captureSession = session;
+                    try {
+                        session.setRepeatingRequest(requestBuilder.build(), null, null);
+                    } catch (Exception exception) {
+                        updateStatus("Unable to run AR camera preview: " + exception.getMessage());
+                    }
+                }
+
+                @Override
+                public void onConfigureFailed(CameraCaptureSession session) {
+                    updateStatus("Unable to configure AR camera preview.");
+                }
+            }, null);
+        } catch (Exception exception) {
+            updateStatus("Unable to start AR camera preview: " + exception.getMessage());
+        }
+    }
+
+    private void stopCamera() {
+        if (captureSession != null) {
+            captureSession.close();
+            captureSession = null;
+        }
+        if (cameraDevice != null) {
+            cameraDevice.close();
+            cameraDevice = null;
+        }
+    }
+
     private void renderPins() {
-        while (getChildCount() > 1) {
-            removeViewAt(1);
+        while (getChildCount() > 2) {
+            removeViewAt(2);
         }
         int visiblePins = 0;
         for (BusStopPin pin : stopPins) {

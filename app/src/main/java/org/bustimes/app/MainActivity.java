@@ -538,7 +538,11 @@ public class MainActivity extends Activity {
         activeRouteFilter = route;
         arBusStopView.setRouteFilter(activeRouteFilter);
         filterMapMarkersForRoute(activeRouteFilter);
-        Toast.makeText(this, "Showing route " + activeRouteFilter, Toast.LENGTH_LONG).show();
+        if (arModeEnabled) {
+            showStandardMap();
+        }
+        webView.loadUrl("https://bustimes.org/search?q=" + Uri.encode(activeRouteFilter));
+        Toast.makeText(this, "Searching for route " + activeRouteFilter, Toast.LENGTH_LONG).show();
     }
 
     private String extractRouteNumber(String text) {
