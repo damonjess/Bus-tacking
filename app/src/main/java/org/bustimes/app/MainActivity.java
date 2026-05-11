@@ -48,8 +48,12 @@ import android.view.animation.LinearInterpolator;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.Locale;
+import java.util.TimeZone;
 import java.util.Map;
 
 public class MainActivity extends Activity {
@@ -574,22 +578,19 @@ public class MainActivity extends Activity {
             return null;
         }
         for (AnimatedBusMarker marker : trackedBusMarkers.values()) {
-            String normalizedLabel = normalizeRouteSearch(marker.label);
-            if (normalizedLabel.equals(normalizedRoute)
-                    || normalizedLabel.contains(normalizedRoute)
-                    || routeNumberTokenMatches(normalizedLabel, normalizedRoute)) {
+            if (marker.matchesRoute(normalizedRoute)) {
                 return marker;
             }
         }
         return null;
     }
 
-    private boolean routeNumberTokenMatches(String normalizedLabel, String normalizedRoute) {
-        return normalizedLabel.matches(".*(^|[^0-9])" + normalizedRoute + "([^0-9]|$).*");
+    private boolean routeNumberTokenMatches(String normalizedValue, String normalizedRoute) {
+        return normalizedValue.matches(".*(^|[^0-9])0*" + normalizedRoute + "([^0-9]|$).*");
     }
 
     private String normalizeRouteSearch(String value) {
-        return value == null ? "" : value.toLowerCase(Locale.UK).trim();
+        return value == null ? "" : value.toLowerCase(Locale.UK).replace("route", "").trim();
     }
 
     private void applyVoiceRouteFilter(String spokenText) {
@@ -945,6 +946,9 @@ public class MainActivity extends Activity {
         }
 
         String lineName = intent.getStringExtra(BusPosition.EXTRA_LINE_NAME);
+        String lineRef = intent.getStringExtra(BusPosition.EXTRA_LINE_REF);
+        String destinationName = intent.getStringExtra(BusPosition.EXTRA_DESTINATION_NAME);
+        String expectedArrivalTime = intent.getStringExtra(BusPosition.EXTRA_EXPECTED_ARRIVAL_TIME);
         String recordedAt = intent.getStringExtra(BusPosition.EXTRA_RECORDED_AT);
         String occupancy = intent.getStringExtra(BusPosition.EXTRA_OCCUPANCY);
         double nextLatitude = intent.getDoubleExtra(BusPosition.EXTRA_LATITUDE, Double.NaN);
@@ -956,9 +960,9 @@ public class MainActivity extends Activity {
 
         AnimatedBusMarker marker = trackedBusMarkers.get(id);
         if (marker == null) {
-            marker = new AnimatedBusMarker(id, firstNonEmpty(lineName, "Bus"), nextLatitude, nextLongitude,
-                    Float.isNaN(nextBearing) ? 0f : nextBearing, firstNonEmpty(recordedAt, "Unknown"),
-                    firstNonEmpty(occupancy, "Unknown"));
+            marker = new AnimatedBusMarker(id, firstNonEmpty(lineName, lineRef, "Bus"), lineRef, destinationName,
+                    expectedArrivalTime, nextLatitude, nextLongitude, Float.isNaN(nextBearing) ? 0f : nextBearing,
+                    firstNonEmpty(recordedAt, "Unknown"), firstNonEmpty(occupancy, "Information Unknown"));
             trackedBusMarkers.put(id, marker);
             marker.renderAt(nextLatitude, nextLongitude, marker.bearing);
             return;
@@ -968,7 +972,7 @@ public class MainActivity extends Activity {
                 ? bearingBetween(marker.latitude, marker.longitude, nextLatitude, nextLongitude)
                 : nextBearing;
         marker.animateTo(nextLatitude, nextLongitude, bearing, firstNonEmpty(recordedAt, "Unknown"),
-                firstNonEmpty(occupancy, "Unknown"));
+                firstNonEmpty(occupancy, "Information Unknown"), destinationName, expectedArrivalTime);
     }
 
     private float bearingBetween(double startLatitude, double startLongitude, double endLatitude, double endLongitude) {
@@ -993,6 +997,37 @@ public class MainActivity extends Activity {
         }
     }
 
+
+    private String etaText(String expectedArrivalTime) {
+        Date expected = parseBodsTime(expectedArrivalTime);
+        if (expected == null) {
+            return "ETA unknown";
+        }
+        long minutes = Math.max(0L, Math.round((expected.getTime() - System.currentTimeMillis()) / 60000.0));
+        return String.format(Locale.UK, "Arriving in %d mins", minutes);
+    }
+
+    private Date parseBodsTime(String value) {
+        if (value == null || value.trim().isEmpty()) {
+            return null;
+        }
+        String[] patterns = {
+                "yyyy-MM-dd'T'HH:mm:ssXXX",
+                "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
+                "yyyy-MM-dd'T'HH:mm:ss'Z'",
+                "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"
+        };
+        for (String pattern : patterns) {
+            try {
+                SimpleDateFormat format = new SimpleDateFormat(pattern, Locale.UK);
+                format.setTimeZone(TimeZone.getTimeZone("UTC"));
+                return format.parse(value.trim());
+            } catch (ParseException ignored) {
+            }
+        }
+        return null;
+    }
+
     private String firstNonEmpty(String... values) {
         for (String value : values) {
             if (value != null && !value.trim().isEmpty()) {
@@ -1009,8 +1044,8 @@ public class MainActivity extends Activity {
                 .replace("\r", "");
     }
 
-    private void renderNativeBusMarker(String id, String label, double latitude, double longitude, float bearing,
-            String lastSeen, String occupancy) {
+    private void renderNativeBusMarker(String id, String label, String destination, String etaText, double latitude, double longitude,
+            float bearing, String lastSeen, String occupancy) {
         String script = String.format(Locale.US,
                 "(function(){"
                         + "window.__bodsMarkers=window.__bodsMarkers||{};"
@@ -1023,21 +1058,22 @@ public class MainActivity extends Activity {
                         + "if(getComputedStyle(container).position==='static')container.style.position='relative';"
                         + "var marker=window.__bodsMarkers['%s'];"
                         + "var occupancy='%s';"
-                        + "var markerColor=(occupancy==='Full')?'#d32f2f':((occupancy==='Medium'||occupancy==='Likely Busy')?'#ff9800':(occupancy==='Low'?'#2e7d32':'#114c8d'));"
+                        + "var markerColor=(occupancy==='Full/Crowded')?'#d32f2f':(occupancy==='Standing Room Only'?'#fbc02d':(occupancy==='Easy Seating'?'#2e7d32':'#1976d2'));"
                         + "if(!marker){marker=document.createElement('div');marker.className='native-bods-bus-marker';"
                         + "marker.style.cssText='position:absolute;z-index:50;width:34px;height:34px;margin-left:-17px;margin-top:-17px;border-radius:17px;background:'+markerColor+';color:white;border:2px solid white;box-shadow:0 2px 6px rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;font:bold 12px sans-serif;pointer-events:auto;cursor:pointer;transform-origin:center center;';"
                         + "container.appendChild(marker);window.__bodsMarkers['%s']=marker;}"
                         + "marker.style.background=markerColor;marker.textContent='%s';marker.dataset.route='%s';marker.dataset.occupancy=occupancy;"
                         + "marker.dataset.lng=%f;marker.dataset.lat=%f;marker.dataset.bearing=%f;"
-                        + "marker.dataset.lastSeen='%s';marker.title='Route %s\\nLast seen: %s\\nOccupancy: '+occupancy;"
-                        + "marker.onclick=function(event){if(event)event.stopPropagation();if(window.BusMarkerBridge){window.BusMarkerBridge.showBusDetails('%s',marker.dataset.lastSeen,marker.dataset.occupancy,marker.dataset.lat,marker.dataset.lng);}};"
+                        + "marker.dataset.destination='%s';marker.dataset.eta='%s';marker.dataset.lastSeen='%s';"
+                        + "marker.title='Route %s to '+marker.dataset.destination+'\\n'+marker.dataset.eta+'\\nOccupancy: '+occupancy+'\\nLast seen: %s';"
+                        + "marker.onclick=function(event){if(event)event.stopPropagation();if(window.BusMarkerBridge){window.BusMarkerBridge.showBusDetails('%s',marker.dataset.lastSeen,marker.dataset.occupancy,marker.dataset.lat,marker.dataset.lng,marker.dataset.destination,marker.dataset.eta);}};"
                         + "if(window.__bodsRouteFilter){marker.style.display=(marker.dataset.route.toLowerCase().indexOf(window.__bodsRouteFilter.toLowerCase())!==-1)?'flex':'none';}"
                         + "window.__bodsPlaceMarker=function(m){var p=map.project([parseFloat(m.dataset.lng),parseFloat(m.dataset.lat)]);m.style.left=p.x+'px';m.style.top=p.y+'px';m.style.transform='rotate('+parseFloat(m.dataset.bearing)+'deg)';};"
                         + "window.__bodsPlaceMarker(marker);"
                         + "if(!window.__bodsMarkersListening){window.__bodsMarkersListening=true;var update=function(){Object.keys(window.__bodsMarkers).forEach(function(key){window.__bodsPlaceMarker(window.__bodsMarkers[key]);});};map.on&&map.on('move',update);map.on&&map.on('zoom',update);map.on&&map.on('resize',update);}"
                         + "return true;})();",
                 escapeJs(id), escapeJs(id), escapeJs(occupancy), escapeJs(label), escapeJs(label), longitude, latitude, bearing,
-                escapeJs(lastSeen), escapeJs(label), escapeJs(lastSeen), escapeJs(label));
+                escapeJs(destination), escapeJs(etaText), escapeJs(lastSeen), escapeJs(label), escapeJs(lastSeen), escapeJs(label));
         webView.evaluateJavascript(script, ignored -> {
         });
     }
@@ -1133,7 +1169,8 @@ public class MainActivity extends Activity {
 
     private class BusMarkerBridge {
         @JavascriptInterface
-        public void showBusDetails(String route, String lastSeen, String occupancy, String latitude, String longitude) {
+        public void showBusDetails(String route, String lastSeen, String occupancy, String latitude, String longitude,
+                String destination, String etaText) {
             runOnUiThread(() -> {
                 double targetLatitude = parseDouble(latitude, Double.NaN);
                 double targetLongitude = parseDouble(longitude, Double.NaN);
@@ -1142,8 +1179,10 @@ public class MainActivity extends Activity {
                 }
                 new AlertDialog.Builder(MainActivity.this)
                         .setTitle("Route " + firstNonEmpty(route, "Bus"))
-                        .setMessage("Last seen: " + firstNonEmpty(lastSeen, "Unknown")
-                                + "\nOccupancy: " + firstNonEmpty(occupancy, "Unknown")
+                        .setMessage("Destination: " + firstNonEmpty(destination, "Unknown")
+                                + "\n" + firstNonEmpty(etaText, "ETA unknown")
+                                + "\nLast seen: " + firstNonEmpty(lastSeen, "Unknown")
+                                + "\nOccupancy: " + firstNonEmpty(occupancy, "Information Unknown")
                                 + "\nAR path: select AR View to follow the glowing pavement line.")
                         .setPositiveButton(android.R.string.ok, null)
                         .show();
@@ -1154,6 +1193,9 @@ public class MainActivity extends Activity {
     private class AnimatedBusMarker {
         private final String id;
         private final String label;
+        private final String lineRef;
+        private String destinationName;
+        private String expectedArrivalTime;
         private double latitude;
         private double longitude;
         private float bearing;
@@ -1161,10 +1203,13 @@ public class MainActivity extends Activity {
         private String occupancy;
         private ValueAnimator animator;
 
-        AnimatedBusMarker(String id, String label, double latitude, double longitude, float bearing, String lastSeen,
-                String occupancy) {
+        AnimatedBusMarker(String id, String label, String lineRef, String destinationName, String expectedArrivalTime,
+                double latitude, double longitude, float bearing, String lastSeen, String occupancy) {
             this.id = id;
             this.label = label;
+            this.lineRef = lineRef;
+            this.destinationName = destinationName;
+            this.expectedArrivalTime = expectedArrivalTime;
             this.latitude = latitude;
             this.longitude = longitude;
             this.bearing = bearing;
@@ -1172,14 +1217,31 @@ public class MainActivity extends Activity {
             this.occupancy = occupancy;
         }
 
+        boolean matchesRoute(String normalizedRoute) {
+            String normalizedLabel = normalizeRouteSearch(label);
+            String normalizedLineRef = normalizeRouteSearch(lineRef);
+            return routeSearchValueMatches(normalizedLabel, normalizedRoute)
+                    || routeSearchValueMatches(normalizedLineRef, normalizedRoute)
+                    || routeSearchValueMatches(normalizeRouteSearch(id), normalizedRoute);
+        }
+
+        private boolean routeSearchValueMatches(String normalizedValue, String normalizedRoute) {
+            return !normalizedValue.isEmpty()
+                    && (normalizedValue.equals(normalizedRoute)
+                    || normalizedValue.contains(normalizedRoute)
+                    || routeNumberTokenMatches(normalizedValue, normalizedRoute));
+        }
+
         void animateTo(double nextLatitude, double nextLongitude, float nextBearing, String nextLastSeen,
-                String nextOccupancy) {
+                String nextOccupancy, String nextDestinationName, String nextExpectedArrivalTime) {
             cancelAnimation();
             double startLatitude = latitude;
             double startLongitude = longitude;
             float startBearing = bearing;
             lastSeen = nextLastSeen;
             occupancy = nextOccupancy;
+            destinationName = nextDestinationName;
+            expectedArrivalTime = nextExpectedArrivalTime;
             animator = ValueAnimator.ofFloat(0f, 1f);
             animator.setDuration(BUS_MARKER_ANIMATION_MS);
             animator.setInterpolator(new LinearInterpolator());
@@ -1194,7 +1256,10 @@ public class MainActivity extends Activity {
         }
 
         void renderAt(double latitude, double longitude, float bearing) {
-            renderNativeBusMarker(id, label, latitude, longitude, bearing, lastSeen, occupancy);
+            String etaText = etaText(expectedArrivalTime);
+            String destination = firstNonEmpty(destinationName, "destination unknown");
+            arBusStopView.updateBusBillboard(id, label, destination, etaText, occupancy, latitude, longitude);
+            renderNativeBusMarker(id, label, destination, etaText, latitude, longitude, bearing, lastSeen, occupancy);
         }
 
         void cancelAnimation() {

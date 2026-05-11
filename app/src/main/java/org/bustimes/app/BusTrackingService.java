@@ -21,9 +21,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Calendar;
 import java.util.Locale;
-import java.util.TimeZone;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -194,19 +192,21 @@ public class BusTrackingService extends Service {
             String datedJourneyRef = text(journey, "DatedVehicleJourneyRef");
             String lineRef = text(journey, "LineRef");
             String lineName = text(journey, "PublishedLineName");
+            String destinationName = text(journey, "DestinationName");
+            String expectedArrivalTime = firstNonEmpty(text(journey, "ExpectedArrivalTime"), text(journey, "AimedArrivalTime"));
             String id = firstNonEmpty(vehicleRef, datedJourneyRef, lineRef + ":" + i);
             float bearing = parseFloat(text(journey, "Bearing"), Float.NaN);
             String recordedAt = text(activity, "RecordedAtTime");
             String occupancy = normalizeOccupancy(firstNonEmpty(
+                    text(journey, "OccupancyStatus"),
                     text(journey, "Occupancy"),
                     text(journey, "VehicleOccupancy"),
                     text(journey, "PassengerCount"),
+                    text(activity, "OccupancyStatus"),
                     text(activity, "Occupancy")));
-            if (TextUtils.isEmpty(occupancy)) {
-                occupancy = inferOccupancy(latitude, longitude);
-            }
 
-            positions.add(new BusPosition(id, firstNonEmpty(lineName, lineRef, "Bus"), latitude, longitude, bearing, recordedAt, occupancy));
+            positions.add(new BusPosition(id, firstNonEmpty(lineName, lineRef, "Bus"), lineRef, destinationName,
+                    expectedArrivalTime, latitude, longitude, bearing, recordedAt, occupancy));
         }
 
         return positions;
@@ -259,20 +259,25 @@ public class BusTrackingService extends Service {
         String datedJourneyRef = jsonText(journey, "DatedVehicleJourneyRef");
         String lineRef = jsonText(journey, "LineRef");
         String lineName = jsonText(journey, "PublishedLineName");
+        String destinationName = jsonText(journey, "DestinationName");
+        String expectedArrivalTime = firstNonEmpty(jsonText(journey, "ExpectedArrivalTime"), jsonText(journey, "AimedArrivalTime"),
+                jsonNestedText(journey, "MonitoredCall", "ExpectedArrivalTime"));
         String id = firstNonEmpty(vehicleRef, datedJourneyRef, lineRef + ":" + index);
         float bearing = parseFloat(jsonText(journey, "Bearing"), Float.NaN);
         String recordedAt = jsonText(activity, "RecordedAtTime");
         String occupancy = normalizeOccupancy(firstNonEmpty(
+                jsonText(journey, "OccupancyStatus"),
                 jsonText(journey, "Occupancy"),
                 jsonText(journey, "VehicleOccupancy"),
                 jsonText(journey, "PassengerCount"),
+                jsonText(activity, "OccupancyStatus"),
                 jsonText(activity, "Occupancy"),
+                jsonNestedText(journey, "VehicleJourney", "OccupancyStatus"),
                 jsonNestedText(journey, "VehicleJourney", "Occupancy"),
+                jsonNestedText(activity, "VehicleJourney", "OccupancyStatus"),
                 jsonNestedText(activity, "VehicleJourney", "Occupancy")));
-        if (TextUtils.isEmpty(occupancy)) {
-            occupancy = inferOccupancy(latitude, longitude);
-        }
-        return new BusPosition(id, firstNonEmpty(lineName, lineRef, "Bus"), latitude, longitude, bearing, recordedAt, occupancy);
+        return new BusPosition(id, firstNonEmpty(lineName, lineRef, "Bus"), lineRef, destinationName,
+                expectedArrivalTime, latitude, longitude, bearing, recordedAt, occupancy);
     }
 
     private static String jsonNestedText(JSONObject parent, String objectName, String key) {
@@ -307,6 +312,9 @@ public class BusTrackingService extends Service {
         intent.setPackage(getPackageName());
         intent.putExtra(BusPosition.EXTRA_ID, position.id);
         intent.putExtra(BusPosition.EXTRA_LINE_NAME, position.lineName);
+        intent.putExtra(BusPosition.EXTRA_LINE_REF, position.lineRef);
+        intent.putExtra(BusPosition.EXTRA_DESTINATION_NAME, position.destinationName);
+        intent.putExtra(BusPosition.EXTRA_EXPECTED_ARRIVAL_TIME, position.expectedArrivalTime);
         intent.putExtra(BusPosition.EXTRA_LATITUDE, position.latitude);
         intent.putExtra(BusPosition.EXTRA_LONGITUDE, position.longitude);
         intent.putExtra(BusPosition.EXTRA_BEARING, position.bearing);
@@ -349,44 +357,34 @@ public class BusTrackingService extends Service {
 
     private static String normalizeOccupancy(String value) {
         if (TextUtils.isEmpty(value)) {
-            return "";
+            return "Information Unknown";
         }
         String lower = value.toLowerCase(Locale.UK).replace("_", "").replace("-", "").replace(" ", "");
-        if (lower.contains("full") || lower.contains("standingroomonly")
+        if (lower.contains("full") || lower.contains("crowded") || lower.contains("noseats")
                 || lower.contains("crushedstandingroomonly") || lower.contains("notacceptingpassengers")
-                || lower.contains("high") || lower.contains("busy")) {
-            return "Full";
+                || lower.contains("atcapacity") || lower.contains("high")) {
+            return "Full/Crowded";
         }
-        if (lower.contains("medium") || lower.contains("fewseatsavailable")
-                || lower.contains("standingavailable")) {
-            return "Medium";
+        if (lower.contains("standing") || lower.contains("limited") || lower.contains("fewseatsavailable")
+                || lower.contains("medium") || lower.contains("half")) {
+            return "Standing Room Only";
         }
-        if (lower.contains("low") || lower.contains("quiet") || lower.contains("empty")
-                || lower.contains("seatsavailable")) {
-            return "Low";
+        if (lower.contains("empty") || lower.contains("manyseatsavailable") || lower.contains("seatsavailable")
+                || lower.contains("low") || lower.contains("quiet") || lower.contains("easy")) {
+            return "Easy Seating";
         }
         try {
             int passengerCount = Integer.parseInt(value.trim());
             if (passengerCount >= 45) {
-                return "Full";
+                return "Full/Crowded";
             }
             if (passengerCount >= 20) {
-                return "Medium";
+                return "Standing Room Only";
             }
-            return "Low";
+            return "Easy Seating";
         } catch (NumberFormatException exception) {
-            return "";
+            return "Information Unknown";
         }
-    }
-
-    private static String inferOccupancy(double latitude, double longitude) {
-        Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("Europe/London"));
-        int day = calendar.get(Calendar.DAY_OF_WEEK);
-        boolean weekday = day >= Calendar.MONDAY && day <= Calendar.FRIDAY;
-        int minutes = calendar.get(Calendar.HOUR_OF_DAY) * 60 + calendar.get(Calendar.MINUTE);
-        boolean peak = (minutes >= 8 * 60 && minutes <= 9 * 60) || (minutes >= (15 * 60) + 30 && minutes <= 17 * 60);
-        boolean scunthorpeArea = latitude > 53.50 && latitude < 53.66 && longitude > -0.78 && longitude < -0.50;
-        return weekday && peak && scunthorpeArea ? "Likely Busy" : "Unknown";
     }
 
     private static float parseFloat(String value, float fallback) {

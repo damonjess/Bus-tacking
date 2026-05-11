@@ -27,7 +27,9 @@ import android.util.AttributeSet;
 import android.view.Gravity;
 import android.view.Surface;
 import android.view.TextureView;
+import android.view.View;
 import android.view.ViewGroup;
+import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 
@@ -50,11 +52,15 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
     private static final float GPS_LOCK_ACCURACY_METERS = 10f;
     private static final float REROUTE_THRESHOLD_METERS = 5f;
     private static final int MAX_DIRECTIONS_POINTS = 160;
+    private static final long CALIBRATION_BYPASS_DELAY_MS = 5_000L;
+    private static final int BILLBOARD_HOVER_OFFSET_DP = 70;
 
     private final TextureView cameraPreview;
     private final TextView statusView;
+    private final Button bypassCalibrationButton;
     private final PathOverlayView pathOverlayView;
     private final List<BusStopPin> stopPins = new ArrayList<>();
+    private final List<BusBillboard> busBillboards = new ArrayList<>();
     private final SensorManager sensorManager;
     private final Sensor rotationSensor;
     private final Sensor accelerometerSensor;
@@ -76,6 +82,8 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
     private long lastDirectionsRequestMs;
     private boolean gpsLocked;
     private boolean arCoreDepthReady;
+    private boolean calibrationBypassed;
+    private boolean bypassButtonScheduled;
 
     public ArBusStopView(Context context) {
         this(context, null);
@@ -125,11 +133,24 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         statusView.setBackgroundColor(Color.argb(140, 0, 0, 0));
         addView(statusView, new LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP));
+
+        bypassCalibrationButton = new Button(context);
+        bypassCalibrationButton.setText("Bypass Calibration");
+        bypassCalibrationButton.setAllCaps(false);
+        bypassCalibrationButton.setVisibility(View.GONE);
+        bypassCalibrationButton.setOnClickListener(view -> bypassCalibration());
+        LayoutParams bypassParams = new LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        bypassParams.setMargins(0, 0, 0, dp(110));
+        addView(bypassCalibrationButton, bypassParams);
         updateStatus("Location-Based AR Bus Stop Finder\nUses live camera + GPS + compass to place stop pins.");
     }
 
     public void startAr() {
         cameraRequested = true;
+        calibrationBypassed = false;
+        bypassButtonScheduled = false;
+        bypassCalibrationButton.setVisibility(View.GONE);
         initializeArCoreDepthAndPlaneDetection();
         startCompass();
         if (cameraPreview.isAvailable()) {
@@ -140,6 +161,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
 
     public void pauseAr() {
         cameraRequested = false;
+        bypassCalibrationButton.setVisibility(View.GONE);
         stopCompass();
         stopCamera();
     }
@@ -167,13 +189,46 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         renderPins();
     }
 
+    public void updateBusBillboard(String id, String lineName, String destinationName, String etaText, String occupancy,
+            double latitude, double longitude) {
+        if (id == null || id.trim().isEmpty()) {
+            return;
+        }
+        BusBillboard billboard = null;
+        for (BusBillboard candidate : busBillboards) {
+            if (candidate.id.equals(id)) {
+                billboard = candidate;
+                break;
+            }
+        }
+        if (billboard == null) {
+            billboard = new BusBillboard(id);
+            busBillboards.add(billboard);
+        }
+        billboard.lineName = lineName == null || lineName.trim().isEmpty() ? "Bus" : lineName.trim();
+        billboard.destinationName = destinationName == null || destinationName.trim().isEmpty() ? "destination unknown" : destinationName.trim();
+        billboard.etaText = etaText == null || etaText.trim().isEmpty() ? "ETA unknown" : etaText.trim();
+        billboard.occupancy = occupancy == null || occupancy.trim().isEmpty() ? "Information Unknown" : occupancy.trim();
+        billboard.latitude = latitude;
+        billboard.longitude = longitude;
+        billboard.lastUpdatedMs = System.currentTimeMillis();
+        renderPins();
+    }
+
+    public void clearBusBillboards() {
+        busBillboards.clear();
+        renderPins();
+    }
+
     public void showStopsNear(Location location) {
-        gpsLocked = location != null && (!location.hasAccuracy() || location.getAccuracy() <= GPS_LOCK_ACCURACY_METERS);
+        boolean accurateEnough = location != null && (!location.hasAccuracy() || location.getAccuracy() <= GPS_LOCK_ACCURACY_METERS);
+        gpsLocked = accurateEnough || (calibrationBypassed && location != null);
         if (!gpsLocked) {
             userLocation = location;
             pathOverlayView.setUserLocation(null);
             pathOverlayView.setCalibrating(true);
             stopPins.clear();
+            scheduleCalibrationBypassButton();
             String message = location == null
                     ? "Calibrating… waiting for GPS lock before placing AR stops."
                     : String.format(Locale.UK, "Calibrating… GPS accuracy %.0fm. Hold still until it is under %.0fm.",
@@ -183,9 +238,12 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             return;
         }
 
-        userLocation = smoothLocation(userLocation, location, 0.22f);
+        bypassCalibrationButton.setVisibility(View.GONE);
+        userLocation = accurateEnough ? smoothLocation(userLocation, location, 0.22f) : new Location(location);
         if (navigationTarget == null) {
-            updateStatus("Location-Based AR active — GPS locked, rotation-vector heading corrected to true north.");
+            updateStatus(calibrationBypassed && !accurateEnough
+                    ? "Calibration bypassed — using best GPS with rotation-vector-stabilized AR markers."
+                    : "Location-Based AR active — GPS locked, rotation-vector heading corrected to true north.");
         }
         pathOverlayView.setCalibrating(false);
         pathOverlayView.setUserLocation(userLocation);
@@ -199,6 +257,35 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         stopPins.add(new BusStopPin("Next stop ahead", firstRoute(), userLocation.getLatitude() + 0.00080,
                 userLocation.getLongitude() - 0.00018));
         renderPins();
+    }
+
+
+    private void scheduleCalibrationBypassButton() {
+        if (bypassButtonScheduled || calibrationBypassed) {
+            return;
+        }
+        bypassButtonScheduled = true;
+        postDelayed(() -> {
+            bypassButtonScheduled = false;
+            if (!gpsLocked && !calibrationBypassed && cameraRequested) {
+                bypassCalibrationButton.setVisibility(View.VISIBLE);
+            }
+        }, CALIBRATION_BYPASS_DELAY_MS);
+    }
+
+    private void bypassCalibration() {
+        if (userLocation == null) {
+            updateStatus("Keep AR open while the phone finds an initial GPS fix, then bypass calibration.");
+            scheduleCalibrationBypassButton();
+            return;
+        }
+        calibrationBypassed = true;
+        gpsLocked = true;
+        bypassCalibrationButton.setVisibility(View.GONE);
+        pathOverlayView.setCalibrating(false);
+        pathOverlayView.setUserLocation(userLocation);
+        updateStatus("Calibration bypassed — rendering with best GPS and rotation-vector-stabilized heading.");
+        showStopsNear(userLocation);
     }
 
     @Override
@@ -372,8 +459,8 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
     }
 
     private void renderPins() {
-        while (getChildCount() > 3) {
-            removeViewAt(3);
+        while (getChildCount() > 4) {
+            removeViewAt(4);
         }
         if (!gpsLocked) {
             return;
@@ -398,9 +485,84 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             addView(marker, params);
         }
 
+        renderBusBillboards();
+
         if (visiblePins == 0 && !stopPins.isEmpty()) {
             updateStatus(String.format(Locale.UK, "No AR bus stop pins match route %s.", routeFilter));
         }
+    }
+
+
+    private void renderBusBillboards() {
+        long now = System.currentTimeMillis();
+        for (BusBillboard billboard : busBillboards) {
+            if (now - billboard.lastUpdatedMs > 120_000L) {
+                continue;
+            }
+            if (!routeFilter.isEmpty() && !billboard.lineName.toLowerCase(Locale.UK).contains(routeFilter.toLowerCase(Locale.UK))) {
+                continue;
+            }
+            TextView view = createBusBillboardView(billboard);
+            float targetX = screenXFor(billboard);
+            float targetY = screenYFor(billboard);
+            billboard.displayedX = Float.isNaN(billboard.displayedX) ? targetX : lerp(billboard.displayedX, targetX, 0.24f);
+            billboard.displayedY = Float.isNaN(billboard.displayedY) ? targetY : lerp(billboard.displayedY, targetY, 0.24f);
+            LayoutParams params = new LayoutParams(dp(210), ViewGroup.LayoutParams.WRAP_CONTENT);
+            params.leftMargin = dp((int) billboard.displayedX);
+            params.topMargin = dp((int) billboard.displayedY);
+            addView(view, params);
+        }
+    }
+
+    private TextView createBusBillboardView(BusBillboard billboard) {
+        TextView view = new TextView(getContext());
+        view.setText(String.format(Locale.UK, "%s %s\n%s\nStatus: %s",
+                occupancyIcon(billboard.occupancy), billboardTitle(billboard),
+                billboard.etaText, billboard.occupancy));
+        view.setTextColor(Color.WHITE);
+        view.setTextSize(14);
+        view.setGravity(Gravity.CENTER);
+        view.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        view.setBackgroundColor(Color.argb(225, 0, 0, 0));
+        view.setPadding(dp(12), dp(10), dp(12), dp(10));
+        return view;
+    }
+
+    private String billboardTitle(BusBillboard billboard) {
+        String line = billboard.lineName == null ? "Bus" : billboard.lineName;
+        String destination = billboard.destinationName == null ? "destination unknown" : billboard.destinationName;
+        String lowerLine = line.toLowerCase(Locale.UK);
+        String lowerDestination = destination.toLowerCase(Locale.UK);
+        if (lowerLine.contains(" to ") || (!lowerDestination.isEmpty() && lowerLine.contains(lowerDestination))) {
+            return line;
+        }
+        return line + " to " + destination;
+    }
+
+    private String occupancyIcon(String occupancy) {
+        if ("Easy Seating".equals(occupancy)) {
+            return "🟢";
+        }
+        if ("Standing Room Only".equals(occupancy)) {
+            return "🟡";
+        }
+        if ("Full/Crowded".equals(occupancy)) {
+            return "🔴";
+        }
+        return "🔵";
+    }
+
+    private int screenXFor(BusBillboard billboard) {
+        float relativeBearing = (bearingTo(billboard.latitude, billboard.longitude) - smoothedCompassBearing + 540f) % 360f - 180f;
+        int center = Math.max(0, getWidth() / 2 - dp(105));
+        int offset = (int) (relativeBearing * dp(4));
+        int max = Math.max(0, getWidth() - dp(220));
+        return Math.max(0, Math.min(max, center + offset));
+    }
+
+    private int screenYFor(BusBillboard billboard) {
+        float distance = distanceTo(billboard.latitude, billboard.longitude);
+        return Math.max(dp(95), 120 + Math.min(220, (int) distance) - dp(BILLBOARD_HOVER_OFFSET_DP));
     }
 
     private Location smoothLocation(Location previous, Location next, float alpha) {
@@ -681,20 +843,34 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         if (userLocation == null) {
             return 0f;
         }
-        Location stopLocation = new Location("stop");
-        stopLocation.setLatitude(pin.latitude);
-        stopLocation.setLongitude(pin.longitude);
-        return userLocation.bearingTo(stopLocation);
+        return bearingTo(pin.latitude, pin.longitude);
     }
 
     private float distanceTo(BusStopPin pin) {
         if (userLocation == null) {
             return 0f;
         }
-        Location stopLocation = new Location("stop");
-        stopLocation.setLatitude(pin.latitude);
-        stopLocation.setLongitude(pin.longitude);
-        return userLocation.distanceTo(stopLocation);
+        return distanceTo(pin.latitude, pin.longitude);
+    }
+
+    private float bearingTo(double latitude, double longitude) {
+        if (userLocation == null) {
+            return 0f;
+        }
+        Location target = new Location("target");
+        target.setLatitude(latitude);
+        target.setLongitude(longitude);
+        return userLocation.bearingTo(target);
+    }
+
+    private float distanceTo(double latitude, double longitude) {
+        if (userLocation == null) {
+            return 0f;
+        }
+        Location target = new Location("target");
+        target.setLatitude(latitude);
+        target.setLongitude(longitude);
+        return userLocation.distanceTo(target);
     }
 
     private String firstRoute() {
@@ -888,6 +1064,23 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             this.name = name;
             this.latitude = latitude;
             this.longitude = longitude;
+        }
+    }
+
+    private static final class BusBillboard {
+        final String id;
+        String lineName = "Bus";
+        String destinationName = "destination unknown";
+        String etaText = "ETA unknown";
+        String occupancy = "Information Unknown";
+        double latitude;
+        double longitude;
+        long lastUpdatedMs;
+        float displayedX = Float.NaN;
+        float displayedY = Float.NaN;
+
+        BusBillboard(String id) {
+            this.id = id;
         }
     }
 
