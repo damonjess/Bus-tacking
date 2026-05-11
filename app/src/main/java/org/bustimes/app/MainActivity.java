@@ -150,7 +150,26 @@ public class MainActivity extends Activity {
         }
         webView.loadUrl(url);
         registerBusTrackingReceiver();
-        startService(new Intent(this, BusTrackingService.class));
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        setMapTrackingActive(true);
+    }
+
+    @Override
+    protected void onStop() {
+        setMapTrackingActive(false);
+        super.onStop();
+    }
+
+    private void setMapTrackingActive(boolean active) {
+        Intent intent = new Intent(this, BusTrackingService.class);
+        intent.setAction(active
+                ? BusTrackingService.ACTION_START_MAP_TRACKING
+                : BusTrackingService.ACTION_STOP_MAP_TRACKING);
+        startService(intent);
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -512,18 +531,19 @@ public class MainActivity extends Activity {
     }
 
     private void applyVoiceRouteFilter(String spokenText) {
-        String route = extractRouteNumber(spokenText);
-        if (route.isEmpty()) {
+        VoiceRouteQuery query = parseVoiceRouteQuery(spokenText);
+        if (query.route.isEmpty()) {
             Toast.makeText(this, "I couldn't hear a bus route number", Toast.LENGTH_LONG).show();
             stopVoiceSearch();
             return;
         }
 
+        String placeLine = query.placeName.isEmpty() ? "near your current map/location" : "in " + query.placeName;
         new AlertDialog.Builder(this)
-                .setTitle("Did you mean route " + route + "?")
-                .setMessage("I heard: \"" + spokenText + "\"")
+                .setTitle("Did you mean route " + query.route + "?")
+                .setMessage("I heard: \"" + spokenText + "\"\nSearch live buses " + placeLine + ".")
                 .setPositiveButton("Yes", (dialog, which) -> {
-                    applyConfirmedRouteFilter(route);
+                    applyConfirmedRouteFilter(query);
                     stopVoiceSearch();
                 })
                 .setNegativeButton("Try again", (dialog, which) -> {
@@ -534,15 +554,86 @@ public class MainActivity extends Activity {
                 .show();
     }
 
-    private void applyConfirmedRouteFilter(String route) {
-        activeRouteFilter = route;
-        arBusStopView.setRouteFilter(activeRouteFilter);
+    private void applyConfirmedRouteFilter(VoiceRouteQuery query) {
+        activeRouteFilter = query.route;
         filterMapMarkersForRoute(activeRouteFilter);
         if (arModeEnabled) {
             showStandardMap();
         }
-        webView.loadUrl("https://bustimes.org/search?q=" + Uri.encode(activeRouteFilter));
-        Toast.makeText(this, "Searching for route " + activeRouteFilter, Toast.LENGTH_LONG).show();
+
+        Location targetLocation = query.location != null ? query.location : getCurrentLocalSearchLocation();
+        if (targetLocation != null) {
+            webView.loadUrl(MAP_URL + "#14/" + targetLocation.getLatitude() + "/" + targetLocation.getLongitude());
+        } else {
+            webView.loadUrl(MAP_URL);
+        }
+        requestImmediateBusRefresh();
+
+        String place = query.placeName.isEmpty() ? "nearby" : "in " + query.placeName;
+        Toast.makeText(this, "Showing live route " + activeRouteFilter + " buses " + place, Toast.LENGTH_LONG).show();
+    }
+
+    private VoiceRouteQuery parseVoiceRouteQuery(String text) {
+        String route = extractRouteNumber(text);
+        String placeName = extractKnownPlaceName(text);
+        return new VoiceRouteQuery(route, placeName, locationForPlace(placeName));
+    }
+
+    private Location getCurrentLocalSearchLocation() {
+        if (!hasLocationPermission()) {
+            return null;
+        }
+        return getBestLastKnownLocation((LocationManager) getSystemService(Context.LOCATION_SERVICE));
+    }
+
+    private String extractKnownPlaceName(String text) {
+        if (text == null) {
+            return "";
+        }
+        String normalized = text.toLowerCase(Locale.UK);
+        if (normalized.contains("scunthorpe")) {
+            return "Scunthorpe";
+        }
+        if (normalized.contains("grimsby")) {
+            return "Grimsby";
+        }
+        if (normalized.contains("doncaster")) {
+            return "Doncaster";
+        }
+        if (normalized.contains("hull")) {
+            return "Hull";
+        }
+        if (normalized.contains("lincoln")) {
+            return "Lincoln";
+        }
+        return "";
+    }
+
+    private Location locationForPlace(String placeName) {
+        if (placeName.isEmpty()) {
+            return null;
+        }
+
+        Location location = new Location("voice-place");
+        if ("Scunthorpe".equals(placeName)) {
+            location.setLatitude(53.5887);
+            location.setLongitude(-0.6544);
+        } else if ("Grimsby".equals(placeName)) {
+            location.setLatitude(53.5675);
+            location.setLongitude(-0.0808);
+        } else if ("Doncaster".equals(placeName)) {
+            location.setLatitude(53.5228);
+            location.setLongitude(-1.1285);
+        } else if ("Hull".equals(placeName)) {
+            location.setLatitude(53.7676);
+            location.setLongitude(-0.3274);
+        } else if ("Lincoln".equals(placeName)) {
+            location.setLatitude(53.2307);
+            location.setLongitude(-0.5406);
+        } else {
+            return null;
+        }
+        return location;
     }
 
     private String extractRouteNumber(String text) {
@@ -638,6 +729,12 @@ public class MainActivity extends Activity {
         }
 
         return result.toString();
+    }
+
+    private void requestImmediateBusRefresh() {
+        Intent intent = new Intent(this, BusTrackingService.class);
+        intent.setAction(BusTrackingService.ACTION_REFRESH_NOW);
+        startService(intent);
     }
 
     private void filterMapMarkersForRoute(String route) {
@@ -863,6 +960,18 @@ public class MainActivity extends Activity {
         return true;
     }
 
+    private static final class VoiceRouteQuery {
+        final String route;
+        final String placeName;
+        final Location location;
+
+        VoiceRouteQuery(String route, String placeName, Location location) {
+            this.route = route;
+            this.placeName = placeName;
+            this.location = location;
+        }
+    }
+
     private class RouteRecognitionListener implements RecognitionListener {
         @Override public void onReadyForSpeech(Bundle params) { }
         @Override public void onBeginningOfSpeech() { }
@@ -972,6 +1081,9 @@ public class MainActivity extends Activity {
         @Override
         public void onPageFinished(WebView view, String url) {
             hideAdsOnPage();
+            if (!activeRouteFilter.isEmpty()) {
+                filterMapMarkersForRoute(activeRouteFilter);
+            }
             bringNativeControlsToFront();
         }
 
@@ -993,6 +1105,9 @@ public class MainActivity extends Activity {
             progressBar.setVisibility(newProgress >= 100 ? View.GONE : View.VISIBLE);
             if (newProgress >= 100) {
                 hideAdsOnPage();
+                if (!activeRouteFilter.isEmpty()) {
+                    filterMapMarkersForRoute(activeRouteFilter);
+                }
                 bringNativeControlsToFront();
             }
         }

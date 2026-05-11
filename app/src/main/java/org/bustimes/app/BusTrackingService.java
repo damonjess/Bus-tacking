@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 import javax.xml.parsers.DocumentBuilderFactory;
@@ -28,15 +29,18 @@ public class BusTrackingService extends Service {
     static final String ACTION_BUS_POSITION = "org.bustimes.app.action.BUS_POSITION";
     static final String ACTION_TRACKING_STATUS = "org.bustimes.app.action.TRACKING_STATUS";
     static final String ACTION_REFRESH_NOW = "org.bustimes.app.action.REFRESH_NOW";
+    static final String ACTION_START_MAP_TRACKING = "org.bustimes.app.action.START_MAP_TRACKING";
+    static final String ACTION_STOP_MAP_TRACKING = "org.bustimes.app.action.STOP_MAP_TRACKING";
     static final String EXTRA_STATUS_MESSAGE = "status_message";
 
     private static final String TAG = "BusTrackingService";
-    private static final long POLL_INTERVAL_SECONDS = 30;
+    private static final long POLL_INTERVAL_SECONDS = 15;
     private static final int CONNECT_TIMEOUT_MS = 10_000;
     private static final int READ_TIMEOUT_MS = 20_000;
 
     private ScheduledExecutorService executorService;
-    private boolean pollingStarted;
+    private ScheduledFuture<?> pollingFuture;
+    private boolean mapActive;
 
     @Override
     public void onCreate() {
@@ -46,24 +50,47 @@ public class BusTrackingService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        String action = intent == null ? ACTION_START_MAP_TRACKING : intent.getAction();
+
+        if (ACTION_STOP_MAP_TRACKING.equals(action)) {
+            mapActive = false;
+            stopPolling();
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
         if (TextUtils.isEmpty(BuildConfig.BODS_API_KEY)) {
             broadcastStatus("Add a BODS_API_KEY GitHub secret or Gradle property to enable live BODS tracking.");
             return START_NOT_STICKY;
         }
 
-        boolean refreshRequested = intent != null && ACTION_REFRESH_NOW.equals(intent.getAction());
-        if (refreshRequested) {
-            executorService.execute(this::pollBodsVehicleLocations);
+        if (ACTION_REFRESH_NOW.equals(action)) {
+            if (mapActive) {
+                executorService.execute(this::pollBodsVehicleLocations);
+            }
+            return START_NOT_STICKY;
         }
 
-        if (!pollingStarted) {
-            executorService.scheduleWithFixedDelay(this::pollBodsVehicleLocations,
-                    refreshRequested ? POLL_INTERVAL_SECONDS : 0,
-                    POLL_INTERVAL_SECONDS,
-                    TimeUnit.SECONDS);
-            pollingStarted = true;
-        }
+        mapActive = true;
+        startPolling();
         return START_STICKY;
+    }
+
+    private void startPolling() {
+        if (pollingFuture != null && !pollingFuture.isCancelled()) {
+            return;
+        }
+        pollingFuture = executorService.scheduleWithFixedDelay(this::pollBodsVehicleLocations,
+                0,
+                POLL_INTERVAL_SECONDS,
+                TimeUnit.SECONDS);
+    }
+
+    private void stopPolling() {
+        if (pollingFuture != null) {
+            pollingFuture.cancel(true);
+            pollingFuture = null;
+        }
     }
 
     @Override
@@ -73,6 +100,7 @@ public class BusTrackingService extends Service {
 
     @Override
     public void onDestroy() {
+        stopPolling();
         if (executorService != null) {
             executorService.shutdownNow();
         }

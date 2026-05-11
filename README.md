@@ -8,11 +8,11 @@ A map-first Android wrapper for [bustimes.org](https://bustimes.org/) focused on
 - Bus stop markers from bustimes.org; tapping a stop shows the served route numbers and links through to the stop's live departure times.
 - Native **Home / locate me** button that asks for Android location permission and recentres the live map on the user's current position.
 - Native refresh button to reload the live map and request an immediate BODS vehicle refresh.
-- Voice search with Android `SpeechRecognizer`: tap the microphone and say a route number to filter live bus markers, open the matching bustimes.org search, and filter AR stop pins, including a **Did you mean?** confirmation for phrases such as “three fifty” or “three five zero”.
+- Voice search with Android `SpeechRecognizer`: tap the microphone and say a route number and place (for example “where is the number 6 in Scunthorpe”) to center the live map locally and show matching bus markers rather than stop search results, including a **Did you mean?** confirmation for phrases such as “three fifty” or “three five zero”.
 - Native **+ / −** zoom controls so both zoom in and zoom out are always visible on top of the map.
 - Injected WebView ad-hiding styles to remove common ad containers from the map page.
 - Location-Based AR Bus Stop Finder mode backed by the live camera preview, GPS, and compass bearing with camera permission handling and floating route stop pins.
-- Optional BODS SIRI-VM polling that refreshes bus locations every 30 seconds and animates existing bus markers to their new positions over 5 seconds.
+- Optional BODS SIRI-VM polling that refreshes bus locations every 15 seconds while the map is active and stops polling when the map closes to save battery.
 - WebView support for JavaScript, DOM storage, cookies, geolocation prompts, back navigation, external map/mail/phone links, and downloads.
 - Battery-conscious cleanup: AR camera/session and voice listener resources are shut down when leaving those modes.
 
