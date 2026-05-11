@@ -52,4 +52,4 @@ This repository includes a GitHub Actions workflow at `.github/workflows/build-a
 
 The workflow also runs automatically for pushes to `main`/`work` and for pull requests.
 
-The project uses the Android Gradle Plugin and has no third-party runtime dependencies.
+The project uses the Android Gradle Plugin. ARCore brings in AndroidX metadata, so `gradle.properties` enables `android.useAndroidX=true` for local and GitHub Actions builds.
