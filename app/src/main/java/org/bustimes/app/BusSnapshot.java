@@ -19,6 +19,8 @@ final class BusSnapshot {
     final float speedKph;
     final int expectedEtaMinutes;
     final String arrivalStopName;
+    /** Optional vehicle registration surfaced from hijacked site popups. */
+    String regOverride = "";
 
     BusSnapshot(String busId, String lineName, String lineRef, String destinationName, String occupancy,
             String vehicleId, String lastSeen, String operatorName, String distanceText,

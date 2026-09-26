@@ -4,11 +4,9 @@ import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.app.Dialog;
 import android.content.Context;
-import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
-import android.net.Uri;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -22,8 +20,8 @@ import android.widget.TextView;
 import java.util.Locale;
 
 /**
- * A modern dark-glass bottom sheet with live bus details, shown whenever a bus
- * marker on the map or in AR is tapped.
+ * Light "Selected Bus" bottom sheet matching the reference design: route title,
+ * live status, next-stop ETA, vehicle/reg line and Favorite Route / Alert Me actions.
  */
 final class BusDetailsSheet {
 
@@ -36,6 +34,14 @@ final class BusDetailsSheet {
         boolean isFollowingBus(String busId);
 
         void onShowBusOnMap(double latitude, double longitude);
+
+        void onToggleFavorite(String route);
+
+        boolean isFavorite(String route);
+
+        void onToggleAlert(String busId, String route);
+
+        boolean isAlertArmed(String busId, String route);
     }
 
     private BusDetailsSheet() {
@@ -44,6 +50,7 @@ final class BusDetailsSheet {
     static void show(Activity activity, BusSnapshot snapshot, Callbacks callbacks) {
         Context context = activity;
         int pad = UiTheme.dp(context, 20);
+        boolean dark = false; // light sheet, like the reference
 
         final Dialog dialog = new Dialog(activity);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
@@ -51,13 +58,17 @@ final class BusDetailsSheet {
 
         LinearLayout root = new LinearLayout(context);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackground(rounded(context, UiTheme.INK_LIGHT, dp24(context)));
-        root.setPadding(pad, pad, pad, dp12(context));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.WHITE);
+        float[] radii = {UiTheme.dp(context, 24), UiTheme.dp(context, 24), 0, 0, 0, 0, 0, 0};
+        bg.setCornerRadii(radii);
+        root.setBackground(bg);
+        root.setPadding(pad, dp14(context), pad, pad);
 
         // ---- grab handle -------------------------------------------------------
         View handle = new View(context);
         GradientDrawable handleBg = new GradientDrawable();
-        handleBg.setColor(Color.argb(90, 255, 255, 255));
+        handleBg.setColor(Color.argb(60, 0, 0, 0));
         handleBg.setCornerRadius(UiTheme.dp(context, 3));
         handle.setBackground(handleBg);
         LinearLayout.LayoutParams handleParams = new LinearLayout.LayoutParams(dp40(context), UiTheme.dp(context, 5));
@@ -65,94 +76,167 @@ final class BusDetailsSheet {
         handleParams.bottomMargin = dp12(context);
         root.addView(handle, handleParams);
 
-        // ---- header: badge + route + destination -------------------------------
-        LinearLayout header = new LinearLayout(context);
-        header.setOrientation(LinearLayout.HORIZONTAL);
-        header.setGravity(Gravity.CENTER_VERTICAL);
+        int ink = Color.rgb(20, 26, 44);
+        int dim = Color.argb(180, 90, 100, 124);
 
-        View badge = busBadge(context, snapshot.lineName, UiTheme.occupancyColor(snapshot.occupancy));
-        header.addView(badge, new LinearLayout.LayoutParams(dp64(context), dp64(context)));
+        // ---- "Selected Bus" label ----------------------------------------------
+        TextView selectedLabel = new TextView(context);
+        selectedLabel.setText("Selected Bus");
+        selectedLabel.setTextColor(dim);
+        selectedLabel.setTextSize(13);
+        root.addView(selectedLabel);
 
-        LinearLayout titles = new LinearLayout(context);
-        titles.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        titleParams.leftMargin = dp14(context);
-        header.addView(titles, titleParams);
-
+        // ---- Route title --------------------------------------------------------
         TextView routeTitle = new TextView(context);
-        routeTitle.setText("Route " + snapshot.lineName);
-        routeTitle.setTextColor(Color.WHITE);
-        routeTitle.setTextSize(22);
+        routeTitle.setText(String.format(Locale.UK, "ROUTE %s | %s",
+                snapshot.lineName, snapshot.destinationName));
+        routeTitle.setTextColor(ink);
+        routeTitle.setTextSize(19);
         routeTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        titles.addView(routeTitle);
+        LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        titleParams.topMargin = dp8(context);
+        root.addView(routeTitle, titleParams);
 
-        TextView destination = new TextView(context);
-        destination.setText("→ " + snapshot.destinationName);
-        destination.setTextColor(UiTheme.TEXT_DIM);
-        destination.setTextSize(14);
-        destination.setTypeface(Typeface.create("sans-serif", Typeface.NORMAL));
-        titles.addView(destination);
-
-        View livePill = UiTheme.pillText(context, "● LIVE", UiTheme.GREEN,
-                UiTheme.withAlpha(UiTheme.GREEN, 26), UiTheme.withAlpha(UiTheme.GREEN, 90));
+        // ---- Live status --------------------------------------------------------
+        int statusColor = statusColor(snapshot);
+        String statusText = statusText(snapshot);
+        TextView liveStatus = new TextView(context);
+        liveStatus.setText(statusText);
+        liveStatus.setTextColor(statusColor);
+        liveStatus.setTextSize(15);
+        liveStatus.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         LinearLayout.LayoutParams liveParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        liveParams.gravity = Gravity.TOP;
-        header.addView(livePill, liveParams);
-        root.addView(header);
-
-        // ---- hero ETA card ------------------------------------------------------
-        LinearLayout hero = heroCard(context, snapshot);
-        LinearLayout.LayoutParams heroParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        heroParams.topMargin = dp14(context);
-        root.addView(hero, heroParams);
+        liveParams.topMargin = dp8(context);
+        root.addView(liveStatus, liveParams);
 
-        // ---- occupancy meter ----------------------------------------------------
-        LinearLayout occupancyBlock = occupancyMeter(context, snapshot);
-        LinearLayout.LayoutParams occupancyParams = new LinearLayout.LayoutParams(
+        // ---- Next stop ETA ------------------------------------------------------
+        TextView etaLine = new TextView(context);
+        etaLine.setText(etaLineText(snapshot));
+        etaLine.setTextColor(ink);
+        etaLine.setTextSize(17);
+        etaLine.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        LinearLayout.LayoutParams etaParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        occupancyParams.topMargin = dp14(context);
-        root.addView(occupancyBlock, occupancyParams);
+        etaParams.topMargin = dp10(context);
+        root.addView(etaLine, etaParams);
 
-        // ---- facts grid ----------------------------------------------------------
-        LinearLayout grid = factsGrid(context, snapshot);
-        LinearLayout.LayoutParams gridParams = new LinearLayout.LayoutParams(
+        // ---- Vehicle / reg + occupancy ------------------------------------------
+        TextView vehicleLine = new TextView(context);
+        String vehicle = snapshot.regOverride == null || snapshot.regOverride.isEmpty()
+                ? "Bus #" + snapshot.vehicleId
+                : "Bus #" + snapshot.vehicleId + " (Reg: " + snapshot.regOverride + ")";
+        if (!"Information Unknown".equals(snapshot.occupancy)) {
+            vehicle += "  ·  " + occupancyLabel(snapshot.occupancy);
+        }
+        vehicleLine.setText(vehicle);
+        vehicleLine.setTextColor(dim);
+        vehicleLine.setTextSize(13);
+        LinearLayout.LayoutParams vehicleParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        gridParams.topMargin = dp14(context);
-        root.addView(grid, gridParams);
+        vehicleParams.topMargin = dp8(context);
+        root.addView(vehicleLine, vehicleParams);
 
-        // ---- operator / source line ---------------------------------------------
-        if (!snapshot.operatorName.trim().isEmpty()) {
-            TextView operator = new TextView(context);
-            String operatorText = snapshot.operatorName;
-            if (!snapshot.lastSeen.trim().isEmpty()) {
-                operatorText += "  ·  updated " + snapshot.lastSeen;
+        // ---- Distance + heading -------------------------------------------------
+        if (!snapshot.distanceText.isEmpty() || !Float.isNaN(snapshot.bearing)) {
+            TextView extraLine = new TextView(context);
+            StringBuilder extra = new StringBuilder();
+            if (!snapshot.distanceText.isEmpty()) {
+                extra.append(snapshot.distanceText);
             }
-            operator.setText(operatorText);
-            operator.setTextColor(Color.argb(160, 226, 234, 255));
-            operator.setTextSize(12);
-            LinearLayout.LayoutParams operatorParams = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            operatorParams.topMargin = dp12(context);
-            root.addView(operator, operatorParams);
+            if (!Float.isNaN(snapshot.bearing) && snapshot.bearing >= 0) {
+                if (extra.length() > 0) {
+                    extra.append("  ·  ");
+                }
+                extra.append("heading ").append(snapshot.compassBearingText());
+            }
+            if (snapshot.speedKph > 0.5f) {
+                extra.append("  ·  ").append(snapshot.speedText());
+            }
+            extraLine.setText(extra.toString());
+            extraLine.setTextColor(dim);
+            extraLine.setTextSize(13);
+            LinearLayout.LayoutParams extraParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            extraParams.topMargin = dp8(context);
+            root.addView(extraLine, extraParams);
         }
 
-        // ---- action row ----------------------------------------------------------
-        root.addView(actionRow(context, snapshot, callbacks, dialog),
-                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        // ---- Right-side actions: Favorite + Alert -------------------------------
+        LinearLayout actions = new LinearLayout(context);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        actions.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
 
-        LinearLayout footerHint = new LinearLayout(context);
-        TextView hint = new TextView(context);
-        hint.setText("Live data from BODS · refreshes every 15s while the map is open");
-        hint.setTextColor(Color.argb(120, 226, 234, 255));
-        hint.setTextSize(11);
-        hint.setGravity(Gravity.CENTER);
-        footerHint.addView(hint);
-        LinearLayout.LayoutParams hintParams = new LinearLayout.LayoutParams(
+        boolean favorite = callbacks != null && callbacks.isFavorite(snapshot.lineName);
+        actions.addView(iconAction(context, favorite ? "★" : "☆",
+                favorite ? "Favorited" : "Favorite Route", statusColor, () -> {
+                    if (callbacks != null) {
+                        callbacks.onToggleFavorite(snapshot.lineName);
+                        dialog.dismiss();
+                    }
+                }));
+
+        boolean armed = callbacks != null && callbacks.isAlertArmed(snapshot.busId, snapshot.lineName);
+        actions.addView(iconAction(context, "🔔",
+                armed ? "Alert on" : "Alert Me", armed ? statusColor : ink, () -> {
+                    if (callbacks != null) {
+                        callbacks.onToggleAlert(snapshot.busId, snapshot.lineName);
+                        dialog.dismiss();
+                    }
+                }));
+
+        LinearLayout.LayoutParams actionsParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        hintParams.topMargin = dp10(context);
-        root.addView(footerHint, hintParams);
+        actionsParams.topMargin = dp10(context);
+        root.addView(actions, actionsParams);
+
+        // ---- Bottom action row ---------------------------------------------------
+        LinearLayout bottomRow = new LinearLayout(context);
+        bottomRow.setOrientation(LinearLayout.HORIZONTAL);
+
+        if (callbacks != null) {
+            boolean following = callbacks.isFollowingBus(snapshot.busId);
+            bottomRow.addView(textPill(context, following ? "✓ Following" : "◎ Follow bus",
+                    following ? UiTheme.BLUE : ink, () -> {
+                        callbacks.onFollowBus(snapshot.busId, !following);
+                        dialog.dismiss();
+                    }));
+
+            if (!Double.isNaN(snapshot.latitude)) {
+                bottomRow.addView(textPill(context, "➤ Walk me there (AR)", ink, () -> {
+                    callbacks.onNavigateToBus(snapshot.latitude, snapshot.longitude);
+                    dialog.dismiss();
+                }));
+
+                bottomRow.addView(textPill(context, "⦿ Show on map", ink, () -> {
+                    callbacks.onShowBusOnMap(snapshot.latitude, snapshot.longitude);
+                    dialog.dismiss();
+                }));
+            }
+
+            bottomRow.addView(textPill(context, "⇪ Share", ink, () -> {
+                String text = String.format(Locale.UK,
+                        "Bus %s → %s. %s. %s",
+                        snapshot.lineName,
+                        snapshot.destinationName,
+                        etaLineText(snapshot),
+                        snapshot.distanceText.isEmpty() ? "" : "Currently " + snapshot.distanceText + ".");
+                android.content.Intent send = new android.content.Intent(android.content.Intent.ACTION_SEND);
+                send.setType("text/plain");
+                send.putExtra(android.content.Intent.EXTRA_TEXT, text);
+                context.startActivity(android.content.Intent.createChooser(send, "Share bus"));
+                dialog.dismiss();
+            }));
+        }
+
+        HorizontalScrollView scroller = new HorizontalScrollView(context);
+        scroller.setHorizontalScrollBarEnabled(false);
+        scroller.addView(bottomRow);
+        LinearLayout.LayoutParams scrollerParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        scrollerParams.topMargin = dp14(context);
+        root.addView(scroller, scrollerParams);
 
         dialog.setContentView(root);
         Window window = dialog.getWindow();
@@ -160,22 +244,17 @@ final class BusDetailsSheet {
             window.setBackgroundDrawableResource(android.R.color.transparent);
             window.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             window.setGravity(Gravity.BOTTOM);
-            window.setWindowAnimations(android.R.style.Animation_InputMethod);
         }
         dialog.show();
 
-        // Slide-up entrance.
         root.setTranslationY(dp40(context));
         root.animate().translationY(0f).setDuration(220)
                 .setInterpolator(new DecelerateInterpolator(1.4f))
                 .start();
 
-        // Live ETA countdown while the sheet is open.
+        // Live countdown while open.
         if (snapshot.expectedEtaMinutes >= 0) {
-            final TextView etaValueView = hero.findViewWithTag("eta_value");
-            final TextView etaUnitView = hero.findViewWithTag("eta_unit");
             final long startElapsed = android.os.SystemClock.elapsedRealtime();
-            final long startWallClock = System.currentTimeMillis();
             final ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
             animator.setDuration(120_000L);
             animator.addUpdateListener(animation -> {
@@ -183,329 +262,109 @@ final class BusDetailsSheet {
                     animation.cancel();
                     return;
                 }
-                long elapsedSeconds = (android.os.SystemClock.elapsedRealtime() - startElapsed) / 1000L;
-                long minutes = snapshot.expectedEtaMinutes - elapsedSeconds / 60L;
-                if (etaValueView != null) {
-                    etaValueView.setText(String.format(Locale.UK, "%d", Math.max(0, minutes)));
-                }
-                if (etaUnitView != null) {
-                    etaUnitView.setText(minutes <= 1 ? "min" : "min");
-                }
+                long minutes = snapshot.expectedEtaMinutes - (android.os.SystemClock.elapsedRealtime() - startElapsed) / 60000L;
+                etaLine.setText(String.format(Locale.UK, "%s - %d min",
+                        snapshot.arrivalStopName, Math.max(0, minutes)));
             });
             animator.start();
             dialog.setOnDismissListener(d -> animator.cancel());
         }
     }
 
-    private static LinearLayout heroCard(Context context, BusSnapshot snapshot) {
-        LinearLayout hero = new LinearLayout(context);
-        hero.setOrientation(LinearLayout.HORIZONTAL);
-        hero.setGravity(Gravity.CENTER_VERTICAL);
-        hero.setBackground(rounded(context, UiTheme.withAlpha(UiTheme.INK, 110), dp20(context)));
-        int pad = dp14(context);
-        hero.setPadding(pad, pad, pad, pad);
-
-        LinearLayout etaBlock = new LinearLayout(context);
-        etaBlock.setOrientation(LinearLayout.VERTICAL);
-
-        TextView etaValue = new TextView(context);
-        etaValue.setTag("eta_value");
-        etaValue.setText(snapshot.expectedEtaMinutes >= 0
-                ? String.format(Locale.UK, "%d", snapshot.expectedEtaMinutes)
-                : "—");
-        etaValue.setTextColor(Color.WHITE);
-        etaValue.setTextSize(46);
-        etaValue.setTypeface(Typeface.create("sans-serif-light", Typeface.NORMAL));
-        etaBlock.addView(etaValue);
-
-        TextView etaUnit = new TextView(context);
-        etaUnit.setTag("eta_unit");
-        etaUnit.setText(snapshot.expectedEtaMinutes >= 0 ? "min to " + snapshot.arrivalStopName : "ETA not published");
-        etaUnit.setTextColor(Color.argb(200, 226, 234, 255));
-        etaUnit.setTextSize(12);
-        etaBlock.addView(etaUnit);
-
-        hero.addView(etaBlock, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-
-        // Status ring: now / soon / later.
-        LinearLayout statusBlock = new LinearLayout(context);
-        statusBlock.setOrientation(LinearLayout.VERTICAL);
-        statusBlock.setGravity(Gravity.CENTER);
-        int statusColor;
-        String statusText;
+    private static int statusColor(BusSnapshot snapshot) {
         if (snapshot.expectedEtaMinutes < 0) {
-            statusColor = UiTheme.BLUE;
-            statusText = "NO DATA";
-        } else if (snapshot.expectedEtaMinutes <= 2) {
-            statusColor = UiTheme.CORAL;
-            statusText = "DUE NOW";
-        } else if (snapshot.expectedEtaMinutes <= 8) {
-            statusColor = UiTheme.AMBER;
-            statusText = "DUE SOON";
-        } else {
-            statusColor = UiTheme.GREEN;
-            statusText = "ON TIME";
+            return UiTheme.BLUE;
         }
-        View ring = new View(context);
-        GradientDrawable ringBg = new GradientDrawable();
-        ringBg.setShape(GradientDrawable.OVAL);
-        ringBg.setColor(UiTheme.withAlpha(statusColor, 34));
-        ringBg.setStroke(UiTheme.dp(context, 3), statusColor);
-        ring.setBackground(ringBg);
-        statusBlock.addView(ring, new LinearLayout.LayoutParams(dp56(context), dp56(context)));
-
-        TextView statusLabel = new TextView(context);
-        statusLabel.setText(statusText);
-        statusLabel.setTextColor(statusColor);
-        statusLabel.setTextSize(11);
-        statusLabel.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        statusLabel.setGravity(Gravity.CENTER);
-        LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        statusParams.topMargin = UiTheme.dp(context, 6);
-        statusBlock.addView(statusLabel, statusParams);
-
-        hero.addView(statusBlock, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        return hero;
+        if (snapshot.expectedEtaMinutes <= 2) {
+            return UiTheme.CORAL;
+        }
+        if (snapshot.expectedEtaMinutes <= 8) {
+            return UiTheme.AMBER;
+        }
+        return UiTheme.GREEN;
     }
 
-    private static LinearLayout occupancyMeter(Context context, BusSnapshot snapshot) {
-        LinearLayout block = new LinearLayout(context);
-        block.setOrientation(LinearLayout.VERTICAL);
-
-        LinearLayout labelRow = new LinearLayout(context);
-        labelRow.setOrientation(LinearLayout.HORIZONTAL);
-
-        TextView label = new TextView(context);
-        label.setText("Occupancy");
-        label.setTextColor(UiTheme.TEXT_DIM);
-        label.setTextSize(12);
-        label.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        labelRow.addView(label, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-
-        TextView value = new TextView(context);
-        value.setText(snapshot.occupancy);
-        value.setTextColor(UiTheme.occupancyColor(snapshot.occupancy));
-        value.setTextSize(12);
-        value.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        labelRow.addView(value, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        block.addView(labelRow, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        // Track.
-        LinearLayout meter = new LinearLayout(context);
-        meter.setOrientation(LinearLayout.HORIZONTAL);
-        meter.setBackground(rounded(context, UiTheme.withAlpha(Color.BLACK, 90), UiTheme.dp(context, 8)));
-        meter.setPadding(UiTheme.dp(context, 2), UiTheme.dp(context, 2), UiTheme.dp(context, 2), UiTheme.dp(context, 2));
-
-        View filled = new View(context);
-        GradientDrawable fillBg = new GradientDrawable();
-        fillBg.setCornerRadius(UiTheme.dp(context, 6));
-        fillBg.setColor(UiTheme.occupancyColor(snapshot.occupancy));
-        filled.setBackground(fillBg);
-        LinearLayout.LayoutParams fillParams = new LinearLayout.LayoutParams(0, UiTheme.dp(context, 10), occupancyFraction(snapshot));
-        meter.addView(filled, fillParams);
-
-        View rest = new View(context);
-        LinearLayout.LayoutParams restParams = new LinearLayout.LayoutParams(0, UiTheme.dp(context, 10), 1f - occupancyFraction(snapshot));
-        meter.addView(rest, restParams);
-
-        LinearLayout.LayoutParams meterParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        LinearLayout blockSpacing = new LinearLayout(context);
-        LinearLayout spacerWrap = new LinearLayout(context);
-        spacerWrap.setOrientation(LinearLayout.VERTICAL);
-        spacerWrap.setPadding(0, UiTheme.dp(context, 8), 0, 0);
-        spacerWrap.addView(meter, meterParams);
-        block.addView(spacerWrap, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        return block;
+    private static String statusText(BusSnapshot snapshot) {
+        if (snapshot.expectedEtaMinutes < 0) {
+            return "Live: awaiting data";
+        }
+        if (snapshot.expectedEtaMinutes <= 2) {
+            return "Live: due now";
+        }
+        if (snapshot.expectedEtaMinutes <= 8) {
+            return "Live: " + snapshot.expectedEtaMinutes + " min away";
+        }
+        return "Live: On-time";
     }
 
-    private static float occupancyFraction(BusSnapshot snapshot) {
-        switch (snapshot.occupancy) {
+    private static String etaLineText(BusSnapshot snapshot) {
+        if (snapshot.expectedEtaMinutes < 0) {
+            return snapshot.arrivalStopName + " - ETA not published";
+        }
+        return String.format(Locale.UK, "%s - %d min", snapshot.arrivalStopName, snapshot.expectedEtaMinutes);
+    }
+
+    private static String occupancyLabel(String occupancy) {
+        switch (occupancy) {
             case "Full/Crowded":
-                return 0.95f;
+                return "🔴 crowded";
             case "Standing Room Only":
-                return 0.55f;
+                return "🟡 busy";
             case "Easy Seating":
-                return 0.2f;
+                return "🟢 seats free";
             default:
-                return 0.5f;
+                return "";
         }
     }
 
-    private static LinearLayout factsGrid(Context context, BusSnapshot snapshot) {
-        LinearLayout grid = new LinearLayout(context);
-        grid.setOrientation(LinearLayout.VERTICAL);
+    private static LinearLayout iconAction(Context context, String icon, String label, int tint, Runnable action) {
+        LinearLayout item = new LinearLayout(context);
+        item.setOrientation(LinearLayout.VERTICAL);
+        item.setGravity(Gravity.CENTER);
+        item.setPadding(UiTheme.dp(context, 14), UiTheme.dp(context, 6), UiTheme.dp(context, 14), UiTheme.dp(context, 6));
+        item.setOnClickListener(v -> action.run());
+        UiTheme.pressScale(item);
 
-        LinearLayout rowOne = new LinearLayout(context);
-        rowOne.addView(factCell(context, "Speed", snapshot.speedText()),
-                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        rowOne.addView(spacer(context));
-        rowOne.addView(factCell(context, "Heading", snapshot.compassBearingText()),
-                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        grid.addView(rowOne, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        LinearLayout rowTwo = new LinearLayout(context);
-        rowTwo.addView(factCell(context, "Distance", snapshot.distanceText),
-                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        rowTwo.addView(spacer(context));
-        rowTwo.addView(factCell(context, "Vehicle", snapshot.vehicleId),
-                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        grid.addView(rowTwo, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        return grid;
-    }
-
-    private static View spacer(Context context) {
-        View spacer = new View(context);
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(UiTheme.dp(context, 8), 1);
-        spacer.setLayoutParams(params);
-        return spacer;
-    }
-
-    private static LinearLayout factCell(Context context, String label, String value) {
-        LinearLayout cell = new LinearLayout(context);
-        cell.setOrientation(LinearLayout.VERTICAL);
-        cell.setBackground(rounded(context, UiTheme.withAlpha(UiTheme.INK, 110), dp16(context)));
-        int pad = dp12(context);
-        cell.setPadding(pad, pad, pad, pad);
-
-        TextView valueView = new TextView(context);
-        valueView.setText(value.isEmpty() ? "—" : value);
-        valueView.setTextColor(Color.WHITE);
-        valueView.setTextSize(15);
-        valueView.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        valueView.setSingleLine(true);
-        valueView.setGravity(Gravity.CENTER);
-        cell.addView(valueView, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        TextView iconView = new TextView(context);
+        iconView.setText(icon);
+        iconView.setTextSize(22);
+        iconView.setTextColor(tint);
+        iconView.setGravity(Gravity.CENTER);
+        item.addView(iconView);
 
         TextView labelView = new TextView(context);
-        labelView.setText(label.toUpperCase(Locale.UK));
-        labelView.setTextColor(Color.argb(130, 226, 234, 255));
-        labelView.setTextSize(10);
-        labelView.setTypeface(Typeface.create("sans-serif", Typeface.NORMAL));
+        labelView.setText(label);
+        labelView.setTextSize(11);
+        labelView.setTextColor(Color.argb(200, 60, 70, 96));
         labelView.setGravity(Gravity.CENTER);
-        cell.addView(labelView, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        return cell;
+        item.addView(labelView);
+        return item;
     }
 
-    private static View actionRow(Context context, BusSnapshot snapshot, Callbacks callbacks, Dialog dialog) {
-        HorizontalScrollView scroller = new HorizontalScrollView(context);
-        scroller.setHorizontalScrollBarEnabled(false);
-
-        LinearLayout row = new LinearLayout(context);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-
-        if (callbacks != null) {
-            boolean following = callbacks.isFollowingBus(snapshot.busId);
-            TextView follow = UiTheme.pillText(context, following ? "✓ Following" : "◎ Follow this bus",
-                    following ? UiTheme.CYAN : Color.WHITE,
-                    UiTheme.withAlpha(following ? UiTheme.CYAN : UiTheme.BLUE, 40),
-                    UiTheme.withAlpha(following ? UiTheme.CYAN : UiTheme.BLUE, 140));
-            follow.setOnClickListener(v -> {
-                callbacks.onFollowBus(snapshot.busId, !following);
-                dialog.dismiss();
-            });
-            row.addView(follow);
-
-            TextView navigate = UiTheme.pillText(context, "➤ Walk me there (AR)", Color.WHITE,
-                    UiTheme.withAlpha(UiTheme.BLUE, 40), UiTheme.withAlpha(UiTheme.BLUE, 140));
-            navigate.setOnClickListener(v -> {
-                callbacks.onNavigateToBus(snapshot.latitude, snapshot.longitude);
-                dialog.dismiss();
-            });
-            row.addView(navigate);
-
-            TextView showOnMap = UiTheme.pillText(context, "⦿ Show on map", Color.WHITE,
-                    UiTheme.withAlpha(UiTheme.INK, 120), UiTheme.withAlpha(Color.WHITE, 60));
-            showOnMap.setOnClickListener(v -> {
-                callbacks.onShowBusOnMap(snapshot.latitude, snapshot.longitude);
-                dialog.dismiss();
-            });
-            row.addView(showOnMap);
-        }
-
-        TextView share = UiTheme.pillText(context, "⇪ Share", Color.WHITE,
-                UiTheme.withAlpha(UiTheme.INK, 120), UiTheme.withAlpha(Color.WHITE, 60));
-        share.setOnClickListener(v -> {
-            String text = String.format(Locale.UK,
-                    "Bus %s → %s%s. %s. Occupancy: %s.%s",
-                    snapshot.lineName,
-                    snapshot.destinationName,
-                    snapshot.expectedEtaMinutes >= 0 ? " due in " + snapshot.expectedEtaMinutes + " min" : "",
-                    "Speed " + snapshot.speedText(),
-                    snapshot.occupancy,
-                    snapshot.distanceText.isEmpty() ? "" : " Currently " + snapshot.distanceText + " from me.");
-            Intent send = new Intent(Intent.ACTION_SEND);
-            send.setType("text/plain");
-            send.putExtra(Intent.EXTRA_TEXT, text);
-            context.startActivity(Intent.createChooser(send, "Share bus"));
-            dialog.dismiss();
-        });
-        row.addView(share);
-
-        int rowPad = UiTheme.dp(context, 6);
-        row.setPadding(0, rowPad, 0, rowPad);
-        scroller.addView(row);
-        return scroller;
-    }
-
-    /** Circular route badge like a modern transit chip. */
-    private static View busBadge(Context context, String lineName, int color) {
-        FrameLayout badge = new FrameLayout(context);
-        GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
-                new int[] { UiTheme.withAlpha(color, 255), UiTheme.withAlpha(color, 170) });
-        bg.setShape(GradientDrawable.OVAL);
-        badge.setBackground(bg);
-
-        TextView label = new TextView(context);
-        label.setText(lineName);
-        label.setTextColor(Color.WHITE);
-        label.setTextSize(24);
-        label.setTypeface(Typeface.create("sans-serif-black", Typeface.NORMAL));
-        label.setGravity(Gravity.CENTER);
-        badge.addView(label, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        return badge;
-    }
-
-    private static GradientDrawable rounded(Context context, int color, float radiusPx) {
-        GradientDrawable drawable = new GradientDrawable();
-        drawable.setColor(color);
-        drawable.setCornerRadius(radiusPx);
-        return drawable;
-    }
-
-    private static int dp64(Context context) {
-        return UiTheme.dp(context, 64);
-    }
-
-    private static int dp56(Context context) {
-        return UiTheme.dp(context, 56);
+    private static TextView textPill(Context context, String label, int inkColor, Runnable action) {
+        TextView pill = new TextView(context);
+        pill.setText(label);
+        pill.setTextSize(13);
+        pill.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        pill.setTextColor(inkColor);
+        pill.setGravity(Gravity.CENTER);
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(Color.argb(16, 20, 26, 44));
+        background.setCornerRadius(UiTheme.dp(context, 20));
+        background.setStroke(UiTheme.dp(context, 1), Color.argb(40, 20, 26, 44));
+        pill.setBackground(UiTheme.ripple(background));
+        pill.setPadding(UiTheme.dp(context, 14), UiTheme.dp(context, 8), UiTheme.dp(context, 14), UiTheme.dp(context, 8));
+        pill.setOnClickListener(v -> action.run());
+        UiTheme.pressScale(pill);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.rightMargin = UiTheme.dp(context, 8);
+        pill.setLayoutParams(params);
+        return pill;
     }
 
     private static int dp40(Context context) {
         return UiTheme.dp(context, 40);
-    }
-
-    private static int dp24(Context context) {
-        return UiTheme.dp(context, 24);
-    }
-
-    private static int dp20(Context context) {
-        return UiTheme.dp(context, 20);
-    }
-
-    private static int dp16(Context context) {
-        return UiTheme.dp(context, 16);
     }
 
     private static int dp14(Context context) {
@@ -518,5 +377,9 @@ final class BusDetailsSheet {
 
     private static int dp10(Context context) {
         return UiTheme.dp(context, 10);
+    }
+
+    private static int dp8(Context context) {
+        return UiTheme.dp(context, 8);
     }
 }

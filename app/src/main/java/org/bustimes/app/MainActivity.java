@@ -16,23 +16,28 @@ import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.PorterDuff;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.location.Criteria;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
 import android.net.Uri;
-import android.os.Handler;
-import android.os.Looper;
-import android.provider.Settings;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.Vibrator;
+import android.provider.Settings;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
 import android.webkit.CookieManager;
 import android.webkit.DownloadListener;
 import android.webkit.GeolocationPermissions;
@@ -40,29 +45,39 @@ import android.webkit.JavascriptInterface;
 import android.webkit.URLUtil;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.FrameLayout;
-import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.view.animation.LinearInterpolator;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.ByteArrayInputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.Date;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TimeZone;
 
+/**
+ * Bus Times Live — app-chrome shell around bustimes.org.
+ * Dark top bar + bottom navigation, clean map controls, light "Selected Bus"
+ * sheet, ad/site-chrome blocking, hijacked site popups and AR mode.
+ */
 public class MainActivity extends Activity {
     private static final int LOCATION_PERMISSION_REQUEST = 1001;
     private static final int CENTER_MAP_PERMISSION_REQUEST = 1002;
@@ -70,28 +85,55 @@ public class MainActivity extends Activity {
     private static final int CAMERA_PERMISSION_REQUEST = 1004;
     private static final String SAVED_URL = "saved_url";
     private static final String MAP_URL = "https://bustimes.org/map";
+    private static final String SEARCH_URL = "https://bustimes.org/search?q=";
     private static final String PREFS_NAME = "bustimes_prefs";
     private static final String PREF_NIGHT_MODE = "night_mode";
+    private static final String PREF_FAVORITES = "favorites_json";
+    private static final String PREF_RECENT = "recent_routes_json";
     private static final long BUS_MARKER_ANIMATION_MS = 5_000L;
     private static final long MARKER_JS_THROTTLE_MS = 300L;
     private static final long BILLBOARD_THROTTLE_MS = 600L;
     private static final long MARKER_STALE_MS = 120_000L;
     private static final long FOLLOW_INTERVAL_MS = 5_000L;
-    private static final long CHIPS_REBUILD_INTERVAL_MS = 5_000L;
 
-    private WebView webView;
-    private ProgressBar progressBar;
-    private Button locateButton;
-    private Button refreshButton;
-    private Button microphoneButton;
+    // Chrome
+    private TextView topBarTitle;
+    private TextView topBarSubtitle;
     private Button arToggleButton;
-    private LinearLayout zoomControls;
-    private Button nightModeButton;
-    private TextView statusPill;
-    private TextView liveCountPill;
-    private HorizontalScrollView routeChipsScroll;
-    private LinearLayout routeChipRow;
+    private LinearLayout tabMapButton;
+    private LinearLayout tabSearchButton;
+    private LinearLayout tabFavoritesButton;
+    private LinearLayout tabAccountButton;
+    private TextView tabMapIcon;
+    private TextView tabSearchIcon;
+    private TextView tabFavoritesIcon;
+    private TextView tabAccountIcon;
+
+    // Content
+    private FrameLayout contentArea;
+    private WebView webView;
     private ArBusStopView arBusStopView;
+    private LinearLayout searchScreen;
+    private LinearLayout favoritesScreen;
+    private LinearLayout accountScreen;
+    private ProgressBar progressBar;
+
+    // Map overlays
+    private LinearLayout mapSearchBar;
+    private LinearLayout mapControlStack;
+    private Button themeButton;
+    private EditText searchInput;
+    private LinearLayout recentChipsRow;
+
+    // State
+    private String currentTab = "map";
+    private boolean nightModeEnabled;
+    private boolean arModeEnabled;
+    private String activeRouteFilter = "";
+    private String followBusId;
+    private String alertRoute;
+    private boolean alertFired;
+    private Location lastKnownLocation;
     private final Map<String, AnimatedBusMarker> trackedBusMarkers = new HashMap<>();
     private final BroadcastReceiver busTrackingReceiver = new BusTrackingReceiver();
     private GeolocationPermissions.Callback geolocationCallback;
@@ -102,14 +144,9 @@ public class MainActivity extends Activity {
     private LocationListener locateLocationListener;
     private Runnable locateTimeoutRunnable;
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
-    private String activeRouteFilter = "";
-    private String followBusId;
-    private boolean nightModeEnabled;
-    private boolean arModeEnabled;
     private String pendingNavigationName;
     private double pendingNavigationLatitude = Double.NaN;
     private double pendingNavigationLongitude = Double.NaN;
-    private long lastChipsRebuildMs;
     private final Runnable followRunnable = new Runnable() {
         @Override
         public void run() {
@@ -125,86 +162,128 @@ public class MainActivity extends Activity {
     };
 
     @Override
+    @SuppressLint("SetJavaScriptEnabled")
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
         SharedPreferences preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         nightModeEnabled = preferences.getBoolean(PREF_NIGHT_MODE, false);
 
-        FrameLayout root = new FrameLayout(this);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            Window window = getWindow();
+            window.setStatusBarColor(UiTheme.INK);
+            window.setNavigationBarColor(UiTheme.INK);
+        }
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(UiTheme.INK);
+        root.setFitsSystemWindows(true);
+
+        // ============ TOP APP BAR ============
+        LinearLayout topBar = new LinearLayout(this);
+        topBar.setOrientation(LinearLayout.HORIZONTAL);
+        topBar.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
+        topBar.setBackgroundColor(UiTheme.INK);
+        int barPad = dp(18);
+        topBar.setPadding(barPad, dp(10), barPad, dp(10));
+
+        LinearLayout titleBlock = new LinearLayout(this);
+        titleBlock.setOrientation(LinearLayout.VERTICAL);
+
+        topBarTitle = new TextView(this);
+        topBarTitle.setText("Bus Times Live");
+        topBarTitle.setTextColor(Color.WHITE);
+        topBarTitle.setTextSize(22);
+        topBarTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        titleBlock.addView(topBarTitle);
+
+        topBarSubtitle = new TextView(this);
+        topBarSubtitle.setText("live bus tracking");
+        topBarSubtitle.setTextColor(Color.argb(150, 200, 214, 245));
+        topBarSubtitle.setTextSize(11);
+        titleBlock.addView(topBarSubtitle);
+
+        topBar.addView(titleBlock, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        arToggleButton = new Button(this);
+        arToggleButton.setText("◧ AR View");
+        arToggleButton.setTextSize(13);
+        arToggleButton.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        arToggleButton.setTextColor(Color.WHITE);
+        arToggleButton.setStateListAnimator(null);
+        arToggleButton.setAllCaps(false);
+        arToggleButton.setMinWidth(0);
+        arToggleButton.setMinHeight(0);
+        arToggleButton.setPadding(dp(16), dp(9), dp(16), dp(9));
+        arToggleButton.setBackground(UiTheme.ripple(UiTheme.pill(this,
+                UiTheme.withAlpha(Color.WHITE, 26), UiTheme.withAlpha(Color.WHITE, 70), 1f, 10f)));
+        arToggleButton.setContentDescription("Switch between standard map and AR bus stop finder");
+        arToggleButton.setOnClickListener(v -> toggleArMode());
+        UiTheme.pressScale(arToggleButton);
+        topBar.addView(arToggleButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        root.addView(topBar, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // ============ CONTENT AREA ============
+        contentArea = new FrameLayout(this);
+        contentArea.setBackgroundColor(nightModeEnabled ? UiTheme.INK : Color.rgb(238, 240, 244));
+
         webView = new WebView(this);
-        progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        locateButton = createFabButton("⌖", 26, "Home: find my location on the live bus map", v -> centerMapOnUserLocation());
-        refreshButton = createFabButton("⟳", 26, "Refresh the live bus map", v -> refreshLiveMap());
-        microphoneButton = createFabButton("🎙", 22, "Voice search for a bus route", v -> startVoiceSearch());
-        arToggleButton = createArToggleButton();
-        zoomControls = createZoomControls();
-        statusPill = createStatusPill();
-        liveCountPill = createLiveCountPill();
-        routeChipsScroll = createRouteChipsScroll();
+        contentArea.addView(webView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
         arBusStopView = new ArBusStopView(this);
         arBusStopView.setVisibility(View.GONE);
-
-        root.addView(webView, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT));
-        root.addView(arBusStopView, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT));
+        contentArea.addView(arBusStopView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         arBusStopView.setBusTapListener(this::openBusDetailsFromAr);
 
-        FrameLayout.LayoutParams progressParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP);
-        root.addView(progressBar, progressParams);
-        progressBar.getProgressDrawable().setColorFilter(UiTheme.CYAN, PorterDuff.Mode.SRC_IN);
+        searchScreen = buildSearchScreen();
+        searchScreen.setVisibility(View.GONE);
+        contentArea.addView(searchScreen, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        FrameLayout.LayoutParams locateParams = new FrameLayout.LayoutParams(dp(60), dp(60),
-                Gravity.BOTTOM | Gravity.END);
-        locateParams.setMargins(0, 0, dp(20), dp(30));
-        root.addView(locateButton, locateParams);
+        favoritesScreen = buildFavoritesScreen();
+        favoritesScreen.setVisibility(View.GONE);
+        contentArea.addView(favoritesScreen, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        FrameLayout.LayoutParams refreshParams = new FrameLayout.LayoutParams(dp(60), dp(60),
-                Gravity.BOTTOM | Gravity.START);
-        refreshParams.setMargins(dp(20), 0, 0, dp(30));
-        root.addView(refreshButton, refreshParams);
+        accountScreen = buildAccountScreen();
+        accountScreen.setVisibility(View.GONE);
+        contentArea.addView(accountScreen, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        FrameLayout.LayoutParams microphoneParams = new FrameLayout.LayoutParams(dp(60), dp(60),
-                Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
-        microphoneParams.setMargins(0, 0, 0, dp(30));
-        root.addView(microphoneButton, microphoneParams);
+        // Map overlays (only visible on the map tab)
+        mapSearchBar = buildMapSearchBar();
+        contentArea.addView(mapSearchBar, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP) {
+            {
+                setMargins(dp(14), dp(12), dp(84), 0);
+            }
+        });
 
-        FrameLayout.LayoutParams arToggleParams = new FrameLayout.LayoutParams(
+        mapControlStack = buildMapControlStack();
+        FrameLayout.LayoutParams stackParams = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP | Gravity.START);
-        arToggleParams.setMargins(dp(16), dp(72), 0, 0);
-        root.addView(arToggleButton, arToggleParams);
-
-        FrameLayout.LayoutParams zoomParams = new FrameLayout.LayoutParams(dp(54),
-                ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP | Gravity.END);
-        zoomParams.setMargins(0, dp(72), dp(16), 0);
-        root.addView(zoomControls, zoomParams);
+        stackParams.setMargins(0, dp(12), dp(14), 0);
+        contentArea.addView(mapControlStack, stackParams);
 
-        FrameLayout.LayoutParams statusParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP);
-        statusParams.setMargins(dp(64), dp(14), dp(80), 0);
-        root.addView(statusPill, statusParams);
+        progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        progressBar.getProgressDrawable().setColorFilter(UiTheme.CYAN, PorterDuff.Mode.SRC_IN);
+        contentArea.addView(progressBar, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP));
 
-        FrameLayout.LayoutParams liveCountParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-        liveCountParams.setMargins(0, dp(58), 0, 0);
-        root.addView(liveCountPill, liveCountParams);
+        root.addView(contentArea, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        FrameLayout.LayoutParams chipsParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP);
-        chipsParams.setMargins(dp(150), dp(96), dp(80), 0);
-        root.addView(routeChipsScroll, chipsParams);
+        // ============ BOTTOM NAVIGATION ============
+        root.addView(buildBottomNav(), new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(64)));
 
         setContentView(root);
         configureWebView();
@@ -215,29 +294,579 @@ public class MainActivity extends Activity {
         }
         webView.loadUrl(url);
         registerBusTrackingReceiver();
+        switchTab("map");
         uiHandler.postDelayed(markerCleanupRunnable, 30_000L);
     }
 
-    @Override
-    protected void onStart() {
-        super.onStart();
-        setMapTrackingActive(true);
+    // ================= LAYOUT BUILDERS =================
+
+    private LinearLayout buildMapSearchBar() {
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        bar.setBackground(UiTheme.pill(this, Color.WHITE, Color.argb(30, 0, 0, 0), 1f, 28f));
+        bar.setElevation(dp(4));
+        int pad = dp(14);
+        bar.setPadding(pad, dp(11), pad, dp(11));
+        bar.setContentDescription("Search stops, places or routes");
+
+        TextView searchIcon = new TextView(this);
+        searchIcon.setText("🔍");
+        searchIcon.setTextSize(16);
+        bar.addView(searchIcon);
+
+        TextView hint = new TextView(this);
+        hint.setText("Search stops, places or routes");
+        hint.setTextColor(Color.argb(160, 40, 48, 70));
+        hint.setTextSize(15);
+        LinearLayout.LayoutParams hintParams = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        hintParams.leftMargin = dp(10);
+        bar.addView(hint, hintParams);
+
+        TextView micIcon = new TextView(this);
+        micIcon.setText("🎙");
+        micIcon.setTextSize(16);
+        micIcon.setPadding(dp(8), 0, 0, 0);
+        micIcon.setOnClickListener(v -> startVoiceSearch());
+        bar.addView(micIcon);
+
+        bar.setOnClickListener(v -> {
+            switchTab("search");
+            searchInput.requestFocus();
+        });
+        return bar;
     }
 
-    @Override
-    protected void onStop() {
-        stopLocateUpdates();
-        setMapTrackingActive(false);
-        super.onStop();
+    private LinearLayout buildMapControlStack() {
+        LinearLayout stack = new LinearLayout(this);
+        stack.setOrientation(LinearLayout.VERTICAL);
+        stack.setGravity(Gravity.END);
+
+        stack.addView(mapControlButton("+", "Zoom in on the live bus map", v -> zoomWebMap(true)));
+        stack.addView(mapControlButton("−", "Zoom out on the live bus map", v -> zoomWebMap(false)));
+        stack.addView(mapControlButton("⌖", "Find my location on the map", v -> centerMapOnUserLocation()));
+        themeButton = mapControlButton(nightModeEnabled ? "🌙" : "☀",
+                "Toggle dark map", v -> applyNightMode(!nightModeEnabled, false));
+        stack.addView(themeButton);
+        stack.addView(mapControlButton("⟳", "Refresh live buses", v -> refreshLiveMap()));
+        return stack;
     }
 
-    private void setMapTrackingActive(boolean active) {
-        Intent intent = new Intent(this, BusTrackingService.class);
-        intent.setAction(active
-                ? BusTrackingService.ACTION_START_MAP_TRACKING
-                : BusTrackingService.ACTION_STOP_MAP_TRACKING);
-        startService(intent);
+    private Button mapControlButton(String glyph, String description, View.OnClickListener listener) {
+        Button button = new Button(this);
+        button.setText(glyph);
+        button.setTextSize(20);
+        button.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        button.setTextColor(Color.rgb(34, 42, 62));
+        button.setStateListAnimator(null);
+        button.setAllCaps(false);
+        button.setMinWidth(0);
+        button.setMinHeight(0);
+        button.setPadding(0, 0, 0, 0);
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(Color.WHITE);
+        background.setCornerRadius(dp(14));
+        background.setStroke(dp(1), Color.argb(24, 0, 0, 0));
+        button.setBackground(UiTheme.ripple(background));
+        button.setContentDescription(description);
+        button.setOnClickListener(listener);
+        UiTheme.pressScale(button);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(dp(52), dp(52));
+        params.topMargin = dp(10);
+        button.setLayoutParams(params);
+        return button;
     }
+
+    private LinearLayout buildBottomNav() {
+        LinearLayout nav = new LinearLayout(this);
+        nav.setOrientation(LinearLayout.HORIZONTAL);
+        nav.setBackgroundColor(UiTheme.INK);
+        nav.setGravity(Gravity.CENTER);
+
+        tabMapButton = navItem("🗺", "Map");
+        tabMapIcon = (TextView) tabMapButton.getChildAt(0);
+        tabSearchButton = navItem("🔍", "Search");
+        tabSearchIcon = (TextView) tabSearchButton.getChildAt(0);
+        tabFavoritesButton = navItem("♥", "Favorites");
+        tabFavoritesIcon = (TextView) tabFavoritesButton.getChildAt(0);
+        tabAccountButton = navItem("👤", "Account");
+        tabAccountIcon = (TextView) tabAccountButton.getChildAt(0);
+
+        View.OnClickListener mapClick = v -> switchTab("map");
+        tabMapButton.setOnClickListener(mapClick);
+        tabSearchButton.setOnClickListener(v -> switchTab("search"));
+        tabFavoritesButton.setOnClickListener(v -> switchTab("favorites"));
+        tabAccountButton.setOnClickListener(v -> switchTab("account"));
+
+        LinearLayout.LayoutParams itemParams = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
+        nav.addView(tabMapButton, itemParams);
+        nav.addView(tabSearchButton, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        nav.addView(tabFavoritesButton, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        nav.addView(tabAccountButton, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        return nav;
+    }
+
+    private LinearLayout navItem(String icon, String label) {
+        LinearLayout item = new LinearLayout(this);
+        item.setOrientation(LinearLayout.VERTICAL);
+        item.setGravity(Gravity.CENTER);
+        item.setClickable(true);
+        item.setFocusable(true);
+        item.setContentDescription(label + " tab");
+
+        TextView iconView = new TextView(this);
+        iconView.setText(icon);
+        iconView.setTextSize(18);
+        item.addView(iconView);
+
+        TextView labelView = new TextView(this);
+        labelView.setText(label);
+        labelView.setTextSize(11);
+        labelView.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        item.addView(labelView);
+        return item;
+    }
+
+    private void setTabSelected(LinearLayout item, TextView icon, boolean selected) {
+        int color = selected ? UiTheme.TEAL : Color.argb(170, 210, 218, 240);
+        icon.setTextColor(color);
+        for (int i = 0; i < item.getChildCount(); i++) {
+            View child = item.getChildAt(i);
+            if (child instanceof TextView) {
+                ((TextView) child).setTextColor(color);
+            }
+        }
+    }
+
+    private LinearLayout buildSearchScreen() {
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.setBackgroundColor(nightModeEnabled ? UiTheme.INK : Color.rgb(244, 246, 250));
+        int pad = dp(20);
+        screen.setPadding(pad, pad, pad, pad);
+
+        TextView title = screenTitle("Search");
+        screen.addView(title);
+
+        LinearLayout searchRow = new LinearLayout(this);
+        searchRow.setOrientation(LinearLayout.HORIZONTAL);
+        searchRow.setGravity(Gravity.CENTER_VERTICAL);
+        searchRow.setBackground(UiTheme.pill(this, Color.WHITE, Color.argb(30, 0, 0, 0), 1f, 26f));
+        searchRow.setPadding(dp(16), dp(6), dp(10), dp(6));
+
+        searchInput = new EditText(this);
+        searchInput.setHint("Stop, place or route number");
+        searchInput.setTextSize(15);
+        searchInput.setTextColor(Color.rgb(24, 30, 48));
+        searchInput.setHintTextColor(Color.argb(140, 40, 48, 70));
+        searchInput.setBackground(null);
+        searchInput.setSingleLine(true);
+        searchInput.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH);
+        searchInput.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) { }
+            @Override
+            public void afterTextChanged(Editable s) {
+                // No-op; search happens on submit.
+            }
+        });
+        searchInput.setOnEditorActionListener((v, actionId, event) -> {
+            submitSearch();
+            return true;
+        });
+        searchRow.addView(searchInput, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        Button mic = new Button(this);
+        mic.setText("🎙");
+        mic.setTextSize(16);
+        mic.setStateListAnimator(null);
+        mic.setMinWidth(0);
+        mic.setMinHeight(0);
+        mic.setPadding(dp(10), dp(6), dp(10), dp(6));
+        mic.setTextColor(Color.rgb(34, 42, 62));
+        mic.setBackground(UiTheme.ripple(UiTheme.pill(this, Color.argb(20, 34, 42, 62), 0, 0, 20f)));
+        mic.setOnClickListener(v -> startVoiceSearch());
+        searchRow.addView(mic);
+
+        LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        rowParams.topMargin = dp(16);
+        screen.addView(searchRow, rowParams);
+
+        Button go = new Button(this);
+        go.setText("Search on bustimes.org");
+        go.setTextSize(14);
+        go.setTextColor(Color.WHITE);
+        go.setStateListAnimator(null);
+        go.setAllCaps(false);
+        go.setBackground(UiTheme.ripple(UiTheme.pill(this, UiTheme.BLUE, 0, 0, 24f)));
+        go.setPadding(dp(20), dp(10), dp(20), dp(10));
+        go.setOnClickListener(v -> submitSearch());
+        LinearLayout.LayoutParams goParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        goParams.topMargin = dp(14);
+        LinearLayout goWrap = new LinearLayout(this);
+        goWrap.addView(go, goParams);
+        screen.addView(goWrap);
+
+        TextView recentLabel = screenSubtitle("Recent route searches");
+        screen.addView(recentLabel);
+
+        recentChipsRow = new LinearLayout(this);
+        recentChipsRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams chipsParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        chipsParams.topMargin = dp(10);
+        screen.addView(recentChipsRow, chipsParams);
+        rebuildRecentChips();
+
+        TextView tip = screenSubtitle("Tip: tap the mic and say a route number like 350, or search a place like Beverley.");
+        LinearLayout.LayoutParams tipParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tipParams.topMargin = dp(22);
+        screen.addView(tip, tipParams);
+        return screen;
+    }
+
+    private TextView screenTitle(String text) {
+        TextView view = new TextView(this);
+        view.setText(text);
+        view.setTextSize(22);
+        view.setTextColor(nightModeEnabled ? Color.WHITE : Color.rgb(20, 26, 44));
+        view.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        return view;
+    }
+
+    private TextView screenSubtitle(String text) {
+        TextView view = new TextView(this);
+        view.setText(text);
+        view.setTextSize(13);
+        view.setTextColor(nightModeEnabled ? UiTheme.TEXT_DIM : Color.argb(180, 60, 70, 96));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.topMargin = dp(18);
+        view.setLayoutParams(params);
+        return view;
+    }
+
+    private LinearLayout buildFavoritesScreen() {
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.setBackgroundColor(nightModeEnabled ? UiTheme.INK : Color.rgb(244, 246, 250));
+        int pad = dp(20);
+        screen.setPadding(pad, pad, pad, pad);
+        screen.setTag("favorites_content");
+        screen.addView(screenTitle("Favorites"));
+        screen.addView(screenSubtitle("No favorites yet — tap ★ Favorite Route on any bus to pin it here."));
+        return screen;
+    }
+
+    private LinearLayout buildAccountScreen() {
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.setBackgroundColor(nightModeEnabled ? UiTheme.INK : Color.rgb(244, 246, 250));
+        int pad = dp(20);
+        screen.setPadding(pad, pad, pad, pad);
+
+        screen.addView(screenTitle("Account & settings"));
+
+        LinearLayout nightRow = new LinearLayout(this);
+        nightRow.setOrientation(LinearLayout.HORIZONTAL);
+        nightRow.setGravity(Gravity.CENTER_VERTICAL);
+        nightRow.setPadding(0, dp(18), 0, dp(6));
+
+        TextView nightLabel = new TextView(this);
+        nightLabel.setText("Dark map mode");
+        nightLabel.setTextSize(15);
+        nightLabel.setTextColor(nightModeEnabled ? Color.WHITE : Color.rgb(24, 30, 48));
+        nightRow.addView(nightLabel, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        Switch nightSwitch = new Switch(this);
+        nightSwitch.setChecked(nightModeEnabled);
+        nightSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> applyNightMode(isChecked, false));
+        nightRow.addView(nightSwitch);
+        screen.addView(nightRow);
+
+        screen.addView(infoRow("Live data (BODS)",
+                BuildConfig.BODS_API_KEY.isEmpty()
+                        ? "Not configured — add a free BODS_API_KEY to overlay live UK buses"
+                        : "Active — polling every 15 seconds"));
+        screen.addView(infoRow("Buses tracked now", String.valueOf(trackedBusMarkers.size())));
+        screen.addView(infoRow("Map & times", "bustimes.org"));
+        screen.addView(infoRow("Bus locations", "UK Bus Open Data Service (SIRI-VM)"));
+        screen.addView(infoRow("Stops in AR", "OpenStreetMap contributors (Overpass API)"));
+        screen.addView(infoRow("Version", "1.1.0"));
+        return screen;
+    }
+
+    private LinearLayout infoRow(String label, String value) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setPadding(0, dp(14), 0, dp(4));
+
+        TextView labelView = new TextView(this);
+        labelView.setText(label);
+        labelView.setTextSize(12);
+        labelView.setTextColor(Color.argb(150, 120, 130, 156));
+        row.addView(labelView);
+
+        TextView valueView = new TextView(this);
+        valueView.setText(value);
+        valueView.setTextSize(14);
+        valueView.setTextColor(nightModeEnabled ? Color.WHITE : Color.rgb(24, 30, 48));
+        row.addView(valueView);
+
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.topMargin = dp(8);
+        row.setLayoutParams(params);
+        return row;
+    }
+
+    // ================= TABS =================
+
+    private void switchTab(String tab) {
+        currentTab = tab;
+        boolean mapTab = "map".equals(tab);
+
+        searchScreen.setVisibility("search".equals(tab) ? View.VISIBLE : View.GONE);
+        favoritesScreen.setVisibility("favorites".equals(tab) ? View.VISIBLE : View.GONE);
+        accountScreen.setVisibility("account".equals(tab) ? View.VISIBLE : View.GONE);
+
+        if (!mapTab && arModeEnabled) {
+            exitArMode();
+        }
+
+        boolean showWeb = mapTab && !arModeEnabled;
+        webView.setVisibility(showWeb ? View.VISIBLE : View.GONE);
+        arBusStopView.setVisibility(mapTab && arModeEnabled ? View.VISIBLE : View.GONE);
+        mapSearchBar.setVisibility(mapTab && !arModeEnabled ? View.VISIBLE : View.GONE);
+        mapControlStack.setVisibility(mapTab && !arModeEnabled ? View.VISIBLE : View.GONE);
+        progressBar.setVisibility(View.GONE);
+
+        setTabSelected(tabMapButton, tabMapIcon, mapTab);
+        setTabSelected(tabSearchButton, tabSearchIcon, "search".equals(tab));
+        setTabSelected(tabFavoritesButton, tabFavoritesIcon, "favorites".equals(tab));
+        setTabSelected(tabAccountButton, tabAccountIcon, "account".equals(tab));
+
+        if ("favorites".equals(tab)) {
+            rebuildFavoritesScreen();
+        } else if ("account".equals(tab)) {
+            rebuildAccountScreen();
+        }
+    }
+
+    private void rebuildAccountScreen() {
+        // Simplest robust approach: rebuild the whole screen content.
+        contentArea.removeView(accountScreen);
+        accountScreen = buildAccountScreen();
+        accountScreen.setVisibility(View.VISIBLE);
+        contentArea.addView(accountScreen,
+                contentArea.indexOfChild(mapSearchBar) >= 0 ? contentArea.indexOfChild(mapSearchBar) : 2,
+                new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+    }
+
+    // ================= FAVORITES / RECENTS =================
+
+    private JSONArray loadJsonArrayPref(String key) {
+        try {
+            String raw = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(key, "[]");
+            return new JSONArray(raw == null || raw.isEmpty() ? "[]" : raw);
+        } catch (Exception exception) {
+            return new JSONArray();
+        }
+    }
+
+    private void saveJsonArrayPref(String key, JSONArray array) {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putString(key, array.toString())
+                .apply();
+    }
+
+    private boolean isFavoriteRoute(String route) {
+        JSONArray favorites = loadJsonArrayPref(PREF_FAVORITES);
+        for (int i = 0; i < favorites.length(); i++) {
+            JSONObject entry = favorites.optJSONObject(i);
+            if (entry != null && route.equalsIgnoreCase(entry.optString("route"))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void toggleFavoriteRoute(String route, String destination) {
+        JSONArray favorites = loadJsonArrayPref(PREF_FAVORITES);
+        JSONArray updated = new JSONArray();
+        boolean existed = false;
+        for (int i = 0; i < favorites.length(); i++) {
+            JSONObject entry = favorites.optJSONObject(i);
+            if (entry != null && route.equalsIgnoreCase(entry.optString("route"))) {
+                existed = true;
+                continue;
+            }
+            try {
+                updated.put(entry);
+            } catch (Exception ignored) {
+            }
+        }
+        if (!existed) {
+            try {
+                JSONObject entry = new JSONObject();
+                entry.put("route", route);
+                entry.put("destination", destination);
+                updated.put(entry);
+                Toast.makeText(this, "Route " + route + " added to favorites", Toast.LENGTH_SHORT).show();
+            } catch (Exception ignored) {
+            }
+        } else {
+            Toast.makeText(this, "Route " + route + " removed from favorites", Toast.LENGTH_SHORT).show();
+        }
+        saveJsonArrayPref(PREF_FAVORITES, updated);
+    }
+
+    private void rememberRecentRoute(String route) {
+        if (route == null || route.trim().isEmpty()) {
+            return;
+        }
+        JSONArray recent = loadJsonArrayPref(PREF_RECENT);
+        JSONArray updated = new JSONArray();
+        try {
+            updated.put(route.trim());
+            for (int i = 0; i < recent.length() && updated.length() < 6; i++) {
+                String value = recent.optString(i, "");
+                if (!value.equalsIgnoreCase(route.trim())) {
+                    updated.put(value);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        saveJsonArrayPref(PREF_RECENT, updated);
+        rebuildRecentChips();
+    }
+
+    private void rebuildRecentChips() {
+        if (recentChipsRow == null) {
+            return;
+        }
+        recentChipsRow.removeAllViews();
+        JSONArray recent = loadJsonArrayPref(PREF_RECENT);
+        if (recent.length() == 0) {
+            TextView empty = new TextView(this);
+            empty.setText("No recent searches yet");
+            empty.setTextSize(13);
+            empty.setTextColor(Color.argb(140, 60, 70, 96));
+            recentChipsRow.addView(empty);
+            return;
+        }
+        for (int i = 0; i < recent.length(); i++) {
+            final String route = recent.optString(i, "");
+            if (route.isEmpty()) {
+                continue;
+            }
+            TextView chip = UiTheme.pillText(this, "Route " + route, Color.WHITE,
+                    UiTheme.BLUE, UiTheme.withAlpha(Color.WHITE, 70));
+            chip.setOnClickListener(v -> {
+                rememberRecentRoute(route);
+                zoomToActiveBusRoute(route);
+                switchTab("map");
+            });
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            params.setMargins(0, 0, dp(8), 0);
+            recentChipsRow.addView(chip, params);
+        }
+    }
+
+    private void rebuildFavoritesScreen() {
+        favoritesScreen.removeAllViews();
+        int pad = dp(20);
+        favoritesScreen.setPadding(pad, pad, pad, pad);
+        favoritesScreen.addView(screenTitle("Favorites"));
+
+        JSONArray favorites = loadJsonArrayPref(PREF_FAVORITES);
+        if (favorites.length() == 0) {
+            favoritesScreen.addView(screenSubtitle(
+                    "No favorites yet — tap ★ Favorite Route on any bus to pin it here."));
+            return;
+        }
+        for (int i = 0; i < favorites.length(); i++) {
+            final JSONObject entry = favorites.optJSONObject(i);
+            if (entry == null) {
+                continue;
+            }
+            final String route = entry.optString("route", "");
+            final String destination = entry.optString("destination", "");
+
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setBackground(UiTheme.pill(this,
+                    nightModeEnabled ? UiTheme.withAlpha(UiTheme.INK_LIGHT, 235) : Color.WHITE,
+                    Color.argb(24, 0, 0, 0), 1f, 16f));
+            int rowPad = dp(14);
+            row.setPadding(rowPad, rowPad, rowPad, rowPad);
+
+            TextView badge = new TextView(this);
+            badge.setText(route);
+            badge.setTextColor(Color.WHITE);
+            badge.setTextSize(15);
+            badge.setTypeface(Typeface.create("sans-serif-black", Typeface.NORMAL));
+            badge.setGravity(Gravity.CENTER);
+            badge.setBackground(UiTheme.circleGradient(this, UiTheme.BLUE, UiTheme.BLUE_DEEP));
+            row.addView(badge, new LinearLayout.LayoutParams(dp(42), dp(42)));
+
+            LinearLayout textBlock = new LinearLayout(this);
+            textBlock.setOrientation(LinearLayout.VERTICAL);
+            textBlock.setPadding(dp(12), 0, 0, 0);
+
+            TextView routeTitle = new TextView(this);
+            routeTitle.setText("Route " + route);
+            routeTitle.setTextSize(15);
+            routeTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+            routeTitle.setTextColor(nightModeEnabled ? Color.WHITE : Color.rgb(20, 26, 44));
+            textBlock.addView(routeTitle);
+
+            TextView destTitle = new TextView(this);
+            destTitle.setText(destination.isEmpty() ? "Tap to see live buses" : "→ " + destination);
+            destTitle.setTextSize(12);
+            destTitle.setTextColor(Color.argb(170, 90, 100, 124));
+            textBlock.addView(destTitle);
+
+            row.addView(textBlock, new LinearLayout.LayoutParams(0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+            TextView remove = new TextView(this);
+            remove.setText("✕");
+            remove.setTextSize(16);
+            remove.setPadding(dp(10), dp(6), dp(4), dp(6));
+            remove.setTextColor(Color.argb(140, 90, 100, 124));
+            remove.setOnClickListener(v -> {
+                toggleFavoriteRoute(route, destination);
+                rebuildFavoritesScreen();
+            });
+            row.addView(remove);
+
+            row.setOnClickListener(v -> {
+                zoomToActiveBusRoute(route);
+                switchTab("map");
+            });
+
+            LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            rowParams.topMargin = dp(12);
+            favoritesScreen.addView(row, rowParams);
+        }
+    }
+
+    // ================= WEBVIEW =================
 
     @SuppressLint("SetJavaScriptEnabled")
     private void configureWebView() {
@@ -261,238 +890,95 @@ public class MainActivity extends Activity {
             CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
         }
 
-        webView.setBackgroundColor(UiTheme.INK);
+        webView.setBackgroundColor(nightModeEnabled ? UiTheme.INK : Color.WHITE);
         webView.addJavascriptInterface(new BusMarkerBridge(), "BusMarkerBridge");
         webView.setWebViewClient(new BusTimesWebViewClient());
         webView.setWebChromeClient(new BusTimesChromeClient());
         webView.setDownloadListener(new BusTimesDownloadListener());
     }
 
-    private Button createFabButton(String glyph, int glyphSize, String description, View.OnClickListener listener) {
-        Button button = new Button(this);
-        button.setText(glyph);
-        button.setTextSize(glyphSize);
-        button.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        button.setTextColor(Color.WHITE);
-        button.setStateListAnimator(null);
-        button.setAllCaps(false);
-        button.setMinWidth(0);
-        button.setMinHeight(0);
-        button.setPadding(0, 0, 0, 0);
-        android.graphics.drawable.GradientDrawable gradient = UiTheme.circleGradient(this, UiTheme.BLUE, UiTheme.BLUE_DEEP);
-        gradient.setStroke(dp(1), UiTheme.withAlpha(Color.WHITE, 70));
-        button.setBackground(UiTheme.ripple(gradient));
-        button.setContentDescription(description);
-        button.setOnClickListener(listener);
-        UiTheme.pressScale(button);
-        return button;
-    }
+    // ================= SITE CLEANUP (ads, chrome, popups) =================
 
-    private Button createArToggleButton() {
-        Button button = new Button(this);
-        button.setText("✦ AR View");
-        button.setTextSize(13);
-        button.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        button.setTextColor(Color.WHITE);
-        button.setStateListAnimator(null);
-        button.setAllCaps(false);
-        button.setMinWidth(0);
-        button.setMinHeight(0);
-        button.setPadding(dp(18), dp(10), dp(18), dp(10));
-        android.graphics.drawable.GradientDrawable gradient = UiTheme.pill(this,
-                UiTheme.withAlpha(UiTheme.INK_LIGHT, 235), UiTheme.withAlpha(UiTheme.CYAN, 160), 1.2f, 24f);
-        button.setBackground(UiTheme.ripple(gradient));
-        button.setContentDescription("Switch between standard map and AR bus stop finder");
-        button.setOnClickListener(v -> toggleArMode());
-        UiTheme.pressScale(button);
-        return button;
-    }
-
-    private LinearLayout createZoomControls() {
-        LinearLayout controls = new LinearLayout(this);
-        controls.setOrientation(LinearLayout.VERTICAL);
-        controls.setGravity(Gravity.CENTER);
-        controls.setBackground(UiTheme.pill(this, UiTheme.withAlpha(UiTheme.INK_LIGHT, 225),
-                UiTheme.withAlpha(Color.WHITE, 45), 1f, 27f));
-        controls.setPadding(dp(5), dp(5), dp(5), dp(5));
-        controls.setContentDescription("Map zoom controls");
-
-        Button zoomInButton = createZoomButton("+", "Zoom in on the live bus map");
-        zoomInButton.setOnClickListener(v -> zoomWebMap(true));
-        controls.addView(zoomInButton, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(44)));
-
-        controls.addView(createDivider());
-
-        Button zoomOutButton = createZoomButton("−", "Zoom out on the live bus map");
-        zoomOutButton.setOnClickListener(v -> zoomWebMap(false));
-        controls.addView(zoomOutButton, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(44)));
-
-        controls.addView(createDivider());
-
-        nightModeButton = createZoomButton(nightModeEnabled ? "☀" : "🌙", "Toggle night mode");
-        nightModeButton.setTextSize(16);
-        nightModeButton.setOnClickListener(v -> applyNightMode(!nightModeEnabled, false));
-        controls.addView(nightModeButton, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
-
-        return controls;
-    }
-
-    private View createDivider() {
-        View divider = new View(this);
-        divider.setBackgroundColor(UiTheme.withAlpha(Color.WHITE, 40));
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, dp(1)));
-        params.setMargins(dp(10), 0, dp(10), 0);
-        divider.setLayoutParams(params);
-        return divider;
-    }
-
-    private Button createZoomButton(String label, String description) {
-        Button button = new Button(this);
-        button.setText(label);
-        button.setTextSize(22);
-        button.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        button.setTextColor(Color.WHITE);
-        button.setBackgroundColor(Color.TRANSPARENT);
-        button.setContentDescription(description);
-        button.setAllCaps(false);
-        button.setMinWidth(0);
-        button.setMinHeight(0);
-        button.setStateListAnimator(null);
-        button.setPadding(0, 0, 0, 0);
-        return button;
-    }
-
-    private TextView createStatusPill() {
-        TextView pill = new TextView(this);
-        pill.setText("Live tracking ready · tap a bus for full details");
-        pill.setTextColor(Color.WHITE);
-        pill.setTextSize(12);
-        pill.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        pill.setGravity(Gravity.CENTER);
-        pill.setMaxLines(1);
-        pill.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        pill.setBackground(UiTheme.ripple(UiTheme.pill(this, UiTheme.withAlpha(UiTheme.INK_LIGHT, 235),
-                UiTheme.withAlpha(Color.WHITE, 45), 1f, 20f)));
-        pill.setPadding(dp(16), dp(7), dp(16), dp(7));
-        pill.setOnClickListener(v -> pill.setVisibility(View.GONE));
-        return pill;
-    }
-
-    private TextView createLiveCountPill() {
-        TextView pill = new TextView(this);
-        pill.setText("0 buses live");
-        pill.setTextColor(UiTheme.CYAN);
-        pill.setTextSize(12);
-        pill.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        pill.setGravity(Gravity.CENTER);
-        pill.setBackground(UiTheme.ripple(UiTheme.pill(this, UiTheme.withAlpha(UiTheme.INK_LIGHT, 235),
-                UiTheme.withAlpha(UiTheme.CYAN, 150), 1f, 20f)));
-        pill.setPadding(dp(16), dp(7), dp(16), dp(7));
-        pill.setOnClickListener(v -> showBusListDialog());
-        return pill;
-    }
-
-    private HorizontalScrollView createRouteChipsScroll() {
-        HorizontalScrollView scroller = new HorizontalScrollView(this);
-        scroller.setHorizontalScrollBarEnabled(false);
-        scroller.setFillViewport(true);
-        routeChipRow = new LinearLayout(this);
-        routeChipRow.setOrientation(LinearLayout.HORIZONTAL);
-        routeChipRow.setGravity(Gravity.CENTER_VERTICAL);
-        scroller.addView(routeChipRow, new HorizontalScrollView.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        scroller.setVisibility(View.GONE);
-        return scroller;
-    }
-
-    private void rebuildRouteChips() {
-        long now = System.currentTimeMillis();
-        if (now - lastChipsRebuildMs < CHIPS_REBUILD_INTERVAL_MS) {
-            return;
+    /** Blocks ad/CMP hosts at the network layer so they never render. */
+    private WebResourceResponse blockIfAd(String url) {
+        String lower = url == null ? "" : url.toLowerCase(Locale.UK);
+        boolean blocked = lower.contains("adfirst")
+                || lower.contains("googlesyndication")
+                || lower.contains("doubleclick")
+                || lower.contains("googleadservices")
+                || lower.contains("adservice.google")
+                || lower.contains("criteo")
+                || lower.contains("taboola")
+                || lower.contains("outbrain")
+                || lower.contains("/consent");
+        if (!blocked) {
+            return null;
         }
-        lastChipsRebuildMs = now;
-
-        Map<String, Integer> routeCounts = new LinkedHashMap<>();
-        for (AnimatedBusMarker marker : trackedBusMarkers.values()) {
-            String route = marker.label == null ? "" : marker.label.trim();
-            if (route.isEmpty()) {
-                continue;
-            }
-            Integer count = routeCounts.get(route);
-            routeCounts.put(route, count == null ? 1 : count + 1);
+        try {
+            return new WebResourceResponse("text/plain", "utf-8",
+                    new ByteArrayInputStream(new byte[0]));
+        } catch (Exception exception) {
+            return null;
         }
-        if (routeCounts.isEmpty()) {
-            routeChipRow.removeAllViews();
-            routeChipsScroll.setVisibility(View.GONE);
-            return;
-        }
-
-        List<Map.Entry<String, Integer>> sorted = new ArrayList<>(routeCounts.entrySet());
-        sorted.sort((a, b) -> b.getValue() - a.getValue());
-        if (sorted.size() > 8) {
-            sorted = sorted.subList(0, 8);
-        }
-
-        routeChipRow.removeAllViews();
-        routeChipRow.addView(makeRouteChip("All", "", sorted.size()));
-        for (Map.Entry<String, Integer> entry : sorted) {
-            routeChipRow.addView(makeRouteChip(entry.getKey() + " ·" + entry.getValue(), entry.getKey(), entry.getValue()));
-        }
-        routeChipsScroll.setVisibility(View.VISIBLE);
     }
 
-    private TextView makeRouteChip(String label, String route, int count) {
-        boolean selected = activeRouteFilter.isEmpty() ? route.isEmpty() : activeRouteFilter.equalsIgnoreCase(route);
-        TextView chip = UiTheme.pillText(this, label,
-                selected ? UiTheme.INK : Color.WHITE,
-                selected ? UiTheme.CYAN : UiTheme.withAlpha(UiTheme.INK_LIGHT, 235),
-                selected ? UiTheme.CYAN : UiTheme.withAlpha(Color.WHITE, 55));
-        chip.setOnClickListener(v -> selectRouteFilter(route));
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        params.setMargins(dp(5), 0, dp(5), 0);
-        chip.setLayoutParams(params);
-        return chip;
+    private void cleanupSiteChrome() {
+        String script = "(function(){"
+                // Kill ads + consent remnants at DOM level.
+                + "var kill='.adsbygoogle,ins.adsbygoogle,[id*=\"google_ads\"],[id*=\"div-gpt-ad\"],"
+                + "[id^=\"ad-\"],[id$=\"-ad\"],[class*=\"advert\"],[class*=\"ad-slot\"],[class*=\"adfirst\"],"
+                + "iframe[src*=\"adfirst\"],iframe[src*=\"googlesyndication\"],iframe[src*=\"doubleclick\"],"
+                + "[class*=\"consent\"],[id*=\"gdpr\"],[class*=\"cmp-\"],.skip';"
+                + "document.querySelectorAll(kill).forEach(function(el){el.remove();});"
+                // Hide the site's own header, zoom/locate/layer controls on the map page.
+                + "var mapPage=/^\\\\/map/.test(location.pathname);"
+                + "var style=document.getElementById('bustimes-chrome-hide');"
+                + "if(!style){style=document.createElement('style');style.id='bustimes-chrome-hide';document.head.appendChild(style);}"
+                + "style.textContent=mapPage?"
+                + "'.site-header{display:none!important}"
+                + ".maplibregl-ctrl-group,.mapboxgl-ctrl-group,.leaflet-control-zoom,.leaflet-control-attribution{display:none!important}"
+                + ".maplibregl-popup,.mapboxgl-popup,.leaflet-popup{display:none!important}'"
+                + ":'';"
+                + "return true;})();";
+        webView.evaluateJavascript(script, ignored -> {
+        });
     }
 
-    private void selectRouteFilter(String route) {
-        activeRouteFilter = route == null ? "" : route.trim();
-        filterMapMarkersForRoute(activeRouteFilter);
-        arBusStopView.setRouteFilter(activeRouteFilter);
-        lastChipsRebuildMs = 0L;
-        rebuildRouteChips();
+    /** Installs a MutationObserver that hides the site's vehicle popup and forwards it to the native sheet. */
+    private void installPopupHijack() {
+        String script = "(function(){"
+                + "if(window.__bodsPopupObs)return;window.__bodsPopupObs=true;"
+                + "var SEL='.maplibregl-popup,.mapboxgl-popup,.leaflet-popup';"
+                + "var lastScan=0;"
+                + "function handle(el){"
+                + "var text=(el.textContent||'').trim();if(!text)return;"
+                + "var lines=text.split('\\n').map(function(s){return s.trim();}).filter(Boolean);"
+                + "var route='',dest='',vehicle='',lastSeen='';"
+                + "for(var i=0;i<lines.length;i++){"
+                + "var line=lines[i];"
+                + "var m=line.match(/^([A-Za-z0-9]+)\\s+to\\s+(.+)$/);"
+                + "if(m&&!route){route=m[1];dest=m[2];continue;}"
+                + "if(!vehicle&&/^[0-9]{1,6}\\s*-\\s*[A-Z0-9 ]{2,14}$/.test(line)){vehicle=line;continue;}"
+                + "if(!lastSeen&&/^(at stop|due$)|(\\d+)\\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)\\s*ago/.test(line)){lastSeen=line;continue;}"
+                + "}"
+                + "if(!route||(!vehicle&&!lastSeen))return;"
+                + "el.style.display='none';"
+                + "if(window.BusMarkerBridge){window.BusMarkerBridge.showSitePopup(JSON.stringify({route:route,destination:dest,vehicle:vehicle,lastSeen:lastSeen}));}"
+                + "}"
+                + "function scan(){var now=Date.now();if(now-lastScan<300)return;lastScan=now;"
+                + "document.querySelectorAll(SEL).forEach(handle);}"
+                + "new MutationObserver(function(){scan();}).observe(document.body,{childList:true,subtree:true});"
+                + "scan();"
+                + "return true;})();";
+        webView.evaluateJavascript(script, ignored -> {
+        });
     }
 
-    private void showBusListDialog() {
-        if (trackedBusMarkers.isEmpty()) {
-            Toast.makeText(this, "No live buses yet. Add a free BODS key for real-time tracking.", Toast.LENGTH_LONG).show();
-            return;
-        }
-        List<AnimatedBusMarker> markers = new ArrayList<>(trackedBusMarkers.values());
-        markers.sort((a, b) -> Float.compare(a.currentSpeedKph, b.currentSpeedKph));
-        StringBuilder message = new StringBuilder();
-        int shown = 0;
-        for (AnimatedBusMarker marker : markers) {
-            if (shown >= 12) {
-                message.append("\n…and ").append(markers.size() - shown).append(" more");
-                break;
-            }
-            message.append("• Route ").append(marker.label)
-                    .append(" → ").append(firstNonEmpty(marker.destinationName, "unknown"))
-                    .append(" · ").append(marker.currentSpeedKph <= 0.5f ? "stopped" : String.format(Locale.UK, "%.0f mph", marker.currentSpeedKph * 0.621371f))
-                    .append("\n");
-            shown++;
-        }
-        new AlertDialog.Builder(this)
-                .setTitle(trackedBusMarkers.size() + " buses live now")
-                .setMessage(message.toString().trim())
-                .setPositiveButton(android.R.string.ok, null)
-                .show();
+    private void hideAdsOnPage() {
+        cleanupSiteChrome();
     }
+
+    // ================= MAP ACTIONS =================
 
     private void refreshLiveMap() {
         hideAdsOnPage();
@@ -504,11 +990,14 @@ public class MainActivity extends Activity {
     }
 
     private void zoomWebMap(boolean zoomIn) {
-        String selector = zoomIn
-                ? ".maplibregl-ctrl-zoom-in, .mapboxgl-ctrl-zoom-in, .leaflet-control-zoom-in, [aria-label='Zoom in']"
-                : ".maplibregl-ctrl-zoom-out, .mapboxgl-ctrl-zoom-out, .leaflet-control-zoom-out, [aria-label='Zoom out']";
         String script = "(function(){"
-                + "var button=document.querySelector(\"" + selector + "\");"
+                + "var map=window.__bodsFindMap&&window.__bodsFindMap();"
+                + "if(map&&map." + (zoomIn ? "zoomIn" : "zoomOut") + "){map." + (zoomIn ? "zoomIn" : "zoomOut") + "();return true;}"
+                + "var button=document.querySelector(\""
+                + (zoomIn
+                        ? ".maplibregl-ctrl-zoom-in, .mapboxgl-ctrl-zoom-in, .leaflet-control-zoom-in, [aria-label='Zoom in']"
+                        : ".maplibregl-ctrl-zoom-out, .mapboxgl-ctrl-zoom-out, .leaflet-control-zoom-out, [aria-label='Zoom out']")
+                + "\");"
                 + "if(button){button.click();return true;}"
                 + "return false;"
                 + "})();";
@@ -529,9 +1018,12 @@ public class MainActivity extends Activity {
         }
         nightModeEnabled = night;
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(PREF_NIGHT_MODE, night).apply();
-        if (nightModeButton != null) {
-            nightModeButton.setText(night ? "☀" : "🌙");
-            nightModeButton.setContentDescription(night ? "Switch back to day mode" : "Switch to night mode");
+        if (themeButton != null) {
+            themeButton.setText(night ? "🌙" : "☀");
+            themeButton.setContentDescription(night ? "Switch back to day map" : "Switch to dark map");
+        }
+        if (webView != null) {
+            webView.setBackgroundColor(night ? UiTheme.INK : Color.WHITE);
         }
         String css;
         if (night) {
@@ -540,9 +1032,6 @@ public class MainActivity extends Activity {
                     + "{filter:invert(1) hue-rotate(180deg) brightness(.92) contrast(.92) saturate(.85)!important}"
                     + ".maplibregl-popup-content,.mapboxgl-popup-content,.leaflet-popup-content-wrapper"
                     + "{background:#101a38!important;color:#dfe7ff!important}"
-                    + ".maplibregl-popup-tip,.mapboxgl-popup-tip,.leaflet-popup-tip"
-                    + "{border-top-color:#101a38!important;border-bottom-color:#101a38!important;"
-                    + "border-left-color:#101a38!important;border-right-color:#101a38!important}"
                     + "h1,h2,h3,h4,p,span,td,th,li,label,small,strong,b{color:#dfe7ff!important}"
                     + "a{color:#7fc4ff!important}"
                     + "header,footer,nav,section,article,aside,table,form,main{background-color:#0e1730!important;color:#dfe7ff!important}"
@@ -555,8 +1044,10 @@ public class MainActivity extends Activity {
                 + "if(!style){style=document.createElement('style');style.id='bustimes-night';document.head.appendChild(style);}"
                 + "style.textContent=\"" + escapeJs(css).replace("\"", "\\\"") + "\";"
                 + "return true;})();";
-        webView.evaluateJavascript(script, ignored -> {
-        });
+        if (webView != null) {
+            webView.evaluateJavascript(script, ignored -> {
+            });
+        }
     }
 
     private int dp(int value) {
@@ -573,8 +1064,12 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
+        if (!"map".equals(currentTab)) {
+            switchTab("map");
+            return;
+        }
         if (arModeEnabled) {
-            showStandardMap();
+            exitArMode();
             return;
         }
         if (webView != null && webView.canGoBack()) {
@@ -582,6 +1077,27 @@ public class MainActivity extends Activity {
             return;
         }
         super.onBackPressed();
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        setMapTrackingActive(true);
+    }
+
+    @Override
+    protected void onStop() {
+        stopLocateUpdates();
+        setMapTrackingActive(false);
+        super.onStop();
+    }
+
+    private void setMapTrackingActive(boolean active) {
+        Intent intent = new Intent(this, BusTrackingService.class);
+        intent.setAction(active
+                ? BusTrackingService.ACTION_START_MAP_TRACKING
+                : BusTrackingService.ACTION_STOP_MAP_TRACKING);
+        startService(intent);
     }
 
     @Override
@@ -636,7 +1152,7 @@ public class MainActivity extends Activity {
             }
         } else if (requestCode == CAMERA_PERMISSION_REQUEST) {
             if (granted) {
-                showArView();
+                enterArMode();
             } else {
                 Toast.makeText(this, "Camera permission is needed for AR bus stop finder", Toast.LENGTH_LONG).show();
             }
@@ -710,6 +1226,9 @@ public class MainActivity extends Activity {
                 bestLocation = location;
             }
         }
+        if (bestLocation != null) {
+            lastKnownLocation = bestLocation;
+        }
         return bestLocation;
     }
 
@@ -775,7 +1294,7 @@ public class MainActivity extends Activity {
             try {
                 locationManager.requestLocationUpdates(provider, 0L, 0f, locateLocationListener);
             } catch (SecurityException exception) {
-                // The user may have granted approximate location only; keep trying providers allowed by that grant.
+                // The user may have granted approximate location only.
             }
         }
         scheduleLocateTimeout(() -> {
@@ -787,7 +1306,8 @@ public class MainActivity extends Activity {
             if (fallback != null) {
                 loadMapAtLocation(fallback);
             } else {
-                Toast.makeText(this, "Still waiting for GPS. Move near a window or turn on High accuracy location.", Toast.LENGTH_LONG).show();
+                Toast.makeText(this, "Still waiting for GPS. Move near a window or turn on High accuracy location.",
+                        Toast.LENGTH_LONG).show();
             }
         }, 10_000L);
     }
@@ -819,6 +1339,7 @@ public class MainActivity extends Activity {
         if (location == null) {
             return;
         }
+        lastKnownLocation = location;
         double latitude = location.getLatitude();
         double longitude = location.getLongitude();
         String url = String.format(Locale.US, "%s#16/%f/%f", MAP_URL, latitude, longitude);
@@ -827,9 +1348,9 @@ public class MainActivity extends Activity {
                         + "var lat=%f,lng=%f,zoom=16;"
                         + "var map=window.__bodsFindMap&&window.__bodsFindMap();"
                         + "if(map){"
-                        + "if(map.flyTo){map.flyTo({center:[lng,lat],zoom:zoom});location.hash='#'+zoom+'/'+lat+'/'+lng;return true;}"
-                        + "if(map.setView){map.setView([lat,lng],zoom);location.hash='#'+zoom+'/'+lat+'/'+lng;return true;}"
-                        + "if(map.easeTo){map.easeTo({center:[lng,lat],zoom:zoom});location.hash='#'+zoom+'/'+lat+'/'+lng;return true;}"
+                        + "if(map.flyTo){map.flyTo({center:[lng,lat],zoom:zoom});return true;}"
+                        + "if(map.setView){map.setView([lat,lng],zoom);return true;}"
+                        + "if(map.easeTo){map.easeTo({center:[lng,lat],zoom:zoom});return true;}"
                         + "}"
                         + "location.href='%s';return false;})();",
                 latitude, longitude, escapeJs(url));
@@ -839,6 +1360,22 @@ public class MainActivity extends Activity {
             }
         });
         Toast.makeText(this, "Map centred on your location", Toast.LENGTH_SHORT).show();
+    }
+
+    // ================= SEARCH =================
+
+    private void submitSearch() {
+        if (searchInput == null) {
+            return;
+        }
+        String query = searchInput.getText() == null ? "" : searchInput.getText().toString().trim();
+        if (query.isEmpty()) {
+            Toast.makeText(this, "Type a stop, place or route first", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        rememberRecentRoute(query);
+        webView.loadUrl(SEARCH_URL + Uri.encode(query));
+        switchTab("map");
     }
 
     private void stopVoiceSearch() {
@@ -875,7 +1412,7 @@ public class MainActivity extends Activity {
     private boolean zoomToActiveBusRoute(String route) {
         AnimatedBusMarker marker = findActiveBusMarker(route);
         if (marker == null) {
-            Toast.makeText(this, "Route " + route + " is not currently active.", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "Route " + route + " has no live buses right now.", Toast.LENGTH_LONG).show();
             return false;
         }
         selectRouteFilter(route);
@@ -887,15 +1424,17 @@ public class MainActivity extends Activity {
         return true;
     }
 
+    private void selectRouteFilter(String route) {
+        activeRouteFilter = route == null ? "" : route.trim();
+        rememberRecentRoute(activeRouteFilter);
+        filterMapMarkersForRoute(activeRouteFilter);
+        arBusStopView.setRouteFilter(activeRouteFilter);
+    }
+
     private void animateMapCameraTo(double latitude, double longitude, float zoom) {
         String script = String.format(Locale.US,
                 "(function(){"
                         + "var lat=%f,lng=%f,zoom=%f;"
-                        + "if(window.mMap&&window.google&&window.google.maps){"
-                        + "var target=new google.maps.LatLng(lat,lng);"
-                        + "if(window.CameraUpdateFactory&&window.mMap.animateCamera){window.mMap.animateCamera(CameraUpdateFactory.newLatLngZoom(target,zoom));return true;}"
-                        + "if(window.mMap.panTo){window.mMap.panTo(target);if(window.mMap.setZoom)window.mMap.setZoom(zoom);return true;}"
-                        + "}"
                         + "var map=window.__bodsFindMap&&window.__bodsFindMap();"
                         + "if(map){if(map.flyTo){map.flyTo({center:[lng,lat],zoom:zoom});return true;}"
                         + "if(map.setView){map.setView([lat,lng],zoom);return true;}"
@@ -954,13 +1493,14 @@ public class MainActivity extends Activity {
     private void applyConfirmedRouteFilter(VoiceRouteQuery query) {
         selectRouteFilter(query.route);
 
-        Location targetLocation = query.location != null ? query.location : getCurrentLocalSearchLocation();
+        Location targetLocation = query.location != null ? query.location : lastKnownLocation;
         if (targetLocation != null) {
             webView.loadUrl(MAP_URL + "#14/" + targetLocation.getLatitude() + "/" + targetLocation.getLongitude());
         } else {
             webView.loadUrl(MAP_URL);
         }
         requestImmediateBusRefresh();
+        switchTab("map");
 
         String place = query.placeName.isEmpty() ? "nearby" : "in " + query.placeName;
         Toast.makeText(this, "Showing live route " + activeRouteFilter + " buses " + place, Toast.LENGTH_LONG).show();
@@ -970,13 +1510,6 @@ public class MainActivity extends Activity {
         String route = extractRouteNumber(text);
         String placeName = extractKnownPlaceName(text);
         return new VoiceRouteQuery(route, placeName, locationForPlace(placeName));
-    }
-
-    private Location getCurrentLocalSearchLocation() {
-        if (!hasLocationPermission()) {
-            return null;
-        }
-        return getBestLastKnownLocation((LocationManager) getSystemService(Context.LOCATION_SERVICE));
     }
 
     private String extractKnownPlaceName(String text) {
@@ -998,6 +1531,9 @@ public class MainActivity extends Activity {
         }
         if (normalized.contains("lincoln")) {
             return "Lincoln";
+        }
+        if (normalized.contains("beverley")) {
+            return "Beverley";
         }
         return "";
     }
@@ -1023,6 +1559,9 @@ public class MainActivity extends Activity {
         } else if ("Lincoln".equals(placeName)) {
             location.setLatitude(53.2307);
             location.setLongitude(-0.5406);
+        } else if ("Beverley".equals(placeName)) {
+            location.setLatitude(53.8420);
+            location.setLongitude(-0.4250);
         } else {
             return null;
         }
@@ -1055,7 +1594,7 @@ public class MainActivity extends Activity {
             return "";
         }
 
-        Map<String, String> digitWords = new LinkedHashMap<>();
+        Map<String, String> digitWords = new HashMap<>();
         digitWords.put("zero", "0");
         digitWords.put("oh", "0");
         digitWords.put("o", "0");
@@ -1073,7 +1612,7 @@ public class MainActivity extends Activity {
         digitWords.put("ate", "8");
         digitWords.put("nine", "9");
 
-        Map<String, String> hundredsPhrases = new LinkedHashMap<>();
+        Map<String, String> hundredsPhrases = new HashMap<>();
         hundredsPhrases.put("one hundred", "100");
         hundredsPhrases.put("two hundred", "200");
         hundredsPhrases.put("three hundred", "300");
@@ -1088,7 +1627,7 @@ public class MainActivity extends Activity {
             text = text.replace(entry.getKey(), entry.getValue());
         }
 
-        Map<String, String> tensWords = new LinkedHashMap<>();
+        Map<String, String> tensWords = new HashMap<>();
         tensWords.put("ten", "10");
         tensWords.put("eleven", "11");
         tensWords.put("twelve", "12");
@@ -1143,30 +1682,32 @@ public class MainActivity extends Activity {
         });
     }
 
+    // ================= AR =================
+
     private void toggleArMode() {
         if (arModeEnabled) {
-            showStandardMap();
+            exitArMode();
             return;
         }
-
+        switchTab("map");
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
                 && checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[] { Manifest.permission.CAMERA }, CAMERA_PERMISSION_REQUEST);
             return;
         }
-
-        showArView();
+        enterArMode();
     }
 
-    private void showArView() {
+    private void enterArMode() {
         arModeEnabled = true;
+        arToggleButton.setText("◧ Map View");
         webView.setVisibility(View.GONE);
+        searchScreen.setVisibility(View.GONE);
+        favoritesScreen.setVisibility(View.GONE);
+        accountScreen.setVisibility(View.GONE);
         arBusStopView.setVisibility(View.VISIBLE);
-        arToggleButton.setText("✕ Exit AR");
-        refreshButton.setVisibility(View.GONE);
-        zoomControls.setVisibility(View.GONE);
-        routeChipsScroll.setVisibility(View.GONE);
-        statusPill.setVisibility(View.GONE);
+        mapSearchBar.setVisibility(View.GONE);
+        mapControlStack.setVisibility(View.GONE);
         arBusStopView.setRouteFilter(activeRouteFilter);
         arBusStopView.showStopsNear(hasLocationPermission()
                 ? getBestLastKnownLocation((LocationManager) getSystemService(Context.LOCATION_SERVICE))
@@ -1179,7 +1720,18 @@ public class MainActivity extends Activity {
             pendingNavigationLongitude = Double.NaN;
             pendingNavigationName = null;
         }
-        bringNativeControlsToFront();
+    }
+
+    private void exitArMode() {
+        arModeEnabled = false;
+        stopArLocationUpdates();
+        arBusStopView.destroyAr();
+        arBusStopView.setVisibility(View.GONE);
+        arToggleButton.setText("◧ AR View");
+        boolean mapTab = "map".equals(currentTab);
+        webView.setVisibility(mapTab ? View.VISIBLE : View.GONE);
+        mapSearchBar.setVisibility(mapTab ? View.VISIBLE : View.GONE);
+        mapControlStack.setVisibility(mapTab ? View.VISIBLE : View.GONE);
     }
 
     @SuppressLint("MissingPermission")
@@ -1200,6 +1752,7 @@ public class MainActivity extends Activity {
         arLocationListener = new LocationListener() {
             @Override
             public void onLocationChanged(Location location) {
+                lastKnownLocation = location;
                 if (arModeEnabled) {
                     arBusStopView.showStopsNear(location);
                 }
@@ -1229,49 +1782,7 @@ public class MainActivity extends Activity {
         arLocationListener = null;
     }
 
-    private void showStandardMap() {
-        arModeEnabled = false;
-        stopArLocationUpdates();
-        arBusStopView.destroyAr();
-        arBusStopView.setVisibility(View.GONE);
-        webView.setVisibility(View.VISIBLE);
-        arToggleButton.setText("✦ AR View");
-        refreshButton.setVisibility(View.VISIBLE);
-        zoomControls.setVisibility(View.VISIBLE);
-        statusPill.setVisibility(View.VISIBLE);
-        if (!trackedBusMarkers.isEmpty()) {
-            routeChipsScroll.setVisibility(View.VISIBLE);
-        }
-        bringNativeControlsToFront();
-    }
-
-    private void hideAdsOnPage() {
-        String script = "(function(){"
-                + "var css='#bustimes-native-ad-hide,'"
-                + ".adsbygoogle,ins.adsbygoogle,[id*=\"google_ads\"],[id*=\"div-gpt-ad\"],"
-                + "[id^=\"google_ads\"],[id^=\"ad-\"],[id$=\"-ad\"],"
-                + "[class*=\"adsbygoogle\"],[class*=\"advert\"],[class*=\" ad-\"],"
-                + "iframe[src*=\"googlesyndication\"],iframe[src*=\"doubleclick\"],"
-                + "iframe[src*=\"googleads\"]{display:none!important;visibility:hidden!important;height:0!important;max-height:0!important;overflow:hidden!important;}';"
-                + "var style=document.getElementById('bustimes-native-ad-hide');"
-                + "if(!style){style=document.createElement('style');style.id='bustimes-native-ad-hide';document.head.appendChild(style);}"
-                + "style.textContent=css;"
-                + "document.querySelectorAll('.adsbygoogle,ins.adsbygoogle,[id*=\"google_ads\"],[id*=\"div-gpt-ad\"],[id^=\"ad-\"],[id$=\"-ad\"],[class*=\"advert\"],iframe[src*=\"googlesyndication\"],iframe[src*=\"doubleclick\"]').forEach(function(el){el.remove();});"
-                + "return true;})();";
-        webView.evaluateJavascript(script, ignored -> {
-        });
-    }
-
-    private void bringNativeControlsToFront() {
-        locateButton.bringToFront();
-        refreshButton.bringToFront();
-        microphoneButton.bringToFront();
-        arToggleButton.bringToFront();
-        zoomControls.bringToFront();
-        statusPill.bringToFront();
-        liveCountPill.bringToFront();
-        routeChipsScroll.bringToFront();
-    }
+    // ================= LIVE BUS DATA =================
 
     private void registerBusTrackingReceiver() {
         IntentFilter filter = new IntentFilter();
@@ -1283,38 +1794,6 @@ public class MainActivity extends Activity {
             registerReceiver(busTrackingReceiver, filter);
         }
         busTrackingReceiverRegistered = true;
-    }
-
-    private void openBusDetailsFromAr(BusSnapshot snapshot) {
-        BusDetailsSheet.show(this, snapshot, new BusDetailsSheet.Callbacks() {
-            @Override
-            public void onNavigateToBus(double navLatitude, double navLongitude) {
-                arBusStopView.setNavigationTarget("route " + snapshot.lineName, navLatitude, navLongitude);
-            }
-
-            @Override
-            public boolean isFollowingBus(String followId) {
-                return followId != null && followId.equals(followBusId);
-            }
-
-            @Override
-            public void onShowBusOnMap(double mapLatitude, double mapLongitude) {
-                if (arModeEnabled) {
-                    showStandardMap();
-                    animateMapCameraTo(mapLatitude, mapLongitude, 16f);
-                }
-            }
-
-            @Override
-            public void onFollowBus(String followId, boolean follow) {
-                if (follow) {
-                    startFollowingBus(followId);
-                } else {
-                    stopFollowingBus(null);
-                    Toast.makeText(MainActivity.this, "Stopped following", Toast.LENGTH_SHORT).show();
-                }
-            }
-        });
     }
 
     private void updateTrackedBusMarker(Intent intent) {
@@ -1345,8 +1824,7 @@ public class MainActivity extends Activity {
                     firstNonEmpty(operatorName, ""));
             trackedBusMarkers.put(id, marker);
             marker.renderAt(nextLatitude, nextLongitude, marker.bearing, true);
-            updateLiveCountPill();
-            rebuildRouteChips();
+            updateTopBarSubtitle();
             return;
         }
 
@@ -1356,13 +1834,15 @@ public class MainActivity extends Activity {
         marker.animateTo(nextLatitude, nextLongitude, bearing, firstNonEmpty(recordedAt, "Unknown"),
                 firstNonEmpty(occupancy, "Information Unknown"), destinationName, expectedArrivalTime,
                 firstNonEmpty(operatorName, ""));
-        updateLiveCountPill();
-        rebuildRouteChips();
+        updateTopBarSubtitle();
+        checkArrivalAlert(marker);
     }
 
-    private void updateLiveCountPill() {
+    private void updateTopBarSubtitle() {
         int count = trackedBusMarkers.size();
-        liveCountPill.setText(count + (count == 1 ? " bus live" : " buses live"));
+        topBarSubtitle.setText(count == 0
+                ? (BuildConfig.BODS_API_KEY.isEmpty() ? "tap a bus for details" : "waiting for live buses…")
+                : count + (count == 1 ? " bus live now" : " buses live now"));
     }
 
     private void removeStaleMarkers() {
@@ -1392,9 +1872,7 @@ public class MainActivity extends Activity {
         removals.append("return true;})();");
         webView.evaluateJavascript(removals.toString(), ignored -> {
         });
-        updateLiveCountPill();
-        lastChipsRebuildMs = 0L;
-        rebuildRouteChips();
+        updateTopBarSubtitle();
     }
 
     private void startFollowingBus(String busId) {
@@ -1429,11 +1907,32 @@ public class MainActivity extends Activity {
         uiHandler.postDelayed(followRunnable, FOLLOW_INTERVAL_MS);
     }
 
-    private String computeDistanceText(double latitude, double longitude) {
-        if (!hasLocationPermission()) {
-            return "";
+    private void checkArrivalAlert(AnimatedBusMarker marker) {
+        if (alertRoute == null || alertFired) {
+            return;
         }
-        Location userLocation = getBestLastKnownLocation((LocationManager) getSystemService(Context.LOCATION_SERVICE));
+        if (!marker.matchesRoute(normalizeRouteSearch(alertRoute))) {
+            return;
+        }
+        int eta = parseEtaMinutes(etaText(marker.expectedArrivalTime));
+        if (eta >= 0 && eta <= 5) {
+            alertFired = true;
+            Toast.makeText(this, "🔔 Route " + marker.label + " is due in about " + eta + " min!", Toast.LENGTH_LONG).show();
+            try {
+                Vibrator vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+                if (vibrator != null && vibrator.hasVibrator()) {
+                    vibrator.vibrate(400);
+                }
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private String computeDistanceText(double latitude, double longitude) {
+        Location userLocation = lastKnownLocation;
+        if (userLocation == null && hasLocationPermission()) {
+            userLocation = getBestLastKnownLocation((LocationManager) getSystemService(Context.LOCATION_SERVICE));
+        }
         if (userLocation == null) {
             return "";
         }
@@ -1447,13 +1946,13 @@ public class MainActivity extends Activity {
         return String.format(Locale.UK, "%.1fkm away", metres / 1000f);
     }
 
-    private int parseEtaMinutes(String etaText) {
-        if (etaText == null) {
+    private int parseEtaMinutes(String etaTextValue) {
+        if (etaTextValue == null) {
             return -1;
         }
-        String digits = etaText.replaceAll("[^0-9]", " ").trim();
+        String digits = etaTextValue.replaceAll("[^0-9]", " ").trim();
         if (digits.isEmpty()) {
-            return -1;
+            return etaTextValue.contains("Arriving now") ? 0 : -1;
         }
         try {
             return Integer.parseInt(digits.split("\\s+")[0]);
@@ -1532,7 +2031,7 @@ public class MainActivity extends Activity {
                 .replace("\r", "");
     }
 
-    private void renderNativeBusMarker(String id, String label, String destination, String etaText, double latitude,
+    private void renderNativeBusMarker(String id, String label, String destination, String etaTextValue, double latitude,
             double longitude, float bearing, String lastSeen, String occupancy, float speedKph, String operator) {
         String script = String.format(Locale.US,
                 "(function(){"
@@ -1594,8 +2093,8 @@ public class MainActivity extends Activity {
                 escapeJs(id), escapeJs(occupancy), escapeJs(id),
                 escapeJs(label), bearing,
                 escapeJs(id), escapeJs(label), longitude, latitude, bearing,
-                escapeJs(destination), escapeJs(etaText), escapeJs(lastSeen), speedKph, escapeJs(operator),
-                escapeJs(label), escapeJs(destination), escapeJs(etaText), escapeJs(speedText(speedKph)),
+                escapeJs(destination), escapeJs(etaTextValue), escapeJs(lastSeen), speedKph, escapeJs(operator),
+                escapeJs(label), escapeJs(destination), escapeJs(etaTextValue), escapeJs(speedText(speedKph)),
                 escapeJs(lastSeen));
         webView.evaluateJavascript(script, ignored -> {
         });
@@ -1689,6 +2188,7 @@ public class MainActivity extends Activity {
             String spokenText = matches.get(0);
             String route = extractRouteNumber(spokenText);
             if (!route.isEmpty()) {
+                rememberRecentRoute(route);
                 zoomToActiveBusRoute(route);
                 stopVoiceSearch();
                 return;
@@ -1697,70 +2197,172 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** Bridge called from injected JS: our own BODS markers and hijacked site popups. */
     private class BusMarkerBridge {
         @JavascriptInterface
-        public void showBusDetails(String busId, String route, String destination, String etaText, String lastSeen,
+        public void showBusDetails(String busId, String route, String destination, String etaTextValue, String lastSeen,
                 String occupancy, String latitude, String longitude, String speed, String bearing, String operator) {
+            runOnUiThread(() -> presentBusSheet(new BusSnapshot(
+                    firstNonEmpty(busId, "bus"),
+                    firstNonEmpty(route, "Bus"),
+                    "",
+                    firstNonEmpty(destination, "destination unknown"),
+                    firstNonEmpty(occupancy, "Information Unknown"),
+                    firstNonEmpty(busId, "—"),
+                    firstNonEmpty(lastSeen, ""),
+                    firstNonEmpty(operator, ""),
+                    computeDistanceText(parseDouble(latitude, Double.NaN), parseDouble(longitude, Double.NaN)),
+                    parseDouble(latitude, Double.NaN),
+                    parseDouble(longitude, Double.NaN),
+                    (float) parseDouble(bearing, Float.NaN),
+                    (float) parseDouble(speed, 0f),
+                    parseEtaMinutes(etaTextValue),
+                    "its next stop"), false));
+        }
+
+        /** Called when the user taps a bus marker on the bustimes.org map itself. */
+        @JavascriptInterface
+        public void showSitePopup(String json) {
             runOnUiThread(() -> {
-                double targetLatitude = parseDouble(latitude, Double.NaN);
-                double targetLongitude = parseDouble(longitude, Double.NaN);
-                if (Double.isNaN(targetLatitude) || Double.isNaN(targetLongitude)) {
+                String route = "";
+                String destination = "";
+                String vehicle = "";
+                String lastSeen = "";
+                try {
+                    JSONObject payload = new JSONObject(json);
+                    route = payload.optString("route", "");
+                    destination = payload.optString("destination", "");
+                    vehicle = payload.optString("vehicle", "");
+                    lastSeen = payload.optString("lastSeen", "");
+                } catch (Exception ignored) {
+                }
+                if (route.isEmpty()) {
                     return;
                 }
+
+                // Enrich with our BODS data when the same route is tracked live.
+                AnimatedBusMarker match = findActiveBusMarker(route);
+                String busNumber = vehicle;
+                String busReg = "";
+                int dashIndex = vehicle.indexOf(" - ");
+                if (dashIndex > 0) {
+                    busNumber = vehicle.substring(0, dashIndex).trim();
+                    busReg = vehicle.substring(dashIndex + 3).trim();
+                }
                 BusSnapshot snapshot = new BusSnapshot(
-                        firstNonEmpty(busId, "bus"),
+                        firstNonEmpty(busNumber, "site-" + route),
                         firstNonEmpty(route, "Bus"),
                         "",
-                        firstNonEmpty(destination, "destination unknown"),
-                        firstNonEmpty(occupancy, "Information Unknown"),
-                        firstNonEmpty(busId, "—"),
-                        firstNonEmpty(lastSeen, ""),
-                        firstNonEmpty(operator, ""),
-                        computeDistanceText(targetLatitude, targetLongitude),
-                        targetLatitude,
-                        targetLongitude,
-                        (float) parseDouble(bearing, Float.NaN),
-                        (float) parseDouble(speed, 0f),
-                        parseEtaMinutes(etaText),
+                        firstNonEmpty(destination, firstNonEmpty(match == null ? "" : match.destinationName,
+                                "destination unknown")),
+                        match == null ? "Information Unknown" : match.occupancy,
+                        firstNonEmpty(busNumber, "—"),
+                        firstNonEmpty(lastSeen, match == null ? "" : match.lastSeen),
+                        match == null ? "" : match.operatorName,
+                        match == null ? "" : computeDistanceText(match.latitude, match.longitude),
+                        match == null ? Double.NaN : match.latitude,
+                        match == null ? Double.NaN : match.longitude,
+                        match == null ? Float.NaN : match.bearing,
+                        match == null ? 0f : match.currentSpeedKph,
+                        match == null ? -1 : parseEtaMinutes(etaText(match.expectedArrivalTime)),
                         "its next stop");
-                BusDetailsSheet.show(MainActivity.this, snapshot, new BusDetailsSheet.Callbacks() {
-                    @Override
-                    public void onNavigateToBus(double navLatitude, double navLongitude) {
-                        pendingNavigationName = "route " + snapshot.lineName;
-                        pendingNavigationLatitude = navLatitude;
-                        pendingNavigationLongitude = navLongitude;
-                        if (!arModeEnabled) {
-                            toggleArMode();
-                        } else {
-                            showArView();
-                        }
-                    }
-
-                    @Override
-                    public void onFollowBus(String followId, boolean follow) {
-                        if (follow) {
-                            startFollowingBus(followId);
-                        } else {
-                            stopFollowingBus(null);
-                            Toast.makeText(MainActivity.this, "Stopped following", Toast.LENGTH_SHORT).show();
-                        }
-                    }
-
-                    @Override
-                    public boolean isFollowingBus(String followId) {
-                        return followId != null && followId.equals(followBusId);
-                    }
-
-                    @Override
-                    public void onShowBusOnMap(double mapLatitude, double mapLongitude) {
-                        if (arModeEnabled) {
-                            showStandardMap();
-                        }
-                        animateMapCameraTo(mapLatitude, mapLongitude, 16f);
-                    }
-                });
+                if (busReg != null && !busReg.isEmpty()) {
+                    snapshot.regOverride = busReg;
+                }
+                presentBusSheet(snapshot, false);
             });
         }
+    }
+
+    private void openBusDetailsFromAr(BusSnapshot snapshot) {
+        presentBusSheet(snapshot, true);
+    }
+
+    /** Shows the "Selected Bus" sheet for a snapshot coming from the map, a site popup or AR. */
+    private void presentBusSheet(BusSnapshot snapshot, boolean fromAr) {
+        if (snapshot == null) {
+            return;
+        }
+        if (Double.isNaN(snapshot.latitude) || Double.isNaN(snapshot.longitude)) {
+            // Popup without coordinates: disable map-dependent actions.
+            BusDetailsSheet.show(this, snapshot, sheetCallbacks(snapshot, fromAr));
+            return;
+        }
+        if (!fromAr) {
+            arBusStopView.setNavigationTarget("route " + snapshot.lineName, snapshot.latitude, snapshot.longitude);
+        }
+        BusDetailsSheet.show(this, snapshot, sheetCallbacks(snapshot, fromAr));
+    }
+
+    private BusDetailsSheet.Callbacks sheetCallbacks(BusSnapshot snapshot, boolean fromAr) {
+        return new BusDetailsSheet.Callbacks() {
+            @Override
+            public void onNavigateToBus(double navLatitude, double navLongitude) {
+                if (fromAr) {
+                    arBusStopView.setNavigationTarget("route " + snapshot.lineName, navLatitude, navLongitude);
+                } else {
+                    pendingNavigationName = "route " + snapshot.lineName;
+                    pendingNavigationLatitude = navLatitude;
+                    pendingNavigationLongitude = navLongitude;
+                    if (!arModeEnabled) {
+                        toggleArMode();
+                    }
+                }
+            }
+
+            @Override
+            public void onFollowBus(String busId, boolean follow) {
+                if (follow) {
+                    startFollowingBus(busId);
+                } else {
+                    stopFollowingBus(null);
+                    Toast.makeText(MainActivity.this, "Stopped following", Toast.LENGTH_SHORT).show();
+                }
+            }
+
+            @Override
+            public boolean isFollowingBus(String busId) {
+                return busId != null && busId.equals(followBusId);
+            }
+
+            @Override
+            public void onShowBusOnMap(double mapLatitude, double mapLongitude) {
+                if (arModeEnabled) {
+                    exitArMode();
+                }
+                switchTab("map");
+                animateMapCameraTo(mapLatitude, mapLongitude, 16f);
+            }
+
+            @Override
+            public void onToggleFavorite(String route) {
+                toggleFavoriteRoute(route, snapshot.destinationName);
+            }
+
+            @Override
+            public boolean isFavorite(String route) {
+                return isFavoriteRoute(route);
+            }
+
+            @Override
+            public void onToggleAlert(String busId, String route) {
+                if (alertRoute != null && alertRoute.equalsIgnoreCase(route)) {
+                    alertRoute = null;
+                    alertFired = false;
+                    Toast.makeText(MainActivity.this, "Alert removed for route " + route, Toast.LENGTH_SHORT).show();
+                } else {
+                    alertRoute = route;
+                    alertFired = false;
+                    Toast.makeText(MainActivity.this,
+                            "We'll buzz when route " + route + " is about 5 minutes away", Toast.LENGTH_LONG).show();
+                }
+            }
+
+            @Override
+            public boolean isAlertArmed(String busId, String route) {
+                return alertRoute != null && alertRoute.equalsIgnoreCase(route);
+            }
+        };
     }
 
     private class AnimatedBusMarker {
@@ -1816,8 +2418,7 @@ public class MainActivity extends Activity {
                 String nextOccupancy, String nextDestinationName, String nextExpectedArrivalTime, String nextOperator) {
             cancelAnimation();
             long now = System.currentTimeMillis();
-            float[] speedResult = estimateSpeedKph(latitude, longitude, nextLatitude, nextLongitude, now);
-            currentSpeedKph = speedResult[0];
+            currentSpeedKph = estimateSpeedKph(latitude, longitude, nextLatitude, nextLongitude, now);
             lastUpdateWallClockMs = now;
 
             double startLatitude = latitude;
@@ -1842,25 +2443,22 @@ public class MainActivity extends Activity {
             animator.start();
         }
 
-        /** Returns {speedKph, unused} — speed estimated from the distance between two polls. */
-        private float[] estimateSpeedKph(double fromLatitude, double fromLongitude,
+        private float estimateSpeedKph(double fromLatitude, double fromLongitude,
                 double toLatitude, double toLongitude, long now) {
             if (lastUpdateWallClockMs <= 0L) {
-                return new float[] { 0f };
+                return 0f;
             }
             long seconds = (now - lastUpdateWallClockMs) / 1000L;
             if (seconds < 1L || seconds > 180L) {
-                return new float[] { currentSpeedKph };
+                return currentSpeedKph;
             }
-            float[] results = new float[1];
             float[] distanceHolder = new float[1];
             Location.distanceBetween(fromLatitude, fromLongitude, toLatitude, toLongitude, distanceHolder);
             float kph = distanceHolder[0] / seconds * 3.6f;
             if (kph > 130f) {
-                kph = currentSpeedKph; // impossible jump — GPS glitch, keep previous speed
+                return currentSpeedKph; // impossible jump — GPS glitch
             }
-            results[0] = Math.max(0f, kph);
-            return results;
+            return Math.max(0f, kph);
         }
 
         void renderAt(double renderLatitude, double renderLongitude, float renderBearing, boolean force) {
@@ -1898,12 +2496,7 @@ public class MainActivity extends Activity {
                 updateTrackedBusMarker(intent);
             } else if (BusTrackingService.ACTION_TRACKING_STATUS.equals(action)) {
                 String message = intent.getStringExtra(BusTrackingService.EXTRA_STATUS_MESSAGE);
-                if (message == null) {
-                    return;
-                }
-                statusPill.setVisibility(View.VISIBLE);
-                statusPill.setText(message);
-                if (message.startsWith("Add a BODS_API_KEY")) {
+                if (message != null && message.startsWith("Add a BODS_API_KEY")) {
                     Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
                 }
             }
@@ -1912,17 +2505,29 @@ public class MainActivity extends Activity {
 
     private class BusTimesWebViewClient extends WebViewClient {
         @Override
+        public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+            WebResourceResponse blocked = blockIfAd(request.getUrl().toString());
+            return blocked != null ? blocked : super.shouldInterceptRequest(view, request);
+        }
+
+        @Override
+        public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+            super.onPageStarted(view, url, favicon);
+            // Pretend we are an embedded webview so the site itself switches its ad code off.
+            view.evaluateJavascript("window.noAds=true;try{Object.defineProperty(window,'noAds',{value:true,writable:false,configurable:false});}catch(e){}", null);
+        }
+
+        @Override
         public void onPageFinished(WebView view, String url) {
             hideAdsOnPage();
+            installPopupHijack();
             applyNightMode(nightModeEnabled, true);
             if (!activeRouteFilter.isEmpty()) {
                 filterMapMarkersForRoute(activeRouteFilter);
             }
-            // Re-render every tracked marker after a reload so the overlay survives page refreshes.
             for (AnimatedBusMarker marker : trackedBusMarkers.values()) {
                 marker.renderAt(marker.latitude, marker.longitude, marker.bearing, true);
             }
-            bringNativeControlsToFront();
         }
 
         @Override
@@ -1940,14 +2545,14 @@ public class MainActivity extends Activity {
         @Override
         public void onProgressChanged(WebView view, int newProgress) {
             progressBar.setProgress(newProgress);
-            progressBar.setVisibility(newProgress >= 100 ? View.GONE : View.VISIBLE);
+            progressBar.setVisibility("map".equals(currentTab) && newProgress < 100 ? View.VISIBLE : View.GONE);
             if (newProgress >= 100) {
                 hideAdsOnPage();
+                installPopupHijack();
                 applyNightMode(nightModeEnabled, true);
                 if (!activeRouteFilter.isEmpty()) {
                     filterMapMarkersForRoute(activeRouteFilter);
                 }
-                bringNativeControlsToFront();
             }
         }
 
