@@ -4,9 +4,11 @@ import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.app.Dialog;
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.os.SystemClock;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -50,7 +52,6 @@ final class BusDetailsSheet {
     static void show(Activity activity, BusSnapshot snapshot, Callbacks callbacks) {
         Context context = activity;
         int pad = UiTheme.dp(context, 20);
-        boolean dark = false; // light sheet, like the reference
 
         final Dialog dialog = new Dialog(activity);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
@@ -81,17 +82,25 @@ final class BusDetailsSheet {
 
         // ---- "Selected Bus" label ----------------------------------------------
         TextView selectedLabel = new TextView(context);
-        selectedLabel.setText("Selected Bus");
+        selectedLabel.setText("Selected bus");
         selectedLabel.setTextColor(dim);
         selectedLabel.setTextSize(13);
         root.addView(selectedLabel);
 
         // ---- Route title --------------------------------------------------------
+        String titleText;
+        if (snapshot.lineName.isEmpty()) {
+            titleText = snapshot.destinationName;
+        } else if (snapshot.destinationName.isEmpty()) {
+            titleText = snapshot.lineName;
+        } else {
+            titleText = snapshot.lineName + " to " + snapshot.destinationName;
+        }
         TextView routeTitle = new TextView(context);
-        routeTitle.setText(String.format(Locale.UK, "ROUTE %s | %s",
-                snapshot.lineName, snapshot.destinationName));
+        routeTitle.setText(titleText);
+        routeTitle.setVisibility(titleText.isEmpty() ? View.GONE : View.VISIBLE);
         routeTitle.setTextColor(ink);
-        routeTitle.setTextSize(19);
+        routeTitle.setTextSize(20);
         routeTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -103,6 +112,7 @@ final class BusDetailsSheet {
         String statusText = statusText(snapshot);
         TextView liveStatus = new TextView(context);
         liveStatus.setText(statusText);
+        liveStatus.setVisibility(statusText.isEmpty() ? View.GONE : View.VISIBLE);
         liveStatus.setTextColor(statusColor);
         liveStatus.setTextSize(15);
         liveStatus.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
@@ -112,8 +122,10 @@ final class BusDetailsSheet {
         root.addView(liveStatus, liveParams);
 
         // ---- Next stop ETA ------------------------------------------------------
+        String etaLineValue = etaLineText(snapshot);
         TextView etaLine = new TextView(context);
-        etaLine.setText(etaLineText(snapshot));
+        etaLine.setText(etaLineValue);
+        etaLine.setVisibility(etaLineValue.isEmpty() ? View.GONE : View.VISIBLE);
         etaLine.setTextColor(ink);
         etaLine.setTextSize(17);
         etaLine.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
@@ -124,19 +136,37 @@ final class BusDetailsSheet {
 
         // ---- Vehicle / reg + occupancy ------------------------------------------
         TextView vehicleLine = new TextView(context);
-        String vehicle = snapshot.regOverride == null || snapshot.regOverride.isEmpty()
-                ? "Bus #" + snapshot.vehicleId
-                : "Bus #" + snapshot.vehicleId + " (Reg: " + snapshot.regOverride + ")";
+        String vehicle = snapshot.vehicleId == null ? "" : snapshot.vehicleId.trim();
+        String vehicleDetail = snapshot.regOverride == null || snapshot.regOverride.isEmpty()
+                ? snapshot.operatorName
+                : snapshot.regOverride;
+        if (vehicleDetail != null && !vehicleDetail.isEmpty()) {
+            vehicle = vehicle.isEmpty() ? vehicleDetail : vehicle + " • " + vehicleDetail;
+        }
         if (!"Information Unknown".equals(snapshot.occupancy)) {
             vehicle += "  ·  " + occupancyLabel(snapshot.occupancy);
         }
         vehicleLine.setText(vehicle);
+        vehicleLine.setVisibility(vehicle.isEmpty() ? View.GONE : View.VISIBLE);
         vehicleLine.setTextColor(dim);
         vehicleLine.setTextSize(13);
         LinearLayout.LayoutParams vehicleParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         vehicleParams.topMargin = dp8(context);
         root.addView(vehicleLine, vehicleParams);
+
+        // ---- Data freshness -----------------------------------------------------
+        String updated = snapshot.updatedText();
+        if (!updated.isEmpty()) {
+            TextView updatedLine = new TextView(context);
+            updatedLine.setText(updated);
+            updatedLine.setTextColor(dim);
+            updatedLine.setTextSize(12);
+            LinearLayout.LayoutParams updatedParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            updatedParams.topMargin = dp6(context);
+            root.addView(updatedLine, updatedParams);
+        }
 
         // ---- Distance + heading -------------------------------------------------
         if (!snapshot.distanceText.isEmpty() || !Float.isNaN(snapshot.bearing)) {
@@ -222,10 +252,10 @@ final class BusDetailsSheet {
                         snapshot.destinationName,
                         etaLineText(snapshot),
                         snapshot.distanceText.isEmpty() ? "" : "Currently " + snapshot.distanceText + ".");
-                android.content.Intent send = new android.content.Intent(android.content.Intent.ACTION_SEND);
+                Intent send = new Intent(Intent.ACTION_SEND);
                 send.setType("text/plain");
-                send.putExtra(android.content.Intent.EXTRA_TEXT, text);
-                context.startActivity(android.content.Intent.createChooser(send, "Share bus"));
+                send.putExtra(Intent.EXTRA_TEXT, text);
+                context.startActivity(Intent.createChooser(send, "Share bus"));
                 dialog.dismiss();
             }));
         }
@@ -254,7 +284,7 @@ final class BusDetailsSheet {
 
         // Live countdown while open.
         if (snapshot.expectedEtaMinutes >= 0) {
-            final long startElapsed = android.os.SystemClock.elapsedRealtime();
+            final long startElapsed = SystemClock.elapsedRealtime();
             final ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
             animator.setDuration(120_000L);
             animator.addUpdateListener(animation -> {
@@ -262,9 +292,8 @@ final class BusDetailsSheet {
                     animation.cancel();
                     return;
                 }
-                long minutes = snapshot.expectedEtaMinutes - (android.os.SystemClock.elapsedRealtime() - startElapsed) / 60000L;
-                etaLine.setText(String.format(Locale.UK, "%s - %d min",
-                        snapshot.arrivalStopName, Math.max(0, minutes)));
+                long minutes = snapshot.expectedEtaMinutes - (SystemClock.elapsedRealtime() - startElapsed) / 60000L;
+                etaLine.setText(countdownText(snapshot, (int) Math.max(0L, minutes)));
             });
             animator.start();
             dialog.setOnDismissListener(d -> animator.cancel());
@@ -286,22 +315,30 @@ final class BusDetailsSheet {
 
     private static String statusText(BusSnapshot snapshot) {
         if (snapshot.expectedEtaMinutes < 0) {
-            return "Live: awaiting data";
+            return "";
         }
         if (snapshot.expectedEtaMinutes <= 2) {
-            return "Live: due now";
+            return "Due now";
         }
-        if (snapshot.expectedEtaMinutes <= 8) {
-            return "Live: " + snapshot.expectedEtaMinutes + " min away";
-        }
-        return "Live: On-time";
+        return snapshot.expectedEtaMinutes + " mins away";
     }
 
     private static String etaLineText(BusSnapshot snapshot) {
-        if (snapshot.expectedEtaMinutes < 0) {
-            return snapshot.arrivalStopName + " - ETA not published";
+        return countdownText(snapshot, snapshot.expectedEtaMinutes);
+    }
+
+    /** "5 mins until arrival (est.)", prefixed with the real stop name when we have one. */
+    private static String countdownText(BusSnapshot snapshot, int minutes) {
+        if (minutes < 0) {
+            return "";
         }
-        return String.format(Locale.UK, "%s - %d min", snapshot.arrivalStopName, snapshot.expectedEtaMinutes);
+        if (!snapshot.arrivalStopName.isEmpty()) {
+            return String.format(Locale.UK, "%s - %d min", snapshot.arrivalStopName, minutes);
+        }
+        if (minutes == 0) {
+            return "Due now (est.)";
+        }
+        return String.format(Locale.UK, "%d mins until arrival (est.)", minutes);
     }
 
     private static String occupancyLabel(String occupancy) {
@@ -381,5 +418,9 @@ final class BusDetailsSheet {
 
     private static int dp8(Context context) {
         return UiTheme.dp(context, 8);
+    }
+
+    private static int dp6(Context context) {
+        return UiTheme.dp(context, 6);
     }
 }

@@ -3,11 +3,10 @@ package org.bustimes.app;
 /** Mutable live-bus record rendered as an AR card, ghost silhouette and radar blip. */
 final class BusBillboard {
     final String id;
-    String lineName = "Bus";
-    String destinationName = "destination unknown";
-    String etaText = "ETA unknown";
+    String lineName = "";
+    String destinationName = "";
+    String etaText = "";
     String occupancy = "Information Unknown";
-    public String delayExplanation;
     double latitude;
     double longitude;
     float bearingDegrees;
@@ -18,6 +17,5 @@ final class BusBillboard {
 
     BusBillboard(String id) {
         this.id = id;
-        this.delayExplanation = "";
     }
 }

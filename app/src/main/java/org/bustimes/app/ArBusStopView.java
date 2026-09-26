@@ -314,12 +314,10 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             billboard = new BusBillboard(id);
             busBillboards.add(billboard);
         }
-        billboard.lineName = lineName == null || lineName.trim().isEmpty() ? "Bus" : lineName.trim();
-        billboard.destinationName = destinationName == null || destinationName.trim().isEmpty()
-                ? "destination unknown" : destinationName.trim();
-        billboard.etaText = etaText == null || etaText.trim().isEmpty() ? "ETA unknown" : etaText.trim();
+        billboard.lineName = lineName == null ? "" : lineName.trim();
+        billboard.destinationName = destinationName == null ? "" : destinationName.trim();
+        billboard.etaText = etaText == null ? "" : etaText.trim();
         billboard.occupancy = occupancy == null || occupancy.trim().isEmpty() ? "Information Unknown" : occupancy.trim();
-        billboard.delayExplanation = explainDelay(billboard.lineName, billboard.etaText, billboard.occupancy);
         billboard.latitude = latitude;
         billboard.longitude = longitude;
         billboard.bearingDegrees = bearingDegrees;
@@ -848,28 +846,6 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         return chevrons;
     }
 
-    private String explainDelay(String lineName, String etaText, String occupancy) {
-        if (etaText == null || !(etaText.contains("Arriving in") || etaText.contains("Arriving now"))) {
-            return "AI Delay Predictor: awaiting live ETA";
-        }
-        int minutes = 0;
-        String[] parts = etaText.split(" ");
-        for (String part : parts) {
-            try {
-                minutes = Integer.parseInt(part);
-                break;
-            } catch (NumberFormatException ignored) {
-            }
-        }
-        if (minutes >= 8) {
-            return String.format(Locale.UK, "AI Delay Predictor: Route %s may be delayed by traffic or weather.", lineName);
-        }
-        if ("Full/Crowded".equals(occupancy)) {
-            return String.format(Locale.UK, "AI Delay Predictor: Route %s boarding may be slower because the bus is crowded.", lineName);
-        }
-        return "AI Delay Predictor: running on time";
-    }
-
     private void renderBusBillboards(float center, float pixelsPerDegree) {
         long now = System.currentTimeMillis();
         int width = Math.max(1, getWidth());
@@ -927,7 +903,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
                 billboard.bearingDegrees,
                 billboard.speedKph,
                 parseEtaMinutes(billboard.etaText),
-                "its next stop");
+                "");
     }
 
     private int parseEtaMinutes(String etaText) {
@@ -957,12 +933,22 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         FrameLayout card = new FrameLayout(getContext());
         int color = UiTheme.occupancyColor(billboard.occupancy);
 
+        StringBuilder lines = new StringBuilder(billboardTitle(billboard));
+        StringBuilder metrics = new StringBuilder();
+        if (!billboard.etaText.isEmpty()) {
+            metrics.append(billboard.etaText);
+        }
+        if (billboard.speedKph > 0.5f) {
+            if (metrics.length() > 0) {
+                metrics.append(" · ");
+            }
+            metrics.append(String.format(Locale.UK, "%.0f mph", billboard.speedKph * 0.621371f));
+        }
+        if (metrics.length() > 0) {
+            lines.append('\n').append(metrics);
+        }
         TextView body = new TextView(getContext());
-        body.setText(String.format(Locale.UK, "%s\n%s · %s\n%s",
-                billboardTitle(billboard),
-                billboard.etaText,
-                billboard.speedKph <= 0.5f ? "stopped" : String.format(Locale.UK, "%.0f mph", billboard.speedKph * 0.621371f),
-                billboard.delayExplanation));
+        body.setText(lines.toString());
         body.setTextColor(Color.WHITE);
         body.setTextSize(12);
         body.setGravity(Gravity.CENTER);
@@ -974,27 +960,34 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         // Route number bubble overlapping the top-left of the card.
-        TextView bubble = new TextView(getContext());
-        bubble.setText(billboard.lineName);
-        bubble.setTextColor(Color.WHITE);
-        bubble.setTextSize(13);
-        bubble.setTypeface(Typeface.create("sans-serif-black", Typeface.NORMAL));
-        bubble.setGravity(Gravity.CENTER);
-        bubble.setBackground(UiTheme.circleGradient(getContext(), color, UiTheme.withAlpha(color, 180)));
-        card.addView(bubble, new FrameLayout.LayoutParams(dp(34), dp(34), Gravity.START | Gravity.TOP) {
-            {
-                setMargins(dp(-6), dp(-12), 0, 0);
-            }
-        });
+        if (!billboard.lineName.isEmpty()) {
+            TextView bubble = new TextView(getContext());
+            bubble.setText(billboard.lineName);
+            bubble.setTextColor(Color.WHITE);
+            bubble.setTextSize(13);
+            bubble.setTypeface(Typeface.create("sans-serif-black", Typeface.NORMAL));
+            bubble.setGravity(Gravity.CENTER);
+            bubble.setBackground(UiTheme.circleGradient(getContext(), color, UiTheme.withAlpha(color, 180)));
+            card.addView(bubble, new FrameLayout.LayoutParams(dp(34), dp(34), Gravity.START | Gravity.TOP) {
+                {
+                    setMargins(dp(-6), dp(-12), 0, 0);
+                }
+            });
+        }
         return card;
     }
 
     private String billboardTitle(BusBillboard billboard) {
-        String line = billboard.lineName == null ? "Bus" : billboard.lineName;
-        String destination = billboard.destinationName == null ? "destination unknown" : billboard.destinationName;
+        String line = billboard.lineName == null ? "" : billboard.lineName;
+        String destination = billboard.destinationName == null ? "" : billboard.destinationName;
+        if (line.isEmpty()) {
+            return destination;
+        }
+        if (destination.isEmpty()) {
+            return line;
+        }
         String lowerLine = line.toLowerCase(Locale.UK);
-        String lowerDestination = destination.toLowerCase(Locale.UK);
-        if (lowerLine.contains(" to ") || (!lowerDestination.isEmpty() && lowerLine.contains(lowerDestination))) {
+        if (lowerLine.contains(" to ") || lowerLine.contains(destination.toLowerCase(Locale.UK))) {
             return line;
         }
         return line + " → " + destination;

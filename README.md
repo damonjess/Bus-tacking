@@ -1,16 +1,18 @@
 # Bus Times Live Android
 
-A map-first Android wrapper for [bustimes.org](https://bustimes.org/) focused on the live tracker at `https://bustimes.org/map`. The app opens directly to the real Bus Times map so bus markers show their live route numbers and locations using the website's own live data, now wrapped in a completely redesigned dark "glass & neon" interface.
+A map-first Android wrapper for [bustimes.org](https://bustimes.org/) focused on the live tracker at `https://bustimes.org/map`. The app opens directly to the real Bus Times map so bus markers show their live route numbers and locations using the website's own live data, now wrapped in a native app shell: dark top bar, light bottom navigation, crisp drawn map controls and bus cards pinned to the map itself.
 
 ## What's new in the redesign
 
 - **Whole new look**: deep-space navy theme, gradient floating action buttons, glass pills and chips, animated press feedback, a cyan page-load progress bar and a brand-new neon launcher icon.
 - **Rich bus details on tap**: tapping any bus (on the map or in AR) opens a modern bottom sheet with a live ETA countdown, due-now/due-soon status ring, animated occupancy meter, live speed (mph), compass heading, distance from you, vehicle/operator line, plus **Follow this bus**, **Walk me there (AR)**, **Show on map** and **Share** actions.
-- **Smarter map markers**: occupancy-tinted circular badges with a direction arrow that rotates without spinning the label, tap-through to the full details sheet, and automatic cleanup of buses that go offline.
+- **Bus pictogram markers**: every live vehicle is drawn as a blue bus illustration with an occupancy-coloured route chip and a soft glow, and buses that go offline are cleaned up automatically.
+- **Anchored bus card**: tapping a bus opens a white card pinned to that bus showing the route ("4 to Orchard Park"), the vehicle/operator, the live arrival estimate and how fresh the data is — tap it for the full details sheet.
 - **Follow mode**: keeps the map (or AR guidance) locked on a bus as it moves.
+- **Nearby tab**: lists the live buses and bus stops closest to you, sorted by straight-line distance, with each bus's next-stop arrival and occupancy; tap a bus for the full details sheet or a stop to jump the map to it.
 - **Live status & count pills**: see how many buses are tracked and what the BODS poller is doing at a glance; tap the count pill for a "buses live now" list.
 - **Route shortcut chips**: one-tap filtering to the busiest routes, plus an All chip.
-- **Night mode**: toggle in the zoom stack inverts the web map into a dark theme (persisted between launches).
+- **Night mode**: the sun/moon button in the map control stack inverts the web map into a dark theme (persisted between launches), next to a layers button for standard, satellite and dark map styles.
 
 ## Features
 
@@ -19,8 +21,10 @@ A map-first Android wrapper for [bustimes.org](https://bustimes.org/) focused on
 - Native **locate me** button that asks for Android location permission and recentres the live map on the user's current position.
 - Native refresh button to reload the live map and request an immediate BODS vehicle refresh.
 - Smart voice navigation with Android `SpeechRecognizer`: say a route number to zoom to that live bus or filter the map.
-- Native **+ / −** zoom controls and night-mode toggle, always visible on top of the map.
-- Injected WebView styles to remove common ad containers from the map page.
+- **Nearby** screen with a GPS-sorted list of live buses (operator, next-stop arrival, occupancy, distance) and OpenStreetMap bus stops within 800 m, both refreshed while the tab is open and stopped when you leave it.
+- Native map control stack — zoom in, zoom out, locate, layers, day/night and refresh — drawn as crisp vector icons and always visible on top of the map.
+- Injected WebView styles that strip ad containers, the site's yellow header/search bar, its own zoom/locate/layer buttons and its popups, leaving only the clean map.
+- **No invented data**: every label comes from bustimes.org, BODS SIRI-VM or OpenStreetMap, and rows with no data are hidden instead of being filled with placeholder text.
 
 ### Location-Based AR Bus Stop Finder (overhauled)
 
@@ -33,7 +37,7 @@ A map-first Android wrapper for [bustimes.org](https://bustimes.org/) focused on
 - **Arrival banner + haptic** when you reach your target stop.
 - **Target chip** showing name, live distance and estimated walking minutes.
 - Corrected **camera aspect ratio** (picks a sensor-matched preview size so the feed is never stretched).
-- Live camera preview, rotation-vector sensor fusion, true-north magnetic declination correction, GPS accuracy lock with a 5-second **Bypass Calibration** fallback, smoothed updates, a force-rendered neon navigation wall, Future HUD, X-Ray Ghost Bus silhouettes, Virtual AR Bus Shelter hints, and AI Delay Predictor explanations.
+- Live camera preview, rotation-vector sensor fusion, true-north magnetic declination correction, GPS accuracy lock with a 5-second **Bypass Calibration** fallback, smoothed updates, a force-rendered neon navigation wall, Future HUD, X-Ray Ghost Bus silhouettes and Virtual AR Bus Shelter hints.
 - Optional Google walking-directions route ribbon when a `GOOGLE_DIRECTIONS_API_KEY` is supplied (on-device direct hint otherwise).
 
 ### Live BODS tracking

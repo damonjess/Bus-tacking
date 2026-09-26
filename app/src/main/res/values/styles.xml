@@ -1,0 +1,13 @@
+<resources>
+
+    <!-- The app draws its own dark "Bus Times Live" top bar, so suppress the
+         framework ActionBar (which otherwise adds a second title above it). -->
+    <style name="Theme.BusTimesLive" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/brand_ink</item>
+        <item name="android:statusBarColor">@color/brand_ink</item>
+        <item name="android:navigationBarColor">@color/brand_ink</item>
+        <item name="android:colorPrimary">@color/brand_ink</item>
+        <item name="android:colorAccent">@color/brand_blue</item>
+    </style>
+
+</resources>

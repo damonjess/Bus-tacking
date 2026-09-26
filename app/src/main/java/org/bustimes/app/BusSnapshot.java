@@ -3,7 +3,7 @@ package org.bustimes.app;
 import java.util.Locale;
 
 /** Immutable view-model for the bus details bottom sheet. */
-final class BusSnapshot {
+public final class BusSnapshot {
     final String busId;
     final String lineName;
     final String lineRef;
@@ -21,18 +21,19 @@ final class BusSnapshot {
     final String arrivalStopName;
     /** Optional vehicle registration surfaced from hijacked site popups. */
     String regOverride = "";
+    /** Pre-formatted "Updated 50 seconds ago" line supplied by the activity. */
+    String updatedOverride = "";
 
     BusSnapshot(String busId, String lineName, String lineRef, String destinationName, String occupancy,
             String vehicleId, String lastSeen, String operatorName, String distanceText,
             double latitude, double longitude, float bearing, float speedKph,
             int expectedEtaMinutes, String arrivalStopName) {
         this.busId = busId;
-        this.lineName = lineName == null || lineName.trim().isEmpty() ? "Bus" : lineName.trim();
+        this.lineName = lineName == null ? "" : lineName.trim();
         this.lineRef = lineRef == null ? "" : lineRef.trim();
-        this.destinationName = destinationName == null || destinationName.trim().isEmpty()
-                ? "destination unknown" : destinationName.trim();
+        this.destinationName = destinationName == null ? "" : destinationName.trim();
         this.occupancy = occupancy == null || occupancy.trim().isEmpty() ? "Information Unknown" : occupancy.trim();
-        this.vehicleId = vehicleId == null || vehicleId.trim().isEmpty() ? "—" : vehicleId.trim();
+        this.vehicleId = vehicleId == null ? "" : vehicleId.trim();
         this.lastSeen = lastSeen == null ? "" : lastSeen.trim();
         this.operatorName = operatorName == null ? "" : operatorName.trim();
         this.distanceText = distanceText == null ? "" : distanceText.trim();
@@ -41,8 +42,18 @@ final class BusSnapshot {
         this.bearing = bearing;
         this.speedKph = speedKph;
         this.expectedEtaMinutes = expectedEtaMinutes;
-        this.arrivalStopName = arrivalStopName == null || arrivalStopName.trim().isEmpty()
-                ? "its next stop" : arrivalStopName.trim();
+        this.arrivalStopName = arrivalStopName == null ? "" : arrivalStopName.trim();
+    }
+
+    /** Human readable "Updated …" line, empty when nothing is known yet. */
+    String updatedText() {
+        if (updatedOverride != null && !updatedOverride.isEmpty()) {
+            return updatedOverride;
+        }
+        if (lastSeen.isEmpty() || "Unknown".equalsIgnoreCase(lastSeen)) {
+            return "";
+        }
+        return "Updated " + lastSeen;
     }
 
     String speedText() {
@@ -54,7 +65,7 @@ final class BusSnapshot {
 
     String compassBearingText() {
         if (Float.isNaN(bearing) || bearing < 0f) {
-            return "—";
+            return "";
         }
         String[] compass = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
         int index = (int) Math.floor(((bearing % 360f) + 22.5f) / 45f) % 8;
