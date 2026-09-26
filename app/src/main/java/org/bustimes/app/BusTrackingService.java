@@ -5,29 +5,24 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.IBinder;
 import android.text.TextUtils;
+import android.util.JsonReader;
 import android.util.Log;
+import android.util.Xml;
 
-import org.w3c.dom.Document;
-import org.w3c.dom.Element;
-import org.w3c.dom.Node;
-import org.w3c.dom.NodeList;
-import org.json.JSONArray;
-import org.json.JSONObject;
+import org.xmlpull.v1.XmlPullParser;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
+import java.io.BufferedInputStream;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.util.ArrayList;
-import java.util.List;
+import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-
-import javax.xml.parsers.DocumentBuilderFactory;
+import java.util.zip.ZipInputStream;
 
 public class BusTrackingService extends Service {
     static final String ACTION_BUS_POSITION = "org.bustimes.app.action.BUS_POSITION";
@@ -35,6 +30,7 @@ public class BusTrackingService extends Service {
     static final String ACTION_REFRESH_NOW = "org.bustimes.app.action.REFRESH_NOW";
     static final String ACTION_START_MAP_TRACKING = "org.bustimes.app.action.START_MAP_TRACKING";
     static final String ACTION_STOP_MAP_TRACKING = "org.bustimes.app.action.STOP_MAP_TRACKING";
+    public static final String ACTION_CLEAR_TRACKING = "org.bustimes.app.CLEAR_TRACKING";
     static final String EXTRA_STATUS_MESSAGE = "status_message";
 
     private static final String TAG = "BusTrackingService";
@@ -64,7 +60,7 @@ public class BusTrackingService extends Service {
         }
 
         if (TextUtils.isEmpty(BuildConfig.BODS_API_KEY)) {
-            broadcastStatus("Add a BODS_API_KEY GitHub secret or Gradle property to enable live BODS tracking.");
+            broadcastStatus("Add a BODS_API_KEY to enable live tracking.");
             return START_NOT_STICKY;
         }
 
@@ -85,9 +81,7 @@ public class BusTrackingService extends Service {
             return;
         }
         pollingFuture = executorService.scheduleWithFixedDelay(this::pollBodsVehicleLocations,
-                0,
-                POLL_INTERVAL_SECONDS,
-                TimeUnit.SECONDS);
+                0, POLL_INTERVAL_SECONDS, TimeUnit.SECONDS);
     }
 
     private void stopPolling() {
@@ -112,33 +106,55 @@ public class BusTrackingService extends Service {
     }
 
     private void pollBodsVehicleLocations() {
+        HttpURLConnection connection = null;
         try {
             URL url = new URL(buildBodsUrl());
-            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection = (HttpURLConnection) url.openConnection();
             connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
             connection.setReadTimeout(READ_TIMEOUT_MS);
             connection.setRequestMethod("GET");
             connection.setRequestProperty("Accept", "application/json,application/xml,text/xml,*/*");
+            connection.setRequestProperty("User-Agent", "BusTimesApp/1.0");
 
             int responseCode = connection.getResponseCode();
             if (responseCode < 200 || responseCode >= 300) {
                 broadcastStatus(String.format(Locale.UK, "BODS request failed: HTTP %d", responseCode));
-                connection.disconnect();
                 return;
             }
 
-            try (InputStream stream = connection.getInputStream()) {
-                List<BusPosition> positions = parseSiriVehiclePositions(stream);
-                for (BusPosition position : positions) {
-                    broadcastPosition(position);
+            try (BufferedInputStream bufferedStream = new BufferedInputStream(connection.getInputStream())) {
+                bufferedStream.mark(512);
+                int firstByte;
+                do {
+                    firstByte = bufferedStream.read();
+                } while (firstByte != -1 && Character.isWhitespace((char) firstByte));
+                bufferedStream.reset();
+
+                int count;
+                if (firstByte == 0x50) { // 'P' in PK
+                    ZipInputStream zis = new ZipInputStream(bufferedStream);
+                    if (zis.getNextEntry() != null) {
+                        broadcastClear();
+                        count = parseXmlStreaming(zis);
+                    } else {
+                        count = 0;
+                    }
+                } else if (firstByte == '{' || firstByte == '[') {
+                    broadcastClear();
+                    count = parseJsonStreaming(bufferedStream);
+                } else {
+                    broadcastClear();
+                    count = parseXmlStreaming(bufferedStream);
                 }
-                broadcastStatus(String.format(Locale.UK, "Updated %d BODS vehicle positions", positions.size()));
-            } finally {
-                connection.disconnect();
+                broadcastStatus(String.format(Locale.UK, "Updated %d BODS vehicle positions", count));
             }
         } catch (Exception exception) {
-            Log.w(TAG, "Unable to poll BODS SIRI-VM feed", exception);
-            broadcastStatus("Unable to update BODS vehicle positions: " + exception.getMessage());
+            Log.w(TAG, "Stream processing error", exception);
+            broadcastStatus("BODS sync failed: " + exception.getMessage());
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
         }
     }
 
@@ -151,162 +167,129 @@ public class BusTrackingService extends Service {
         return builder.build().toString();
     }
 
-    private List<BusPosition> parseSiriVehiclePositions(InputStream stream) throws Exception {
-        byte[] body = readAllBytes(stream);
-        String payload = new String(body, "UTF-8").trim();
-        if (payload.startsWith("{") || payload.startsWith("[")) {
-            return parseJsonVehiclePositions(payload);
-        }
-        return parseXmlVehiclePositions(body);
-    }
+    private int parseXmlStreaming(InputStream stream) throws Exception {
+        XmlPullParser parser = Xml.newPullParser();
+        parser.setInput(stream, null);
+        int eventType = parser.getEventType();
+        int count = 0;
 
-    private List<BusPosition> parseXmlVehiclePositions(byte[] body) throws Exception {
-        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-        factory.setNamespaceAware(true);
-        Document document = factory.newDocumentBuilder().parse(new ByteArrayInputStream(body));
-        NodeList activities = document.getElementsByTagNameNS("*", "VehicleActivity");
-        List<BusPosition> positions = new ArrayList<>();
+        String id = "", lineName = "", lineRef = "", destination = "", eta = "", recordedAt = "", occupancy = "", operator = "";
+        double latitude = Double.NaN, longitude = Double.NaN;
+        float bearing = Float.NaN;
 
-        for (int i = 0; i < activities.getLength(); i++) {
-            Node item = activities.item(i);
-            if (!(item instanceof Element)) {
-                continue;
-            }
-
-            Element activity = (Element) item;
-            Element journey = firstChild(activity, "MonitoredVehicleJourney");
-            Element location = journey == null ? null : firstChild(journey, "VehicleLocation");
-            if (journey == null || location == null) {
-                continue;
-            }
-
-            String latitudeText = text(location, "Latitude");
-            String longitudeText = text(location, "Longitude");
-            if (TextUtils.isEmpty(latitudeText) || TextUtils.isEmpty(longitudeText)) {
-                continue;
-            }
-
-            double latitude = Double.parseDouble(latitudeText);
-            double longitude = Double.parseDouble(longitudeText);
-            String vehicleRef = text(journey, "VehicleRef");
-            String datedJourneyRef = text(journey, "DatedVehicleJourneyRef");
-            String lineRef = text(journey, "LineRef");
-            String lineName = text(journey, "PublishedLineName");
-            String destinationName = text(journey, "DestinationName");
-            String operatorName = text(journey, "OperatorRef");
-            String expectedArrivalTime = firstNonEmpty(text(journey, "ExpectedArrivalTime"), text(journey, "AimedArrivalTime"));
-            String id = firstNonEmpty(vehicleRef, datedJourneyRef, lineRef + ":" + i);
-            float bearing = parseFloat(text(journey, "Bearing"), Float.NaN);
-            String recordedAt = text(activity, "RecordedAtTime");
-            String occupancy = normalizeOccupancy(firstNonEmpty(
-                    text(journey, "OccupancyStatus"),
-                    text(journey, "Occupancy"),
-                    text(journey, "VehicleOccupancy"),
-                    text(journey, "PassengerCount"),
-                    text(activity, "OccupancyStatus"),
-                    text(activity, "Occupancy")));
-
-            positions.add(new BusPosition(id, firstNonEmpty(lineName, lineRef, "Bus"), lineRef, destinationName,
-                    expectedArrivalTime, latitude, longitude, bearing, recordedAt, occupancy, operatorName));
-        }
-
-        return positions;
-    }
-
-    private List<BusPosition> parseJsonVehiclePositions(String payload) throws Exception {
-        List<BusPosition> positions = new ArrayList<>();
-        Object root = payload.startsWith("[") ? new JSONArray(payload) : new JSONObject(payload);
-        collectJsonVehicleActivities(root, positions);
-        return positions;
-    }
-
-    private void collectJsonVehicleActivities(Object node, List<BusPosition> positions) throws Exception {
-        if (node instanceof JSONObject) {
-            JSONObject object = (JSONObject) node;
-            JSONObject journey = object.optJSONObject("MonitoredVehicleJourney");
-            if (journey != null) {
-                BusPosition position = positionFromJsonVehicleActivity(object, journey, positions.size());
-                if (position != null) {
-                    positions.add(position);
+        while (eventType != XmlPullParser.END_DOCUMENT) {
+            String tagName = parser.getName();
+            if (eventType == XmlPullParser.START_TAG) {
+                if ("VehicleActivity".equalsIgnoreCase(tagName)) {
+                    id = ""; lineName = ""; lineRef = ""; destination = ""; eta = "";
+                    recordedAt = ""; occupancy = ""; operator = "";
+                    latitude = Double.NaN; longitude = Double.NaN; bearing = Float.NaN;
+                } else if ("RecordedAtTime".equalsIgnoreCase(tagName)) {
+                    recordedAt = parser.nextText();
+                } else if ("VehicleRef".equalsIgnoreCase(tagName)) {
+                    id = parser.nextText();
+                } else if ("PublishedLineName".equalsIgnoreCase(tagName)) {
+                    lineName = parser.nextText();
+                } else if ("LineRef".equalsIgnoreCase(tagName)) {
+                    lineRef = parser.nextText();
+                } else if ("DestinationName".equalsIgnoreCase(tagName)) {
+                    destination = parser.nextText();
+                } else if ("OperatorRef".equalsIgnoreCase(tagName)) {
+                    operator = parser.nextText();
+                } else if ("ExpectedArrivalTime".equalsIgnoreCase(tagName)) {
+                    eta = parser.nextText();
+                } else if ("Bearing".equalsIgnoreCase(tagName)) {
+                    bearing = parseFloat(parser.nextText(), Float.NaN);
+                } else if ("Latitude".equalsIgnoreCase(tagName)) {
+                    latitude = parseDouble(parser.nextText(), Double.NaN);
+                } else if ("Longitude".equalsIgnoreCase(tagName)) {
+                    longitude = parseDouble(parser.nextText(), Double.NaN);
+                } else if ("OccupancyStatus".equalsIgnoreCase(tagName) || "Occupancy".equalsIgnoreCase(tagName)) {
+                    occupancy = normalizeOccupancy(parser.nextText());
+                }
+            } else if (eventType == XmlPullParser.END_TAG) {
+                if ("VehicleActivity".equalsIgnoreCase(tagName)) {
+                    if (!Double.isNaN(latitude) && !Double.isNaN(longitude)) {
+                        String busId = !TextUtils.isEmpty(id) ? id : lineRef + ":" + count;
+                        broadcastPosition(new BusPosition(busId, firstNonEmpty(lineName, lineRef, "Bus"),
+                                lineRef, destination, eta, latitude, longitude, bearing, recordedAt, occupancy, operator));
+                        count++;
+                    }
                 }
             }
-            JSONArray names = object.names();
-            if (names == null) {
-                return;
-            }
-            for (int i = 0; i < names.length(); i++) {
-                collectJsonVehicleActivities(object.opt(names.getString(i)), positions);
-            }
-        } else if (node instanceof JSONArray) {
-            JSONArray array = (JSONArray) node;
-            for (int i = 0; i < array.length(); i++) {
-                collectJsonVehicleActivities(array.opt(i), positions);
-            }
+            eventType = parser.next();
         }
+        return count;
     }
 
-    private BusPosition positionFromJsonVehicleActivity(JSONObject activity, JSONObject journey, int index) {
-        JSONObject location = journey.optJSONObject("VehicleLocation");
-        if (location == null) {
-            return null;
+    private int parseJsonStreaming(InputStream stream) throws Exception {
+        JsonReader reader = new JsonReader(new InputStreamReader(stream, StandardCharsets.UTF_8));
+        int count = 0;
+        reader.beginObject();
+        while (reader.hasNext()) {
+            String name = reader.nextName();
+            if ("activities".equalsIgnoreCase(name) || "VehicleActivity".equalsIgnoreCase(name) || "data".equalsIgnoreCase(name)) {
+                reader.beginArray();
+                while (reader.hasNext()) {
+                    BusPosition pos = readJsonVehicle(reader, count);
+                    if (pos != null) {
+                        broadcastPosition(pos);
+                        count++;
+                    }
+                }
+                reader.endArray();
+            } else {
+                reader.skipValue();
+            }
         }
-        double latitude = location.optDouble("Latitude", Double.NaN);
-        double longitude = location.optDouble("Longitude", Double.NaN);
+        reader.endObject();
+        return count;
+    }
+
+    private BusPosition readJsonVehicle(JsonReader reader, int index) throws Exception {
+        String id = "", lineName = "", lineRef = "", destination = "", eta = "", recordedAt = "", occupancy = "", operator = "";
+        double latitude = Double.NaN, longitude = Double.NaN;
+        float bearing = Float.NaN;
+
+        reader.beginObject();
+        while (reader.hasNext()) {
+            String key = reader.nextName();
+            if ("RecordedAtTime".equalsIgnoreCase(key)) {
+                recordedAt = reader.nextString();
+            } else if ("MonitoredVehicleJourney".equalsIgnoreCase(key)) {
+                reader.beginObject();
+                while (reader.hasNext()) {
+                    String jKey = reader.nextName();
+                    if ("VehicleRef".equalsIgnoreCase(jKey)) id = reader.nextString();
+                    else if ("PublishedLineName".equalsIgnoreCase(jKey)) lineName = reader.nextString();
+                    else if ("LineRef".equalsIgnoreCase(jKey)) lineRef = reader.nextString();
+                    else if ("DestinationName".equalsIgnoreCase(jKey)) destination = reader.nextString();
+                    else if ("OperatorRef".equalsIgnoreCase(jKey)) operator = reader.nextString();
+                    else if ("Bearing".equalsIgnoreCase(jKey)) bearing = (float) reader.nextDouble();
+                    else if ("VehicleLocation".equalsIgnoreCase(jKey)) {
+                        reader.beginObject();
+                        while (reader.hasNext()) {
+                            String lKey = reader.nextName();
+                            if ("Latitude".equalsIgnoreCase(lKey)) latitude = reader.nextDouble();
+                            else if ("Longitude".equalsIgnoreCase(lKey)) longitude = reader.nextDouble();
+                            else reader.skipValue();
+                        }
+                        reader.endObject();
+                    } else reader.skipValue();
+                }
+                reader.endObject();
+            } else {
+                reader.skipValue();
+            }
+        }
+        reader.endObject();
+
         if (Double.isNaN(latitude) || Double.isNaN(longitude)) {
             return null;
         }
-
-        String vehicleRef = jsonText(journey, "VehicleRef");
-        String datedJourneyRef = jsonText(journey, "DatedVehicleJourneyRef");
-        String lineRef = jsonText(journey, "LineRef");
-        String lineName = jsonText(journey, "PublishedLineName");
-        String destinationName = jsonText(journey, "DestinationName");
-        String operatorName = jsonText(journey, "OperatorRef");
-        String expectedArrivalTime = firstNonEmpty(jsonText(journey, "ExpectedArrivalTime"), jsonText(journey, "AimedArrivalTime"),
-                jsonNestedText(journey, "MonitoredCall", "ExpectedArrivalTime"));
-        String id = firstNonEmpty(vehicleRef, datedJourneyRef, lineRef + ":" + index);
-        float bearing = parseFloat(jsonText(journey, "Bearing"), Float.NaN);
-        String recordedAt = jsonText(activity, "RecordedAtTime");
-        String occupancy = normalizeOccupancy(firstNonEmpty(
-                jsonText(journey, "OccupancyStatus"),
-                jsonText(journey, "Occupancy"),
-                jsonText(journey, "VehicleOccupancy"),
-                jsonText(journey, "PassengerCount"),
-                jsonText(activity, "OccupancyStatus"),
-                jsonText(activity, "Occupancy"),
-                jsonNestedText(journey, "VehicleJourney", "OccupancyStatus"),
-                jsonNestedText(journey, "VehicleJourney", "Occupancy"),
-                jsonNestedText(activity, "VehicleJourney", "OccupancyStatus"),
-                jsonNestedText(activity, "VehicleJourney", "Occupancy")));
-        return new BusPosition(id, firstNonEmpty(lineName, lineRef, "Bus"), lineRef, destinationName,
-                expectedArrivalTime, latitude, longitude, bearing, recordedAt, occupancy, operatorName);
-    }
-
-    private static String jsonNestedText(JSONObject parent, String objectName, String key) {
-        JSONObject object = parent == null ? null : parent.optJSONObject(objectName);
-        return object == null ? "" : jsonText(object, key);
-    }
-
-    private static String jsonText(JSONObject parent, String key) {
-        if (parent == null || !parent.has(key) || parent.isNull(key)) {
-            return "";
-        }
-        Object value = parent.opt(key);
-        if (value instanceof JSONObject) {
-            JSONObject object = (JSONObject) value;
-            return firstNonEmpty(object.optString("value", ""), object.optString("Value", ""), object.toString());
-        }
-        return String.valueOf(value).trim();
-    }
-
-    private static byte[] readAllBytes(InputStream stream) throws Exception {
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        byte[] buffer = new byte[8192];
-        int read;
-        while ((read = stream.read(buffer)) != -1) {
-            output.write(buffer, 0, read);
-        }
-        return output.toByteArray();
+        String busId = !TextUtils.isEmpty(id) ? id : "bus:" + index;
+        return new BusPosition(busId, firstNonEmpty(lineName, lineRef, "Bus"), lineRef, destination,
+                eta, latitude, longitude, bearing, recordedAt, occupancy, operator);
     }
 
     private void broadcastPosition(BusPosition position) {
@@ -326,6 +309,12 @@ public class BusTrackingService extends Service {
         sendBroadcast(intent);
     }
 
+    private void broadcastClear() {
+        Intent intent = new Intent(ACTION_CLEAR_TRACKING);
+        intent.setPackage(getPackageName());
+        sendBroadcast(intent);
+    }
+
     private void broadcastStatus(String message) {
         Intent intent = new Intent(ACTION_TRACKING_STATUS);
         intent.setPackage(getPackageName());
@@ -333,98 +322,34 @@ public class BusTrackingService extends Service {
         sendBroadcast(intent);
     }
 
-    private static Element firstChild(Element parent, String tagName) {
-        NodeList nodes = parent.getElementsByTagNameNS("*", tagName);
-        if (nodes.getLength() == 0 || !(nodes.item(0) instanceof Element)) {
-            return null;
-        }
-        return (Element) nodes.item(0);
-    }
-
-    private static String text(Element parent, String tagName) {
-        Element child = firstChild(parent, tagName);
-        if (child == null) {
-            return "";
-        }
-        return child.getTextContent().trim();
-    }
-
     private static String firstNonEmpty(String... values) {
         for (String value : values) {
-            if (!TextUtils.isEmpty(value)) {
-                return value;
-            }
+            if (!TextUtils.isEmpty(value)) return value;
         }
         return "";
     }
 
     private static String normalizeOccupancy(String value) {
-        if (TextUtils.isEmpty(value)) {
-            return "Information Unknown";
-        }
-        String lower = value.toLowerCase(Locale.UK).replace("_", "").replace("-", "").replace(" ", "");
-        if (lower.contains("full") || lower.contains("crowded") || lower.contains("noseats")
-                || lower.contains("crushedstandingroomonly") || lower.contains("notacceptingpassengers")
-                || lower.contains("atcapacity") || lower.contains("high")) {
-            return "Full/Crowded";
-        }
-        if (lower.contains("standing") || lower.contains("limited") || lower.contains("fewseatsavailable")
-                || lower.contains("medium") || lower.contains("half")) {
-            return "Standing Room Only";
-        }
-        if (lower.contains("empty") || lower.contains("manyseatsavailable") || lower.contains("seatsavailable")
-                || lower.contains("low") || lower.contains("quiet") || lower.contains("easy")) {
-            return "Easy Seating";
-        }
-        int percentage = parseOccupancyPercentage(value);
-        if (percentage >= 0) {
-            if (percentage > 70) {
-                return "Full/Crowded";
-            }
-            if (percentage >= 40) {
-                return "Standing Room Only";
-            }
-            return "Easy Seating";
-        }
-        try {
-            int passengerCount = Integer.parseInt(value.trim());
-            if (passengerCount >= 45) {
-                return "Full/Crowded";
-            }
-            if (passengerCount >= 20) {
-                return "Standing Room Only";
-            }
-            return "Easy Seating";
-        } catch (NumberFormatException exception) {
-            return "Information Unknown";
-        }
-    }
-
-    private static int parseOccupancyPercentage(String value) {
-        StringBuilder digits = new StringBuilder();
-        for (int i = 0; i < value.length(); i++) {
-            char character = value.charAt(i);
-            if (Character.isDigit(character)) {
-                digits.append(character);
-            } else if (digits.length() > 0) {
-                break;
-            }
-        }
-        if (digits.length() == 0) {
-            return -1;
-        }
-        try {
-            int parsed = Integer.parseInt(digits.toString());
-            return value.contains("%") || parsed <= 100 ? parsed : -1;
-        } catch (NumberFormatException exception) {
-            return -1;
-        }
+        if (TextUtils.isEmpty(value)) return "Information Unknown";
+        String lower = value.toLowerCase(Locale.UK);
+        if (lower.contains("full") || lower.contains("crowded")) return "Full/Crowded";
+        if (lower.contains("standing")) return "Standing Room Only";
+        if (lower.contains("seats") || lower.contains("empty")) return "Easy Seating";
+        return "Information Unknown";
     }
 
     private static float parseFloat(String value, float fallback) {
         try {
             return TextUtils.isEmpty(value) ? fallback : Float.parseFloat(value);
-        } catch (NumberFormatException exception) {
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    private static double parseDouble(String value, double fallback) {
+        try {
+            return TextUtils.isEmpty(value) ? fallback : Double.parseDouble(value);
+        } catch (NumberFormatException e) {
             return fallback;
         }
     }

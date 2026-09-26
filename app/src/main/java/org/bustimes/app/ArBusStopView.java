@@ -2,13 +2,16 @@ package org.bustimes.app;
 
 import android.Manifest;
 import android.annotation.SuppressLint;
+import android.app.Activity;
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.pm.PackageManager;
 import android.graphics.BlurMaskFilter;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Path;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.SurfaceTexture;
 import android.graphics.Typeface;
@@ -67,7 +70,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
     private static final float HALF_FOV_DEGREES = 32f;      // approximate horizontal half-FOV
     private static final int EDGE_CHEVRON_INSET_DP = 18;
     private static final float STOPS_FETCH_RADIUS_METERS = 150f;
-    private static final float OVERPASS_SEARCH_RADIUS_METERS = 800f;
+    private static final float OVERPASS_SEARCH_RADIUS_METERS = 10000f;
     private static final float ARRIVAL_DISTANCE_METERS = 40f;
     private static final int MAX_VISIBLE_STOPS = 8;
 
@@ -220,12 +223,12 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             // Walk the context chain to the hosting Activity and trigger its back handling,
             // which MainActivity maps to "leave AR".
             Context ctx = getContext();
-            while (ctx instanceof android.content.ContextWrapper) {
-                if (ctx instanceof android.app.Activity) {
-                    ((android.app.Activity) ctx).onBackPressed();
+            while (ctx instanceof ContextWrapper) {
+                if (ctx instanceof Activity) {
+                    ((Activity) ctx).onBackPressed();
                     return;
                 }
-                ctx = ((android.content.ContextWrapper) ctx).getBaseContext();
+                ctx = ((ContextWrapper) ctx).getBaseContext();
             }
         });
 
@@ -402,9 +405,10 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
     private List<BusStopPin> fetchNearbyStops(double latitude, double longitude) {
         HttpURLConnection connection = null;
         try {
-            String query = "[out:json][timeout:15];"
-                    + "node(around:" + (int) OVERPASS_SEARCH_RADIUS_METERS + "," + latitude + "," + longitude + ")"
-                    + "[highway=bus_stop];out body " + (MAX_VISIBLE_STOPS * 3) + ";";
+            String query = "[out:json][timeout:15];("
+                    + "node(around:" + (int) OVERPASS_SEARCH_RADIUS_METERS + "," + latitude + "," + longitude + ")[highway=bus_stop];"
+                    + "node(around:" + (int) OVERPASS_SEARCH_RADIUS_METERS + "," + latitude + "," + longitude + ")[public_transport=platform];"
+                    + ");out body " + (MAX_VISIBLE_STOPS * 3) + ";";
             String body = "data=" + URLEncoder.encode(query, "UTF-8");
             connection = (HttpURLConnection) new URL("https://overpass-api.de/api/interpreter").openConnection();
             connection.setRequestMethod("POST");
@@ -637,7 +641,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             if (map == null) {
                 return null;
             }
-            android.graphics.Rect sensorSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+            Rect sensorSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
             double targetAspect = sensorSize != null
                     ? (double) sensorSize.width() / (double) sensorSize.height()
                     : (double) cameraPreview.getWidth() / Math.max(1, cameraPreview.getHeight());
@@ -794,7 +798,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
                 View dot = new View(getContext());
                 dot.setBackground(UiTheme.pill(getContext(), UiTheme.withAlpha(UiTheme.TEAL, 230),
                         UiTheme.withAlpha(Color.WHITE, 160), 1f, 5f));
-                container.addView(dot, new FrameLayout.LayoutParams(
+                container.addView(dot, new LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
                 params.leftMargin = (int) pin.displayedX;
                 params.topMargin = (int) pin.displayedY;
@@ -867,7 +871,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             }
             shown++;
             FrameLayout card = new FrameLayout(getContext());
-            card.addView(createBusBillboardView(billboard), new FrameLayout.LayoutParams(
+            card.addView(createBusBillboardView(billboard), new LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
             card.setOnClickListener(v -> {
                 performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
@@ -956,7 +960,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         body.setBackground(UiTheme.pill(getContext(), UiTheme.withAlpha(UiTheme.INK, 216),
                 UiTheme.withAlpha(color, 200), 1.2f, 14f));
         body.setPadding(dp(10), dp(8), dp(10), dp(8));
-        card.addView(body, new FrameLayout.LayoutParams(
+        card.addView(body, new LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         // Route number bubble overlapping the top-left of the card.
@@ -968,7 +972,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             bubble.setTypeface(Typeface.create("sans-serif-black", Typeface.NORMAL));
             bubble.setGravity(Gravity.CENTER);
             bubble.setBackground(UiTheme.circleGradient(getContext(), color, UiTheme.withAlpha(color, 180)));
-            card.addView(bubble, new FrameLayout.LayoutParams(dp(34), dp(34), Gravity.START | Gravity.TOP) {
+            card.addView(bubble, new LayoutParams(dp(34), dp(34), Gravity.START | Gravity.TOP) {
                 {
                     setMargins(dp(-6), dp(-12), 0, 0);
                 }

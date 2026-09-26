@@ -16,6 +16,7 @@ import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.Color;
+import android.graphics.Outline;
 import android.graphics.PorterDuff;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -42,6 +43,7 @@ import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewOutlineProvider;
 import android.view.Window;
 import android.view.inputmethod.EditorInfo;
 import android.webkit.CookieManager;
@@ -58,6 +60,7 @@ import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
@@ -100,7 +103,7 @@ public class MainActivity extends Activity {
     private static final int AUDIO_PERMISSION_REQUEST = 1003;
     private static final int CAMERA_PERMISSION_REQUEST = 1004;
     private static final int NEARBY_PERMISSION_REQUEST = 1005;
-    private static final float NEARBY_STOP_RADIUS_METERS = 800f;
+    private static final float NEARBY_STOP_RADIUS_METERS = 10000f;
     private static final String SAVED_URL = "saved_url";
     private static final String MAP_URL = "https://bustimes.org/map";
     private static final String SEARCH_URL = "https://bustimes.org/search?q=";
@@ -468,7 +471,7 @@ public class MainActivity extends Activity {
 
     // ================= ON-MAP BUS CARD =================
 
-    /** Floating white bus card pinned to the tapped bus, like the reference mock-up. */
+    /** Floating white bus card pinned to the tapped bus, matching reference style. */
     private FrameLayout buildMapBusCard() {
         FrameLayout wrapper = new FrameLayout(this);
         wrapper.setClipChildren(false);
@@ -481,9 +484,10 @@ public class MainActivity extends Activity {
 
         GradientDrawable background = new GradientDrawable();
         background.setColor(Color.WHITE);
-        background.setCornerRadius(dp(18));
+        background.setCornerRadius(dp(16));
+        background.setStroke(dp(1), Color.rgb(226, 232, 240));
         card.setBackground(background);
-        card.setElevation(dp(12));
+        card.setElevation(dp(10));
         int padHorizontal = dp(14);
         int padTop = dp(14);
         card.setPadding(padHorizontal, padTop, padHorizontal, dp(0));
@@ -491,42 +495,42 @@ public class MainActivity extends Activity {
         card.setContentDescription("Live bus summary, tap for full details");
         card.setOnClickListener(v -> openCardDetails());
 
-        // Header
+        // Header: Thumbnail + Title/Subtitle
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
 
-        // Thumbnail
-        FrameLayout thumb = new FrameLayout(this);
-        GradientDrawable thumbBackground = new GradientDrawable();
-        thumbBackground.setColor(Color.rgb(238, 242, 246));
-        thumbBackground.setCornerRadius(dp(10));
-        thumb.setBackground(thumbBackground);
+        // Bus Icon Thumbnail
+        ImageView cardThumbView = new ImageView(this);
+        cardThumbView.setImageResource(R.drawable.ic_bus_marker);
+        cardThumbView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        cardThumbView.setClipToOutline(true);
+        cardThumbView.setOutlineProvider(new ViewOutlineProvider() {
+            @Override
+            public void getOutline(View view, Outline outline) {
+                outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), dp(10));
+            }
+        });
 
-        IconView thumbIcon = new IconView(this, IconView.BUS);
-        thumbIcon.setIconColor(UiTheme.BLUE);
-        thumbIcon.setAccentColor(Color.WHITE);
-        thumb.addView(thumbIcon, new FrameLayout.LayoutParams(dp(44), dp(36), Gravity.CENTER));
-
-        LinearLayout.LayoutParams thumbParams = new LinearLayout.LayoutParams(dp(50), dp(42));
+        LinearLayout.LayoutParams thumbParams = new LinearLayout.LayoutParams(dp(48), dp(48));
         thumbParams.rightMargin = dp(12);
-        header.addView(thumb, thumbParams);
+        header.addView(cardThumbView, thumbParams);
 
-        // Title & Subtitle
+        // Title & Subtitle Container
         LinearLayout texts = new LinearLayout(this);
         texts.setOrientation(LinearLayout.VERTICAL);
 
         cardTitleView = new TextView(this);
-        cardTitleView.setTextColor(Color.rgb(15, 23, 42));
-        cardTitleView.setTextSize(15.5f);
+        cardTitleView.setTextColor(Color.rgb(15, 23, 42)); // #0F172A
+        cardTitleView.setTextSize(16f);
         cardTitleView.setSingleLine(true);
         cardTitleView.setEllipsize(TextUtils.TruncateAt.END);
         cardTitleView.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         texts.addView(cardTitleView);
 
         cardSubtitleView = new TextView(this);
-        cardSubtitleView.setTextColor(Color.rgb(100, 116, 139));
-        cardSubtitleView.setTextSize(12.5f);
+        cardSubtitleView.setTextColor(Color.rgb(71, 85, 105)); // #475569
+        cardSubtitleView.setTextSize(13.5f);
         cardSubtitleView.setSingleLine(true);
         cardSubtitleView.setEllipsize(TextUtils.TruncateAt.END);
         LinearLayout.LayoutParams subtitleParams = new LinearLayout.LayoutParams(
@@ -537,30 +541,34 @@ public class MainActivity extends Activity {
         header.addView(texts, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         card.addView(header);
 
-        // Arrival & Updated lines
+        // Arrival Info Line (Centered)
         cardArrivalView = new TextView(this);
-        cardArrivalView.setTextColor(Color.rgb(15, 23, 42));
-        cardArrivalView.setTextSize(13.5f);
+        cardArrivalView.setTextColor(Color.rgb(15, 23, 42)); // #0F172A
+        cardArrivalView.setTextSize(14.5f);
+        cardArrivalView.setGravity(Gravity.CENTER_HORIZONTAL);
         cardArrivalView.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         LinearLayout.LayoutParams arrivalParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         arrivalParams.topMargin = dp(10);
         card.addView(cardArrivalView, arrivalParams);
 
+        // Updated Line (Centered)
         cardUpdatedView = new TextView(this);
-        cardUpdatedView.setTextColor(Color.rgb(100, 116, 139));
-        cardUpdatedView.setTextSize(12f);
+        cardUpdatedView.setTextColor(Color.rgb(100, 116, 139)); // #64748B
+        cardUpdatedView.setTextSize(12.5f);
+        cardUpdatedView.setGravity(Gravity.CENTER_HORIZONTAL);
         LinearLayout.LayoutParams updatedParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         updatedParams.topMargin = dp(2);
         card.addView(cardUpdatedView, updatedParams);
 
-        // Speech-bubble tail pointing at the bus on the map.
+        // Pointer Tail pointing at the bus marker on the map
         FrameLayout tailRow = new FrameLayout(this);
         View tail = new View(this);
         GradientDrawable tailBackground = new GradientDrawable();
         tailBackground.setColor(Color.WHITE);
         tailBackground.setCornerRadius(dp(2));
+        tailBackground.setStroke(dp(1), Color.rgb(226, 232, 240));
         tail.setBackground(tailBackground);
         tail.setRotation(45f);
         tail.setTranslationY(dp(7));
@@ -570,9 +578,10 @@ public class MainActivity extends Activity {
         tailRowParams.topMargin = dp(4);
         card.addView(tailRow, tailRowParams);
 
-        int cardWidth = Math.min(dp(260), getResources().getDisplayMetrics().widthPixels - dp(28));
+        int cardWidth = Math.min(dp(250), getResources().getDisplayMetrics().widthPixels - dp(28));
         wrapper.addView(card, new FrameLayout.LayoutParams(cardWidth, ViewGroup.LayoutParams.WRAP_CONTENT));
         wrapper.setLayoutParams(new FrameLayout.LayoutParams(cardWidth, ViewGroup.LayoutParams.WRAP_CONTENT));
+        updateMapBusCardStyle();
         return wrapper;
     }
 
@@ -581,6 +590,7 @@ public class MainActivity extends Activity {
         if (mapBusCard == null || json == null) {
             return;
         }
+        updateMapBusCardStyle();
         try {
             JSONObject payload = new JSONObject(json);
             cardAnchorX = (float) payload.optDouble("x", 0d);
@@ -602,59 +612,87 @@ public class MainActivity extends Activity {
             double latitude = parseDouble(payload.optString("lat", ""), Double.NaN);
             double longitude = parseDouble(payload.optString("lng", ""), Double.NaN);
             float bearing = (float) parseDouble(payload.optString("bearing", ""), Float.NaN);
-            float speedKph = (float) parseDouble(payload.optString("speed", ""), 0d);
+            float speedKph = (float) parseDouble(payload.optString("speed", ""), Float.NaN);
 
-            cardTitleView.setText(route.isEmpty() ? destination
-                    : (destination.isEmpty() ? route
-                    : String.format(Locale.UK, "%s to %s", route, destination)));
+            // Format Title: e.g. "4 to Orchard Park" or "Route 36"
+            String routeName = route.trim();
+            String destName = destination.trim();
+            if (!routeName.isEmpty() && !destName.isEmpty()) {
+                cardTitleView.setText(String.format(Locale.UK, "%s to %s", routeName, destName));
+            } else if (!routeName.isEmpty()) {
+                cardTitleView.setText(String.format(Locale.UK, "Route %s", routeName));
+            } else if (!destName.isEmpty()) {
+                cardTitleView.setText(String.format(Locale.UK, "Bus to %s", destName));
+            } else {
+                cardTitleView.setText("Live Bus");
+            }
 
-            // Extract fleet number and registration if formatted together
+            // Format Subtitle: Fleet ID, Registration Plate, or Operator name
             String vId = vehicleId;
-            String vReg = "";
+            String vReg = payload.optString("reg", "").trim();
             int dashIdx = vehicleId.indexOf(" - ");
             if (dashIdx > 0) {
                 vId = vehicleId.substring(0, dashIdx).trim();
-                vReg = vehicleId.substring(dashIdx + 3).trim();
+                if (vReg.isEmpty()) {
+                    vReg = vehicleId.substring(dashIdx + 3).trim();
+                }
             } else if (vehicleId.contains(" ")) {
                 String[] parts = vehicleId.split("\\s+", 2);
                 if (parts.length == 2 && parts[1].length() >= 5) {
                     vId = parts[0].trim();
-                    vReg = parts[1].trim();
+                    if (vReg.isEmpty()) {
+                        vReg = parts[1].trim();
+                    }
                 }
             }
 
-            StringBuilder subtitle = new StringBuilder();
-            if (!vId.isEmpty()) {
-                subtitle.append(vId);
+            if (vId.equalsIgnoreCase(routeName)) {
+                vId = "";
             }
-            if (!vReg.isEmpty()) {
-                if (subtitle.length() > 0) {
-                    subtitle.append(" • ");
-                }
-                subtitle.append(vReg);
+
+            StringBuilder subBuilder = new StringBuilder();
+            if (!vId.isEmpty() && !vReg.isEmpty()) {
+                subBuilder.append(vId).append(" • ").append(vReg);
+            } else if (!vId.isEmpty()) {
+                subBuilder.append("#").append(vId);
+            } else if (!vReg.isEmpty()) {
+                subBuilder.append(vReg);
             } else if (!operator.isEmpty()) {
-                if (subtitle.length() > 0) {
-                    subtitle.append(" • ");
-                }
-                subtitle.append(operator);
+                subBuilder.append(operator);
             }
-            cardSubtitleView.setText(subtitle.toString());
-            cardSubtitleView.setVisibility(subtitle.length() == 0 ? View.GONE : View.VISIBLE);
 
+            if (subBuilder.length() > 0) {
+                cardSubtitleView.setText(subBuilder.toString());
+                cardSubtitleView.setVisibility(View.VISIBLE);
+            } else {
+                cardSubtitleView.setVisibility(View.GONE);
+            }
+
+            // Format Arrival Line: real ETA if available, or straight-line distance, or hide
             String arrivalLine = arrivalText(etaMinutes);
             if (arrivalLine.isEmpty() && !rawEta.isEmpty()) {
-                arrivalLine = rawEta + " until arrival (est.)";
+                arrivalLine = rawEta.contains("min") ? rawEta + " until arrival (est.)" : rawEta + " (est.)";
             }
             if (arrivalLine.isEmpty()) {
-                cardArrivalView.setVisibility(View.GONE);
-            } else {
-                cardArrivalView.setText(arrivalLine);
-                cardArrivalView.setVisibility(View.VISIBLE);
+                String distanceText = computeDistanceText(latitude, longitude);
+                if (!distanceText.isEmpty()) {
+                    arrivalLine = distanceText;
+                }
             }
 
+            if (!arrivalLine.isEmpty()) {
+                cardArrivalView.setText(arrivalLine);
+                cardArrivalView.setVisibility(View.VISIBLE);
+            } else {
+                cardArrivalView.setVisibility(View.GONE);
+            }
+
+            // Format Updated Line: real last seen timestamp if available
             String updatedLine = updatedText(rawLastSeen);
             if (updatedLine.isEmpty()) {
-                if (rawLastSeen.contains("ago") || rawLastSeen.contains("seconds") || rawLastSeen.contains("mins")) {
+                if (rawLastSeen.contains("ago") || rawLastSeen.contains("sec") || rawLastSeen.contains("min")) {
+                    updatedLine = rawLastSeen.startsWith("Updated") ? rawLastSeen : "Updated " + rawLastSeen;
+                } else if (!rawLastSeen.isEmpty() && !"Unknown".equalsIgnoreCase(rawLastSeen)) {
                     updatedLine = "Updated " + rawLastSeen;
                 } else {
                     updatedLine = "Updated live";
@@ -664,8 +702,8 @@ public class MainActivity extends Activity {
             cardUpdatedView.setVisibility(View.VISIBLE);
 
             cardSnapshot = new BusSnapshot(
-                    vId, route, "", destination, occupancy,
-                    vId, rawLastSeen, operator,
+                    vId.isEmpty() ? vehicleId : vId, routeName, "", destName, occupancy,
+                    vId.isEmpty() ? vehicleId : vId, rawLastSeen, operator,
                     computeDistanceText(latitude, longitude), latitude, longitude,
                     bearing, speedKph, etaMinutes, "");
             cardSnapshot.updatedOverride = updatedLine;
@@ -1132,6 +1170,10 @@ public class MainActivity extends Activity {
         nearbyStopsFetchedFrom = new Location(location);
         final double latitude = location.getLatitude();
         final double longitude = location.getLongitude();
+        nearbyStops.clear();
+        if ("nearby".equals(currentTab)) {
+            rebuildNearbyScreen();
+        }
         nearbyExecutor.execute(() -> {
             final List<NearbyStop> fetched = fetchNearbyStops(latitude, longitude);
             nearbyStopsFetching = false;
@@ -1152,9 +1194,11 @@ public class MainActivity extends Activity {
     private List<NearbyStop> fetchNearbyStops(double latitude, double longitude) {
         HttpURLConnection connection = null;
         try {
-            String query = "[out:json][timeout:15];"
-                    + "node(around:" + (int) NEARBY_STOP_RADIUS_METERS + "," + latitude + "," + longitude + ")"
-                    + "[highway=bus_stop];out body 60;";
+            String query = "[out:json][timeout:15];("
+                    + "node(around:" + (int) NEARBY_STOP_RADIUS_METERS + "," + latitude + "," + longitude + ")[highway=bus_stop];"
+                    + "node(around:" + (int) NEARBY_STOP_RADIUS_METERS + "," + latitude + "," + longitude + ")[public_transport=platform];"
+                    + "node(around:" + (int) NEARBY_STOP_RADIUS_METERS + "," + latitude + "," + longitude + ")[highway=platform];"
+                    + ");out body 80;";
             String body = "data=" + URLEncoder.encode(query, "UTF-8");
             connection = (HttpURLConnection) new URL("https://overpass-api.de/api/interpreter").openConnection();
             connection.setRequestMethod("POST");
@@ -1162,6 +1206,7 @@ public class MainActivity extends Activity {
             connection.setReadTimeout(15_000);
             connection.setDoOutput(true);
             connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+            connection.setRequestProperty("User-Agent", "BusTimesApp/1.0");
             try (OutputStream output = connection.getOutputStream()) {
                 output.write(body.getBytes("UTF-8"));
             }
@@ -1262,7 +1307,7 @@ public class MainActivity extends Activity {
         if (buses.isEmpty()) {
             nearbyContent.addView(screenSubtitle(BuildConfig.BODS_API_KEY.isEmpty()
                     ? "Live positions need a BODS API key — see the Account tab."
-                    : "No live buses within " + Math.round(NEARBY_STOP_RADIUS_METERS) + " m right now."));
+                    : "No live buses within " + formatDistance(NEARBY_STOP_RADIUS_METERS * 2f) + " right now."));
         } else {
             for (AnimatedBusMarker bus : buses) {
                 nearbyContent.addView(nearbyBusRow(bus), topMargin(10));
@@ -1273,7 +1318,7 @@ public class MainActivity extends Activity {
         if (nearbyStops.isEmpty()) {
             nearbyContent.addView(screenSubtitle(nearbyStopsFetching
                     ? "Looking for bus stops nearby…"
-                    : "No bus stops found within " + Math.round(NEARBY_STOP_RADIUS_METERS) + " m."));
+                    : "No bus stops found within " + formatDistance(NEARBY_STOP_RADIUS_METERS) + "."));
         } else {
             for (NearbyStop stop : nearbyStops) {
                 nearbyContent.addView(nearbyStopRow(stop), topMargin(10));
@@ -1864,6 +1909,10 @@ public class MainActivity extends Activity {
     }
 
     private void cleanupSiteChrome() {
+        String bodyBg = nightModeEnabled ? "#0b1226" : "#ffffff";
+        String textColor = nightModeEnabled ? "#ffffff" : "#0f172a";
+        String popupBg = nightModeEnabled ? "#101a38" : "#0d1424";
+
         String script = "(function(){"
                 // Kill ads + consent remnants at DOM level.
                 + "var kill='.adsbygoogle,ins.adsbygoogle,[id*=\"google_ads\"],[id*=\"div-gpt-ad\"],"
@@ -1875,18 +1924,22 @@ public class MainActivity extends Activity {
                 + "var style=document.getElementById('bustimes-chrome-hide');"
                 + "if(!style){style=document.createElement('style');style.id='bustimes-chrome-hide';"
                 + "(document.head||document.documentElement||document.body).appendChild(style);}"
-                + "var css='html,body{background:#ffffff !important}';"
+                + "var css='html,body{background:" + bodyBg + " !important;color:" + textColor + " !important}';"
                 + "if((location.pathname||'').indexOf('/map')===0){"
                 + "css+='header,.site-header,.skip{display:none !important}'"
                 + "+'.maplibregl-ctrl-top-left,.maplibregl-ctrl-top-right,.maplibregl-ctrl-bottom-left,.maplibregl-ctrl-bottom-right,'"
                 + "+'.mapboxgl-ctrl-top-left,.mapboxgl-ctrl-top-right,.mapboxgl-ctrl-bottom-left,.mapboxgl-ctrl-bottom-right,'"
                 + "+'[class*=maplibregl-ctrl],[class*=mapboxgl-ctrl],.leaflet-control-container,.leaflet-control,'"
-                + "+'.maplibregl-ctrl-attrib,.mapboxgl-ctrl-attrib,.leaflet-control-attribution{display:none !important}'"
-                + "+'.maplibregl-popup,.mapboxgl-popup,.leaflet-popup{display:none !important}'"
-                + "+'#hugemap,.maplibregl-map,.mapboxgl-map,.maplibregl-canvas{background:#ffffff !important}'"
-                + "+'#hugemap{top:0 !important;height:100% !important;margin-top:0 !important}'"
-                + "+'body{margin-top:0 !important;padding-top:0 !important}';"
+                + "+'.maplibregl-ctrl-attrib,.mapboxgl-ctrl-attrib,.leaflet-control-attribution{display:none !important}';"
                 + "}"
+                + "css+='.maplibregl-popup-content,.mapboxgl-popup-content,.leaflet-popup-content-wrapper{background:" + popupBg + " !important;color:#FFFFFF !important;border-radius:16px !important;padding:14px 18px !important;box-shadow:0 10px 30px rgba(0,0,0,0.6) !important;font-family:sans-serif !important;border:1px solid #24304F !important}';"
+                + "css+='.maplibregl-popup-content *,.mapboxgl-popup-content *,.leaflet-popup-content-wrapper *{color:#FFFFFF !important}';"
+                + "css+='.maplibregl-popup-content a,.mapboxgl-popup-content a,.leaflet-popup-content-wrapper a{color:#00E5FF !important;font-weight:bold !important;text-decoration:underline !important}';"
+                + "css+='.maplibregl-popup-tip,.mapboxgl-popup-tip,.leaflet-popup-tip{border-bottom-color:" + popupBg + " !important;border-top-color:" + popupBg + " !important}';"
+                + "css+='.maplibregl-marker>*:not(.bods-bus-3d-wrapper),.mapboxgl-marker>*:not(.bods-bus-3d-wrapper),.leaflet-marker-icon>*:not(.bods-bus-3d-wrapper){display:inherit}';"
+                + "css+='#hugemap,.maplibregl-map,.mapboxgl-map,.maplibregl-canvas{background:" + bodyBg + " !important}';"
+                + "css+='#hugemap{top:0 !important;height:100% !important;margin-top:0 !important}';"
+                + "css+='body{margin-top:0 !important;padding-top:0 !important}';"
                 + "style.textContent=css;"
                 + "if(!window.__bodsChromeWatch){window.__bodsChromeWatch=setInterval(function(){"
                 + "var s=document.getElementById('bustimes-chrome-hide');"
@@ -1896,40 +1949,77 @@ public class MainActivity extends Activity {
         });
     }
 
-    /** Restyles all map markers (site Mapbox/Leaflet markers and BODS markers) to 3D double deckers and handles card clicks. */
+    /** Restyles vehicle map markers to 3D double deckers with bus numbers, while preserving bus stop pins and stop popups. */
     private void installPopupHijack() {
         String script = "(function(){"
                 + "if(window.__bodsPopupObs)return;window.__bodsPopupObs=true;"
-                + "var busSvg=\"<svg width='60' height='48' viewBox='0 0 60 48' xmlns='http://www.w3.org/2000/svg'>"
-                + "<ellipse cx='30' cy='43' rx='25' ry='4.5' fill='rgba(0,0,0,0.30)'/>"
-                + "<path d='M8 14 L46 10 L52 20 L8 23 Z' fill='#f8fafc'/>"
-                + "<path d='M8 14 L46 10 C48 10, 50 11, 52 13 L52.5 15 L8 16.5 Z' fill='#0288d1'/>"
-                + "<rect x='11' y='15' width='7' height='5.5' rx='1.2' fill='#1e293b' transform='rotate(-2 14.5 17.75)'/>"
-                + "<rect x='20' y='14.2' width='7' height='5.5' rx='1.2' fill='#1e293b' transform='rotate(-2 23.5 16.95)'/>"
-                + "<rect x='29' y='13.4' width='7' height='5.5' rx='1.2' fill='#1e293b' transform='rotate(-2 32.5 16.15)'/>"
-                + "<path d='M38 12.6 L49 11.6 L50.5 18 L38 18.8 Z' fill='#0f172a'/>"
-                + "<path d='M7.5 23 L52 20 L52.5 23 L7.2 26 Z' fill='#0288d1'/>"
-                + "<path d='M7.2 26 L52.5 23 L51 37 L6.5 39 Z' fill='#d32f2f'/>"
-                + "<rect x='10' y='27.5' width='7' height='6' rx='1.2' fill='#1e293b' transform='rotate(-2 13.5 30.5)'/>"
-                + "<rect x='19' y='26.7' width='7' height='6' rx='1.2' fill='#1e293b' transform='rotate(-2 22.5 29.7)'/>"
-                + "<rect x='28' y='25.9' width='7' height='6' rx='1.2' fill='#1e293b' transform='rotate(-2 31.5 28.9)'/>"
-                + "<path d='M37 25.1 L49.5 24.1 L48.8 32 L37 31.8 Z' fill='#0f172a'/>"
-                + "<circle cx='48.5' cy='34.2' r='1.8' fill='#ffeb3b'/>"
-                + "<rect x='42' y='35.2' width='6' height='2' rx='1' fill='#334155' transform='rotate(-3 45 36.2)'/>"
-                + "<circle cx='15' cy='38.5' r='4.5' fill='#0f172a'/>"
-                + "<circle cx='15' cy='38.5' r='1.8' fill='#94a3b8'/>"
-                + "<circle cx='39' cy='36.5' r='4.5' fill='#0f172a'/>"
-                + "<circle cx='39' cy='36.5' r='1.8' fill='#94a3b8'/>"
+                + "var busSvg=\"<svg width='40' height='40' viewBox='0 0 40 40' xmlns='http://www.w3.org/2000/svg'>"
+                + "<path fill='#101A38' d='M20,2C11.16,2 4,9.16 4,18c0,11.25 14.5,19.25 15.35,19.72a1.32,1.32 0,0 0,1.3 0C21.5,37.25 36,29.25 36,18 36,9.16 28.84,2 20,2z'/>"
+                + "<path stroke='#2E7CF6' stroke-width='1.5' fill='none' d='M20,2C11.16,2 4,9.16 4,18c0,11.25 14.5,19.25 15.35,19.72a1.32,1.32 0,0 0,1.3 0C21.5,37.25 36,29.25 36,18 36,9.16 28.84,2 20,2z'/>"
+                + "<path fill='#FFFFFF' d='M13,9h14c1.66,0 3,1.34 3,3v10c0,1.3 -0.84,2.4 -2,2.82V26c0,0.55 -0.45,1 -1,1h-1c-0.55,0 -1,-0.45 -1,-1v-1h-10v1c0,0.55 -0.45,1 -1,1h-1c-0.55,0 -1,-0.45 -1,-1v-1.18C11.84,24.4 11,23.3 11,22V12c0,-1.66 1.34,-3 3,-3z'/>"
+                + "<path fill='#2E7CF6' d='M13,12h14v5h-14z'/>"
+                + "<circle cx='13.5' cy='21' r='1.5' fill='#FFB300'/>"
+                + "<circle cx='26.5' cy='21' r='1.5' fill='#FFB300'/>"
                 + "</svg>\";"
+                + "function isBusStop(el){"
+                + "if(!el)return false;"
+                + "if(el.classList.contains('native-bods-bus-marker'))return false;"
+                + "var outer=(el.outerHTML||'').toLowerCase();"
+                + "var title=(el.getAttribute('title')||el.getAttribute('aria-label')||'').toLowerCase();"
+                + "return outer.indexOf('/stops/')!==-1||outer.indexOf('bus-stop')!==-1||outer.indexOf('stop-marker')!==-1||title.indexOf('stop')!==-1;"
+                + "}"
+                + "function extractRouteFromEl(el){"
+                + "if(!el||isBusStop(el))return '';"
+                + "if(el.dataset.route&&el.dataset.route.trim())return el.dataset.route.trim();"
+                + "if(el.dataset.line&&el.dataset.line.trim())return el.dataset.line.trim();"
+                + "var nodes=el.querySelectorAll('span,div,text,b,strong,p');"
+                + "for(var i=0;i<nodes.length;i++){"
+                + "var txt=(nodes[i].textContent||'').trim();"
+                + "if(txt&&txt.length<=6&&/^[A-Za-z0-9]+$/i.test(txt)){return txt;}"
+                + "}"
+                + "var title=(el.getAttribute('title')||el.getAttribute('aria-label')||el.textContent||el.innerText||'').trim();"
+                + "if(!title)return '';"
+                + "var m1=title.match(/^([A-Za-z0-9]{1,6})\\s+to\\s+/i);"
+                + "if(m1)return m1[1];"
+                + "var m2=title.match(/^([A-Za-z0-9]{1,6})\\s*[\\-\\u2013\\u2014]/);"
+                + "if(m2)return m2[1];"
+                + "var m3=title.match(/(?:route|line|service)\\s*([A-Za-z0-9]{1,6})\\b/i);"
+                + "if(m3)return m3[1];"
+                + "var m4=title.match(/\\b([0-9]{1,4}[A-Za-z]{0-2}|[A-Za-z]{1,3}[0-9]{1,4}[A-Za-z]?)\\b/);"
+                + "if(m4)return m4[1];"
+                + "var m5=title.match(/^([A-Za-z0-9]{1,6})\\b/);"
+                + "if(m5)return m5[1];"
+                + "return '';"
+                + "}"
+                + "function updateMarkerChip(el,route){"
+                + "if(!el||!route)return;"
+                + "el.dataset.route=route;"
+                + "var chip=el.querySelector('.bods-chip');"
+                + "if(chip){"
+                + "chip.textContent=route;"
+                + "chip.style.display='block';"
+                + "}"
+                + "}"
                 + "function styleAndHookMarker(el){"
-                + "if(!el||el.dataset.bodsHooked)return;"
+                + "if(!el||isBusStop(el))return;"
+                + "var route=extractRouteFromEl(el);"
+                + "if(route)el.dataset.route=route;"
+                + "if(!el.dataset.bodsHooked){"
                 + "el.dataset.bodsHooked='true';"
                 + "if(!el.classList.contains('native-bods-bus-marker')){"
-                + "el.style.width='60px';el.style.height='48px';el.style.cursor='pointer';"
+                + "el.style.width='40px';el.style.height='40px';el.style.cursor='pointer';"
                 + "var wrapper=document.createElement('div');"
                 + "wrapper.className='bods-bus-3d-wrapper';"
-                + "wrapper.style.cssText='position:relative;width:60px;height:48px;filter:drop-shadow(0 4px 6px rgba(0,0,0,.45));pointer-events:auto;';"
+                + "wrapper.style.cssText='position:relative;width:40px;height:40px;filter:drop-shadow(0 4px 6px rgba(0,0,0,.45));pointer-events:auto;';"
                 + "wrapper.innerHTML=busSvg;"
+                + "var chip=document.createElement('div');"
+                + "chip.className='bods-chip';"
+                + "chip.style.cssText='position:absolute;left:50%;transform:translateX(-50%);top:-22px;min-width:32px;height:20px;line-height:20px;"
+                + "border-radius:10px;background:#2e7cf6;color:#ffffff;font-size:12px;font-weight:bold;font-family:sans-serif;"
+                + "text-align:center;padding:0 5px;box-shadow:0 2px 6px rgba(0,0,0,0.5);white-space:nowrap;box-sizing:border-box;"
+                + "pointer-events:none;z-index:52;';"
+                + "if(route){chip.textContent=route;}else{chip.style.display='none';}"
+                + "wrapper.appendChild(chip);"
                 + "for(var i=0;i<el.children.length;i++){el.children[i].style.display='none';}"
                 + "el.appendChild(wrapper);"
                 + "}"
@@ -1937,15 +2027,19 @@ public class MainActivity extends Activity {
                 + "if(evt)evt.stopPropagation();"
                 + "showCardForMarker(el);"
                 + "},true);"
+                + "}else{"
+                + "if(route)updateMarkerChip(el,route);"
+                + "}"
                 + "}"
                 + "function showCardForMarker(el){"
+                + "if(!el||isBusStop(el))return;"
                 + "var rect=el.getBoundingClientRect();"
                 + "var px=rect.left+(rect.width/2);"
                 + "var py=rect.top+(rect.height/2);"
                 + "var pw=document.documentElement.clientWidth||window.innerWidth;"
                 + "var ph=document.documentElement.clientHeight||window.innerHeight;"
                 + "var text=(el.getAttribute('title')||el.textContent||'').trim();"
-                + "var route=el.dataset.route||'';"
+                + "var route=el.dataset.route||extractRouteFromEl(el)||'';"
                 + "var destination=el.dataset.destination||'';"
                 + "var vehicle=el.dataset.id||el.dataset.vehicle||'';"
                 + "var operator=el.dataset.operator||'';"
@@ -1962,18 +2056,19 @@ public class MainActivity extends Activity {
                 + "if(!lastSeen&&/ago|due|arriving|mins/i.test(lines[i])){lastSeen=lines[i];}"
                 + "}"
                 + "}"
-                + "p.style.display='none';"
+                + "if(route||vehicle){p.style.display='none';}"
                 + "});"
                 + "if(!route){"
                 + "var m=text.match(/([A-Za-z0-9]+)\\s+to\\s+(.+)/);"
                 + "if(m){route=m[1];destination=m[2];}"
                 + "else if(text){route=text.split(/\\s+/)[0];}"
                 + "}"
-                + "if(window.BusMarkerBridge){"
+                + "if(route){updateMarkerChip(el,route);}"
+                + "if(route&&window.BusMarkerBridge){"
                 + "window.BusMarkerBridge.showBusCard(JSON.stringify({"
                 + "x:px,y:py,w:pw,h:ph,"
                 + "id:vehicle||route,"
-                + "route:route||\"Bus\","
+                + "route:route,"
                 + "destination:destination,"
                 + "operator:operator,"
                 + "lastSeen:lastSeen,"
@@ -1994,6 +2089,11 @@ public class MainActivity extends Activity {
                 + "p.dataset.bodsSeen='true';"
                 + "var pText=(p.textContent||'').trim();"
                 + "if(!pText)return;"
+                + "var pOuter=(p.outerHTML||'').toLowerCase();"
+                + "if(pOuter.indexOf('/stops/')!==-1||pOuter.indexOf('bus stop')!==-1||pOuter.indexOf('stop')!==-1){"
+                + "p.style.display='block';"
+                + "return;"
+                + "}"
                 + "var rect=p.getBoundingClientRect();"
                 + "var px=rect.left+(rect.width/2);"
                 + "var py=rect.top+rect.height;"
@@ -2007,8 +2107,9 @@ public class MainActivity extends Activity {
                 + "if(!vehicle&&/^[0-9]{1,6}\\s*-\\s*[A-Z0-9 ]{2,14}$/.test(lines[i])){vehicle=lines[i];}"
                 + "if(!lastSeen&&/ago|due|arriving|mins/i.test(lines[i])){lastSeen=lines[i];}"
                 + "}"
+                + "if(route){"
                 + "p.style.display='none';"
-                + "if(route&&window.BusMarkerBridge){"
+                + "if(window.BusMarkerBridge){"
                 + "window.BusMarkerBridge.showBusCard(JSON.stringify({"
                 + "x:px,y:py,w:pw,h:ph,"
                 + "id:vehicle||route,"
@@ -2016,6 +2117,7 @@ public class MainActivity extends Activity {
                 + "destination:destination,"
                 + "lastSeen:lastSeen"
                 + "}));"
+                + "}"
                 + "}"
                 + "});"
                 + "}"
@@ -2064,6 +2166,45 @@ public class MainActivity extends Activity {
         });
     }
 
+    private void updateMapBusCardStyle() {
+        if (mapBusCard == null) return;
+        View cardView = mapBusCard.getChildAt(0);
+        if (cardView == null) return;
+
+        int bgCol = nightModeEnabled ? Color.rgb(13, 20, 36) : Color.WHITE;
+        int strokeCol = nightModeEnabled ? Color.rgb(36, 48, 79) : Color.rgb(226, 232, 240);
+        int titleCol = nightModeEnabled ? Color.WHITE : Color.rgb(15, 23, 42);
+        int subCol = nightModeEnabled ? Color.rgb(148, 163, 184) : Color.rgb(71, 85, 105);
+        int arrivalCol = nightModeEnabled ? Color.rgb(0, 229, 255) : Color.rgb(15, 23, 42);
+        int updatedCol = nightModeEnabled ? Color.rgb(148, 163, 184) : Color.rgb(100, 116, 139);
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(bgCol);
+        bg.setCornerRadius(dp(16));
+        bg.setStroke(dp(1), strokeCol);
+        cardView.setBackground(bg);
+
+        if (cardTitleView != null) cardTitleView.setTextColor(titleCol);
+        if (cardSubtitleView != null) cardSubtitleView.setTextColor(subCol);
+        if (cardArrivalView != null) cardArrivalView.setTextColor(arrivalCol);
+        if (cardUpdatedView != null) cardUpdatedView.setTextColor(updatedCol);
+
+        if (cardView instanceof ViewGroup) {
+            ViewGroup cardGroup = (ViewGroup) cardView;
+            View tailRow = cardGroup.getChildAt(cardGroup.getChildCount() - 1);
+            if (tailRow instanceof ViewGroup) {
+                View tail = ((ViewGroup) tailRow).getChildAt(0);
+                if (tail != null) {
+                    GradientDrawable tailBg = new GradientDrawable();
+                    tailBg.setColor(bgCol);
+                    tailBg.setCornerRadius(dp(2));
+                    tailBg.setStroke(dp(1), strokeCol);
+                    tail.setBackground(tailBg);
+                }
+            }
+        }
+    }
+
     private void applyNightMode(boolean night, boolean force) {
         if (!force && nightModeEnabled == night) {
             return;
@@ -2077,19 +2218,38 @@ public class MainActivity extends Activity {
         if (webView != null) {
             webView.setBackgroundColor(night ? UiTheme.INK : Color.WHITE);
         }
+        updateMapBusCardStyle();
         String css;
         if (night) {
-            css = "body{background:#0b1226!important;color:#dfe7ff!important}"
+            css = "html,body{background:#0b1226!important;color:#ffffff!important}"
                     + ".maplibregl-canvas,.mapboxgl-canvas,.leaflet-tile-pane,.leaflet-tile-container,.leaflet-tile"
                     + "{filter:invert(1) hue-rotate(180deg) brightness(.92) contrast(.92) saturate(.85)!important}"
                     + ".maplibregl-popup-content,.mapboxgl-popup-content,.leaflet-popup-content-wrapper"
-                    + "{background:#101a38!important;color:#dfe7ff!important}"
-                    + "h1,h2,h3,h4,p,span,td,th,li,label,small,strong,b{color:#dfe7ff!important}"
-                    + "a{color:#7fc4ff!important}"
-                    + "header,footer,nav,section,article,aside,table,form,main{background-color:#0e1730!important;color:#dfe7ff!important}"
-                    + "button,input,select,textarea{background-color:#16224a!important;color:#dfe7ff!important;border-color:#2a3a6e!important}";
+                    + "{background:#101a38!important;color:#ffffff!important;border:1px solid #24304f!important}"
+                    + ".maplibregl-popup-content *,.mapboxgl-popup-content *,.leaflet-popup-content-wrapper *"
+                    + "{color:#ffffff!important}"
+                    + ".maplibregl-popup-content a,.mapboxgl-popup-content a,.leaflet-popup-content-wrapper a"
+                    + "{color:#00e5ff!important;font-weight:bold!important;text-decoration:underline!important}"
+                    + "h1,h2,h3,h4,h5,h6,p,span,td,th,li,label,small,strong,b,time{color:#ffffff!important}"
+                    + "a{color:#38bdf8!important;font-weight:bold!important}"
+                    + "header,footer,nav,section,article,aside,table,form,main,div.card,div.sheet,div.box"
+                    + "{background-color:#101a38!important;color:#ffffff!important;border-color:#24304f!important}"
+                    + "button,input,select,textarea{background-color:#16224a!important;color:#ffffff!important;border-color:#2a3a6e!important}"
+                    + "tr,td,th{border-color:#24304f!important}";
         } else {
-            css = "";
+            css = "html,body{background:#ffffff!important;color:#0f172a!important}"
+                    + "h1,h2,h3,h4,h5,h6,p,span,td,th,li,label,small,strong,b,time{color:#0f172a!important}"
+                    + "a{color:#174abe!important;font-weight:bold!important}"
+                    + ".maplibregl-popup-content,.mapboxgl-popup-content,.leaflet-popup-content-wrapper"
+                    + "{background:#0d1424!important;color:#ffffff!important;border:1px solid #24304f!important}"
+                    + ".maplibregl-popup-content *,.mapboxgl-popup-content *,.leaflet-popup-content-wrapper *"
+                    + "{color:#ffffff!important}"
+                    + ".maplibregl-popup-content a,.mapboxgl-popup-content a,.leaflet-popup-content-wrapper a"
+                    + "{color:#00e5ff!important;font-weight:bold!important;text-decoration:underline!important}"
+                    + "table{background-color:#ffffff!important;color:#0f172a!important}"
+                    + "th{background-color:#f1f5f9!important;color:#0f172a!important;font-weight:bold!important}"
+                    + "td{color:#0f172a!important;border-color:#e2e8f0!important}"
+                    + "button,input,select,textarea{background-color:#f8fafc!important;color:#0f172a!important;border-color:#cbd5e1!important}";
         }
         String script = "(function(){"
                 + "var style=document.getElementById('bustimes-night');"
@@ -2100,6 +2260,7 @@ public class MainActivity extends Activity {
             webView.evaluateJavascript(script, ignored -> {
             });
         }
+        cleanupSiteChrome();
     }
 
     private int dp(int value) {
@@ -2855,6 +3016,7 @@ public class MainActivity extends Activity {
         }
         IntentFilter filter = new IntentFilter();
         filter.addAction(BusTrackingService.ACTION_BUS_POSITION);
+        filter.addAction(BusTrackingService.ACTION_CLEAR_TRACKING);
         filter.addAction(BusTrackingService.ACTION_TRACKING_STATUS);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(busTrackingReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
@@ -3005,7 +3167,7 @@ public class MainActivity extends Activity {
         if (userLocation == null && hasLocationPermission()) {
             userLocation = getBestLastKnownLocation((LocationManager) getSystemService(Context.LOCATION_SERVICE));
         }
-        if (userLocation == null) {
+        if (userLocation == null || Double.isNaN(latitude) || Double.isNaN(longitude)) {
             return "";
         }
         Location target = new Location("bus");
@@ -3116,28 +3278,14 @@ public class MainActivity extends Activity {
                         + "if(window.map&&window.map.project)return window.map;"
                         + "for(var k in window){try{var v=window[k];if(v&&v.project&&v.getContainer)return v;}catch(e){}}"
                         + "return null;};"
-                        // 3D perspective double-decker bus SVG
                         + "window.__bodsBusSvg=window.__bodsBusSvg||\""
-                        + "<svg width='60' height='48' viewBox='0 0 60 48' xmlns='http://www.w3.org/2000/svg'>"
-                        + "<ellipse cx='30' cy='43' rx='25' ry='4.5' fill='rgba(0,0,0,0.30)'/>"
-                        + "<path d='M8 14 L46 10 L52 20 L8 23 Z' fill='#f8fafc'/>"
-                        + "<path d='M8 14 L46 10 C48 10, 50 11, 52 13 L52.5 15 L8 16.5 Z' fill='#0288d1'/>"
-                        + "<rect x='11' y='15' width='7' height='5.5' rx='1.2' fill='#1e293b' transform='rotate(-2 14.5 17.75)'/>"
-                        + "<rect x='20' y='14.2' width='7' height='5.5' rx='1.2' fill='#1e293b' transform='rotate(-2 23.5 16.95)'/>"
-                        + "<rect x='29' y='13.4' width='7' height='5.5' rx='1.2' fill='#1e293b' transform='rotate(-2 32.5 16.15)'/>"
-                        + "<path d='M38 12.6 L49 11.6 L50.5 18 L38 18.8 Z' fill='#0f172a'/>"
-                        + "<path d='M7.5 23 L52 20 L52.5 23 L7.2 26 Z' fill='#0288d1'/>"
-                        + "<path d='M7.2 26 L52.5 23 L51 37 L6.5 39 Z' fill='#d32f2f'/>"
-                        + "<rect x='10' y='27.5' width='7' height='6' rx='1.2' fill='#1e293b' transform='rotate(-2 13.5 30.5)'/>"
-                        + "<rect x='19' y='26.7' width='7' height='6' rx='1.2' fill='#1e293b' transform='rotate(-2 22.5 29.7)'/>"
-                        + "<rect x='28' y='25.9' width='7' height='6' rx='1.2' fill='#1e293b' transform='rotate(-2 31.5 28.9)'/>"
-                        + "<path d='M37 25.1 L49.5 24.1 L48.8 32 L37 31.8 Z' fill='#0f172a'/>"
-                        + "<circle cx='48.5' cy='34.2' r='1.8' fill='#ffeb3b'/>"
-                        + "<rect x='42' y='35.2' width='6' height='2' rx='1' fill='#334155' transform='rotate(-3 45 36.2)'/>"
-                        + "<circle cx='15' cy='38.5' r='4.5' fill='#0f172a'/>"
-                        + "<circle cx='15' cy='38.5' r='1.8' fill='#94a3b8'/>"
-                        + "<circle cx='39' cy='36.5' r='4.5' fill='#0f172a'/>"
-                        + "<circle cx='39' cy='36.5' r='1.8' fill='#94a3b8'/>"
+                        + "<svg width='40' height='40' viewBox='0 0 40 40' xmlns='http://www.w3.org/2000/svg'>"
+                        + "<path fill='#101A38' d='M20,2C11.16,2 4,9.16 4,18c0,11.25 14.5,19.25 15.35,19.72a1.32,1.32 0,0 0,1.3 0C21.5,37.25 36,29.25 36,18 36,9.16 28.84,2 20,2z'/>"
+                        + "<path stroke='#2E7CF6' stroke-width='1.5' fill='none' d='M20,2C11.16,2 4,9.16 4,18c0,11.25 14.5,19.25 15.35,19.72a1.32,1.32 0,0 0,1.3 0C21.5,37.25 36,29.25 36,18 36,9.16 28.84,2 20,2z'/>"
+                        + "<path fill='#FFFFFF' d='M13,9h14c1.66,0 3,1.34 3,3v10c0,1.3 -0.84,2.4 -2,2.82V26c0,0.55 -0.45,1 -1,1h-1c-0.55,0 -1,-0.45 -1,-1v-1h-10v1c0,0.55 -0.45,1 -1,1h-1c-0.55,0 -1,-0.45 -1,-1v-1.18C11.84,24.4 11,23.3 11,22V12c0,-1.66 1.34,-3 3,-3z'/>"
+                        + "<path fill='#2E7CF6' d='M13,12h14v5h-14z'/>"
+                        + "<circle cx='13.5' cy='21' r='1.5' fill='#FFB300'/>"
+                        + "<circle cx='26.5' cy='21' r='1.5' fill='#FFB300'/>"
                         + "</svg>\";"
                         + "var map=window.__bodsFindMap();if(!map)return false;"
                         + "var container=map.getContainer();"
@@ -3151,15 +3299,18 @@ public class MainActivity extends Activity {
                         + "marker.style.cssText='position:absolute;z-index:50;width:0;height:0;pointer-events:auto;cursor:pointer;';"
                         + "var halo=document.createElement('div');"
                         + "halo.className='bods-halo';"
-                        + "halo.style.cssText='position:absolute;left:-30px;top:-38px;width:60px;height:48px;border-radius:50%;"
+                        + "halo.style.cssText='position:absolute;left:-20px;top:-38px;width:40px;height:40px;border-radius:50%;"
                         + "pointer-events:none;background:radial-gradient(circle,rgba(2,136,209,.25) 0%%,rgba(0,0,0,0) 70%%);';"
                         + "var badge=document.createElement('div');"
                         + "badge.className='bods-badge';"
-                        + "badge.style.cssText='position:absolute;left:-30px;top:-38px;width:60px;height:48px;"
+                        + "badge.style.cssText='position:absolute;left:-20px;top:-38px;width:40px;height:40px;"
                         + "filter:drop-shadow(0 4px 6px rgba(0,0,0,.45));';"
                         + "var chip=document.createElement('div');"
                         + "chip.className='bods-chip';"
-                        + "chip.style.cssText='display:none;';"
+                        + "chip.style.cssText='position:absolute;left:0;transform:translateX(-50%);top:-62px;min-width:32px;height:20px;line-height:20px;"
+                        + "border-radius:10px;background:#2e7cf6;color:#ffffff;font-size:12px;font-weight:bold;font-family:sans-serif;"
+                        + "text-align:center;padding:0 5px;box-shadow:0 2px 6px rgba(0,0,0,0.5);white-space:nowrap;box-sizing:border-box;"
+                        + "pointer-events:none;z-index:52;';"
                         + "marker.appendChild(halo);marker.appendChild(badge);marker.appendChild(chip);"
                         + "container.appendChild(marker);window.__bodsMarkers['%s']=marker;"
                         + "marker.onclick=function(event){if(event)event.stopPropagation();"
@@ -3557,6 +3708,19 @@ public class MainActivity extends Activity {
             String action = intent.getAction();
             if (BusTrackingService.ACTION_BUS_POSITION.equals(action)) {
                 updateTrackedBusMarker(intent);
+                refreshNearbyIfVisible();
+            } else if (BusTrackingService.ACTION_CLEAR_TRACKING.equals(action)) {
+                for (AnimatedBusMarker marker : trackedBusMarkers.values()) {
+                    marker.cancelAnimation();
+                }
+                trackedBusMarkers.clear();
+                webView.evaluateJavascript("(function(){"
+                        + "Object.keys(window.__bodsMarkers||{}).forEach(function(key){"
+                        + "var m=window.__bodsMarkers[key];if(m&&m.parentNode)m.parentNode.removeChild(m);"
+                        + "});"
+                        + "window.__bodsMarkers={};"
+                        + "return true;})();", null);
+                updateTopBarSubtitle();
                 refreshNearbyIfVisible();
             } else if (BusTrackingService.ACTION_TRACKING_STATUS.equals(action)) {
                 String message = intent.getStringExtra(BusTrackingService.EXTRA_STATUS_MESSAGE);

@@ -258,95 +258,47 @@ final class IconView extends View {
         canvas.drawCircle(12f, 9.8f, 1.9f, paint);
     }
 
-    /** 3D perspective double-decker bus pictogram, used for thumbnails and bus markers. */
     private void drawBus(Canvas canvas) {
-        // Shadow under bus
+        // Modern drop-shadow
         paint.setStyle(Paint.Style.FILL);
-        paint.setColor(Color.argb(55, 0, 0, 0));
-        canvas.drawOval(new RectF(2.5f, 20.2f, 21.5f, 22.4f), paint);
+        paint.setColor(Color.argb(70, 0, 0, 0));
+        canvas.drawOval(new RectF(4f, 20f, 20f, 23.5f), paint);
 
-        // Upper deck body (White / Light Slate)
-        paint.setColor(Color.rgb(248, 250, 252));
+        // Marker pin base
         path.reset();
-        path.moveTo(4.2f, 7.2f);
-        path.lineTo(18.5f, 5.8f);
-        path.lineTo(20.5f, 10.8f);
-        path.lineTo(4.2f, 11.8f);
+        path.moveTo(12f, 2f);
+        path.cubicTo(6.5f, 2f, 2f, 6.5f, 2f, 12f);
+        path.cubicTo(2f, 18.5f, 11f, 22.5f, 11.5f, 22.8f);
+        path.lineTo(12f, 23.2f);
+        path.lineTo(12.5f, 22.8f);
+        path.cubicTo(13f, 22.5f, 22f, 18.5f, 22f, 12f);
+        path.cubicTo(22f, 6.5f, 17.5f, 2f, 12f, 2f);
         path.close();
+
+        paint.setColor(Color.rgb(16, 26, 56)); // deep panel navy
         canvas.drawPath(path, paint);
 
-        // Roof cap (Blue accent)
-        paint.setColor(Color.rgb(2, 136, 209));
-        path.reset();
-        path.moveTo(4.2f, 7.2f);
-        path.lineTo(18.5f, 5.8f);
-        path.lineTo(19.0f, 7.0f);
-        path.lineTo(4.2f, 8.2f);
-        path.close();
+        stroke(1.2f);
+        paint.setColor(Color.rgb(46, 124, 246)); // neon blue rim
         canvas.drawPath(path, paint);
 
-        // Upper windows (Dark blue/slate)
-        paint.setColor(Color.rgb(30, 41, 59));
-        canvas.drawRoundRect(new RectF(5.5f, 8.4f, 8.5f, 11.0f), 0.8f, 0.8f, paint);
-        canvas.drawRoundRect(new RectF(9.5f, 8.0f, 12.5f, 10.6f), 0.8f, 0.8f, paint);
-        canvas.drawRoundRect(new RectF(13.5f, 7.6f, 16.5f, 10.2f), 0.8f, 0.8f, paint);
-        // Upper windscreen
-        path.reset();
-        path.moveTo(17.2f, 7.2f);
-        path.lineTo(19.8f, 6.9f);
-        path.lineTo(20.2f, 9.8f);
-        path.lineTo(17.2f, 10.0f);
-        path.close();
-        canvas.drawPath(path, paint);
+        // Bus body silhouette
+        fill();
+        paint.setColor(Color.WHITE);
+        canvas.drawRoundRect(new RectF(6.8f, 6.2f, 17.2f, 15.8f), 1.6f, 1.6f, paint);
 
-        // Inter-deck stripe (Blue)
-        paint.setColor(Color.rgb(2, 136, 209));
-        path.reset();
-        path.moveTo(4.0f, 11.8f);
-        path.lineTo(20.5f, 10.8f);
-        path.lineTo(20.8f, 12.2f);
-        path.lineTo(4.0f, 13.2f);
-        path.close();
-        canvas.drawPath(path, paint);
+        // Windshield
+        paint.setColor(Color.rgb(46, 124, 246));
+        canvas.drawRoundRect(new RectF(8.0f, 7.4f, 16.0f, 10.6f), 0.8f, 0.8f, paint);
 
-        // Lower deck body (Vibrant Red)
-        paint.setColor(Color.rgb(211, 47, 47));
-        path.reset();
-        path.moveTo(4.0f, 13.2f);
-        path.lineTo(20.8f, 12.2f);
-        path.lineTo(20.2f, 18.5f);
-        path.lineTo(3.5f, 19.5f);
-        path.close();
-        canvas.drawPath(path, paint);
+        // Headlights
+        paint.setColor(Color.rgb(255, 179, 0));
+        canvas.drawCircle(8.6f, 13.6f, 0.9f, paint);
+        canvas.drawCircle(15.4f, 13.6f, 0.9f, paint);
 
-        // Lower windows
-        paint.setColor(Color.rgb(30, 41, 59));
-        canvas.drawRoundRect(new RectF(5.2f, 14.0f, 8.2f, 16.6f), 0.8f, 0.8f, paint);
-        canvas.drawRoundRect(new RectF(9.2f, 13.6f, 12.2f, 16.2f), 0.8f, 0.8f, paint);
-        canvas.drawRoundRect(new RectF(13.2f, 13.2f, 16.2f, 15.8f), 0.8f, 0.8f, paint);
-        // Lower windscreen
-        path.reset();
-        path.moveTo(16.8f, 12.8f);
-        path.lineTo(20.0f, 12.5f);
-        path.lineTo(19.6f, 16.0f);
-        path.lineTo(16.8f, 15.3f);
-        path.close();
-        canvas.drawPath(path, paint);
-
-        // Headlight
-        paint.setColor(Color.rgb(255, 235, 59));
-        canvas.drawCircle(19.2f, 17.2f, 0.8f, paint);
-
-        // Wheels
-        paint.setColor(Color.rgb(17, 24, 39));
-        canvas.drawCircle(6.5f, 19.5f, 2.2f, paint);
-        canvas.drawCircle(16.2f, 18.8f, 2.2f, paint);
-
-        paint.setColor(Color.rgb(156, 163, 175));
-        canvas.drawCircle(6.5f, 19.5f, 0.9f, paint);
-        canvas.drawCircle(16.2f, 18.8f, 0.9f, paint);
-
-        paint.setColor(color);
+        // Bumper bar
+        paint.setColor(Color.rgb(16, 26, 56));
+        canvas.drawRoundRect(new RectF(10.2f, 13.2f, 13.8f, 14.4f), 0.5f, 0.5f, paint);
     }
 
     private static int darker(int color, float factor) {

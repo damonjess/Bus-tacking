@@ -21,7 +21,7 @@ public final class BusSnapshot {
     final String arrivalStopName;
     /** Optional vehicle registration surfaced from hijacked site popups. */
     String regOverride = "";
-    /** Pre-formatted "Updated 50 seconds ago" line supplied by the activity. */
+    /** Pre-formatted updated time line supplied by the activity. */
     String updatedOverride = "";
 
     BusSnapshot(String busId, String lineName, String lineRef, String destinationName, String occupancy,
@@ -57,6 +57,9 @@ public final class BusSnapshot {
     }
 
     String speedText() {
+        if (Float.isNaN(speedKph)) {
+            return "";
+        }
         if (speedKph <= 0.5f) {
             return "Stopped";
         }
