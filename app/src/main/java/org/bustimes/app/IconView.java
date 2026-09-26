@@ -258,18 +258,94 @@ final class IconView extends View {
         canvas.drawCircle(12f, 9.8f, 1.9f, paint);
     }
 
-    /** Side-on bus pictogram, also used for the bus card thumbnail. */
+    /** 3D perspective double-decker bus pictogram, used for thumbnails and bus markers. */
     private void drawBus(Canvas canvas) {
-        fill();
-        canvas.drawRoundRect(new RectF(2.6f, 5.4f, 21.4f, 17.4f), 3.4f, 3.4f, paint);
-        accentPaint.setStyle(Paint.Style.FILL);
-        accentPaint.setColor(accent);
-        canvas.drawRoundRect(new RectF(4.8f, 7.8f, 9.6f, 12.6f), 1.3f, 1.3f, accentPaint);
-        canvas.drawRoundRect(new RectF(10.4f, 7.8f, 15.2f, 12.6f), 1.3f, 1.3f, accentPaint);
-        canvas.drawRoundRect(new RectF(16f, 7.8f, 20.2f, 12.6f), 1.3f, 1.3f, accentPaint);
-        paint.setColor(darker(color, 0.55f));
-        canvas.drawCircle(7f, 18.4f, 2.5f, paint);
-        canvas.drawCircle(17f, 18.4f, 2.5f, paint);
+        // Shadow under bus
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(Color.argb(55, 0, 0, 0));
+        canvas.drawOval(new RectF(2.5f, 20.2f, 21.5f, 22.4f), paint);
+
+        // Upper deck body (White / Light Slate)
+        paint.setColor(Color.rgb(248, 250, 252));
+        path.reset();
+        path.moveTo(4.2f, 7.2f);
+        path.lineTo(18.5f, 5.8f);
+        path.lineTo(20.5f, 10.8f);
+        path.lineTo(4.2f, 11.8f);
+        path.close();
+        canvas.drawPath(path, paint);
+
+        // Roof cap (Blue accent)
+        paint.setColor(Color.rgb(2, 136, 209));
+        path.reset();
+        path.moveTo(4.2f, 7.2f);
+        path.lineTo(18.5f, 5.8f);
+        path.lineTo(19.0f, 7.0f);
+        path.lineTo(4.2f, 8.2f);
+        path.close();
+        canvas.drawPath(path, paint);
+
+        // Upper windows (Dark blue/slate)
+        paint.setColor(Color.rgb(30, 41, 59));
+        canvas.drawRoundRect(new RectF(5.5f, 8.4f, 8.5f, 11.0f), 0.8f, 0.8f, paint);
+        canvas.drawRoundRect(new RectF(9.5f, 8.0f, 12.5f, 10.6f), 0.8f, 0.8f, paint);
+        canvas.drawRoundRect(new RectF(13.5f, 7.6f, 16.5f, 10.2f), 0.8f, 0.8f, paint);
+        // Upper windscreen
+        path.reset();
+        path.moveTo(17.2f, 7.2f);
+        path.lineTo(19.8f, 6.9f);
+        path.lineTo(20.2f, 9.8f);
+        path.lineTo(17.2f, 10.0f);
+        path.close();
+        canvas.drawPath(path, paint);
+
+        // Inter-deck stripe (Blue)
+        paint.setColor(Color.rgb(2, 136, 209));
+        path.reset();
+        path.moveTo(4.0f, 11.8f);
+        path.lineTo(20.5f, 10.8f);
+        path.lineTo(20.8f, 12.2f);
+        path.lineTo(4.0f, 13.2f);
+        path.close();
+        canvas.drawPath(path, paint);
+
+        // Lower deck body (Vibrant Red)
+        paint.setColor(Color.rgb(211, 47, 47));
+        path.reset();
+        path.moveTo(4.0f, 13.2f);
+        path.lineTo(20.8f, 12.2f);
+        path.lineTo(20.2f, 18.5f);
+        path.lineTo(3.5f, 19.5f);
+        path.close();
+        canvas.drawPath(path, paint);
+
+        // Lower windows
+        paint.setColor(Color.rgb(30, 41, 59));
+        canvas.drawRoundRect(new RectF(5.2f, 14.0f, 8.2f, 16.6f), 0.8f, 0.8f, paint);
+        canvas.drawRoundRect(new RectF(9.2f, 13.6f, 12.2f, 16.2f), 0.8f, 0.8f, paint);
+        canvas.drawRoundRect(new RectF(13.2f, 13.2f, 16.2f, 15.8f), 0.8f, 0.8f, paint);
+        // Lower windscreen
+        path.reset();
+        path.moveTo(16.8f, 12.8f);
+        path.lineTo(20.0f, 12.5f);
+        path.lineTo(19.6f, 16.0f);
+        path.lineTo(16.8f, 15.3f);
+        path.close();
+        canvas.drawPath(path, paint);
+
+        // Headlight
+        paint.setColor(Color.rgb(255, 235, 59));
+        canvas.drawCircle(19.2f, 17.2f, 0.8f, paint);
+
+        // Wheels
+        paint.setColor(Color.rgb(17, 24, 39));
+        canvas.drawCircle(6.5f, 19.5f, 2.2f, paint);
+        canvas.drawCircle(16.2f, 18.8f, 2.2f, paint);
+
+        paint.setColor(Color.rgb(156, 163, 175));
+        canvas.drawCircle(6.5f, 19.5f, 0.9f, paint);
+        canvas.drawCircle(16.2f, 18.8f, 0.9f, paint);
+
         paint.setColor(color);
     }
 
