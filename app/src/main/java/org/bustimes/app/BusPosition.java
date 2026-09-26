@@ -11,6 +11,7 @@ final class BusPosition {
     static final String EXTRA_BEARING = "bearing";
     static final String EXTRA_RECORDED_AT = "recorded_at";
     static final String EXTRA_OCCUPANCY = "occupancy";
+    static final String EXTRA_OPERATOR = "operator";
 
     final String id;
     final String lineName;
@@ -22,9 +23,10 @@ final class BusPosition {
     final float bearing;
     final String recordedAt;
     final String occupancy;
+    final String operatorName;
 
     BusPosition(String id, String lineName, String lineRef, String destinationName, String expectedArrivalTime,
-            double latitude, double longitude, float bearing, String recordedAt, String occupancy) {
+            double latitude, double longitude, float bearing, String recordedAt, String occupancy, String operatorName) {
         this.id = id;
         this.lineName = lineName;
         this.lineRef = lineRef;
@@ -35,5 +37,6 @@ final class BusPosition {
         this.bearing = bearing;
         this.recordedAt = recordedAt;
         this.occupancy = occupancy;
+        this.operatorName = operatorName;
     }
 }

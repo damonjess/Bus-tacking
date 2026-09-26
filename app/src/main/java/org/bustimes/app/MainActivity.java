@@ -11,23 +11,25 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.speech.RecognitionListener;
-import android.speech.RecognizerIntent;
-import android.speech.SpeechRecognizer;
 import android.graphics.Color;
+import android.graphics.PorterDuff;
 import android.graphics.Typeface;
 import android.location.Criteria;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
 import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
-import android.os.Handler;
-import android.os.Looper;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -43,6 +45,7 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
@@ -55,9 +58,10 @@ import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
-import java.util.TimeZone;
 import java.util.Map;
+import java.util.TimeZone;
 
 public class MainActivity extends Activity {
     private static final int LOCATION_PERMISSION_REQUEST = 1001;
@@ -66,7 +70,14 @@ public class MainActivity extends Activity {
     private static final int CAMERA_PERMISSION_REQUEST = 1004;
     private static final String SAVED_URL = "saved_url";
     private static final String MAP_URL = "https://bustimes.org/map";
+    private static final String PREFS_NAME = "bustimes_prefs";
+    private static final String PREF_NIGHT_MODE = "night_mode";
     private static final long BUS_MARKER_ANIMATION_MS = 5_000L;
+    private static final long MARKER_JS_THROTTLE_MS = 300L;
+    private static final long BILLBOARD_THROTTLE_MS = 600L;
+    private static final long MARKER_STALE_MS = 120_000L;
+    private static final long FOLLOW_INTERVAL_MS = 5_000L;
+    private static final long CHIPS_REBUILD_INTERVAL_MS = 5_000L;
 
     private WebView webView;
     private ProgressBar progressBar;
@@ -75,7 +86,11 @@ public class MainActivity extends Activity {
     private Button microphoneButton;
     private Button arToggleButton;
     private LinearLayout zoomControls;
-    private TextView helperChip;
+    private Button nightModeButton;
+    private TextView statusPill;
+    private TextView liveCountPill;
+    private HorizontalScrollView routeChipsScroll;
+    private LinearLayout routeChipRow;
     private ArBusStopView arBusStopView;
     private final Map<String, AnimatedBusMarker> trackedBusMarkers = new HashMap<>();
     private final BroadcastReceiver busTrackingReceiver = new BusTrackingReceiver();
@@ -85,23 +100,49 @@ public class MainActivity extends Activity {
     private SpeechRecognizer speechRecognizer;
     private LocationListener arLocationListener;
     private LocationListener locateLocationListener;
-    private final Handler locateHandler = new Handler(Looper.getMainLooper());
+    private Runnable locateTimeoutRunnable;
+    private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private String activeRouteFilter = "";
+    private String followBusId;
+    private boolean nightModeEnabled;
     private boolean arModeEnabled;
+    private String pendingNavigationName;
+    private double pendingNavigationLatitude = Double.NaN;
+    private double pendingNavigationLongitude = Double.NaN;
+    private long lastChipsRebuildMs;
+    private final Runnable followRunnable = new Runnable() {
+        @Override
+        public void run() {
+            stepFollowMode();
+        }
+    };
+    private final Runnable markerCleanupRunnable = new Runnable() {
+        @Override
+        public void run() {
+            removeStaleMarkers();
+            uiHandler.postDelayed(this, 30_000L);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        SharedPreferences preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        nightModeEnabled = preferences.getBoolean(PREF_NIGHT_MODE, false);
+
         FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(UiTheme.INK);
         webView = new WebView(this);
         progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        locateButton = createLocateButton();
-        refreshButton = createRefreshButton();
-        microphoneButton = createMicrophoneButton();
+        locateButton = createFabButton("⌖", 26, "Home: find my location on the live bus map", v -> centerMapOnUserLocation());
+        refreshButton = createFabButton("⟳", 26, "Refresh the live bus map", v -> refreshLiveMap());
+        microphoneButton = createFabButton("🎙", 22, "Voice search for a bus route", v -> startVoiceSearch());
         arToggleButton = createArToggleButton();
         zoomControls = createZoomControls();
-        helperChip = createHelperChip();
+        statusPill = createStatusPill();
+        liveCountPill = createLiveCountPill();
+        routeChipsScroll = createRouteChipsScroll();
         arBusStopView = new ArBusStopView(this);
         arBusStopView.setVisibility(View.GONE);
 
@@ -111,45 +152,59 @@ public class MainActivity extends Activity {
         root.addView(arBusStopView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
+        arBusStopView.setBusTapListener(this::openBusDetailsFromAr);
 
         FrameLayout.LayoutParams progressParams = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP);
         root.addView(progressBar, progressParams);
+        progressBar.getProgressDrawable().setColorFilter(UiTheme.CYAN, PorterDuff.Mode.SRC_IN);
 
-        FrameLayout.LayoutParams locateParams = new FrameLayout.LayoutParams(dp(56), dp(56),
+        FrameLayout.LayoutParams locateParams = new FrameLayout.LayoutParams(dp(60), dp(60),
                 Gravity.BOTTOM | Gravity.END);
-        locateParams.setMargins(0, 0, dp(20), dp(28));
+        locateParams.setMargins(0, 0, dp(20), dp(30));
         root.addView(locateButton, locateParams);
 
-        FrameLayout.LayoutParams refreshParams = new FrameLayout.LayoutParams(dp(56), dp(56),
+        FrameLayout.LayoutParams refreshParams = new FrameLayout.LayoutParams(dp(60), dp(60),
                 Gravity.BOTTOM | Gravity.START);
-        refreshParams.setMargins(dp(20), 0, 0, dp(28));
+        refreshParams.setMargins(dp(20), 0, 0, dp(30));
         root.addView(refreshButton, refreshParams);
 
-        FrameLayout.LayoutParams microphoneParams = new FrameLayout.LayoutParams(dp(56), dp(56),
+        FrameLayout.LayoutParams microphoneParams = new FrameLayout.LayoutParams(dp(60), dp(60),
                 Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
-        microphoneParams.setMargins(0, 0, 0, dp(28));
+        microphoneParams.setMargins(0, 0, 0, dp(30));
         root.addView(microphoneButton, microphoneParams);
 
-        FrameLayout.LayoutParams arToggleParams = new FrameLayout.LayoutParams(dp(112), dp(48),
+        FrameLayout.LayoutParams arToggleParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP | Gravity.START);
-        arToggleParams.setMargins(dp(14), dp(72), 0, 0);
+        arToggleParams.setMargins(dp(16), dp(72), 0, 0);
         root.addView(arToggleButton, arToggleParams);
 
-        FrameLayout.LayoutParams zoomParams = new FrameLayout.LayoutParams(dp(52),
+        FrameLayout.LayoutParams zoomParams = new FrameLayout.LayoutParams(dp(54),
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP | Gravity.END);
-        zoomParams.setMargins(0, dp(72), dp(14), 0);
+        zoomParams.setMargins(0, dp(72), dp(16), 0);
         root.addView(zoomControls, zoomParams);
 
-        FrameLayout.LayoutParams helperParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
+        FrameLayout.LayoutParams statusParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP);
+        statusParams.setMargins(dp(64), dp(14), dp(80), 0);
+        root.addView(statusPill, statusParams);
+
+        FrameLayout.LayoutParams liveCountParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-        helperParams.setMargins(dp(12), dp(14), dp(12), 0);
-        root.addView(helperChip, helperParams);
+        liveCountParams.setMargins(0, dp(58), 0, 0);
+        root.addView(liveCountPill, liveCountParams);
+
+        FrameLayout.LayoutParams chipsParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP);
+        chipsParams.setMargins(dp(150), dp(96), dp(80), 0);
+        root.addView(routeChipsScroll, chipsParams);
 
         setContentView(root);
         configureWebView();
@@ -160,6 +215,7 @@ public class MainActivity extends Activity {
         }
         webView.loadUrl(url);
         registerBusTrackingReceiver();
+        uiHandler.postDelayed(markerCleanupRunnable, 30_000L);
     }
 
     @Override
@@ -205,58 +261,50 @@ public class MainActivity extends Activity {
             CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
         }
 
-        webView.setBackgroundColor(Color.WHITE);
+        webView.setBackgroundColor(UiTheme.INK);
         webView.addJavascriptInterface(new BusMarkerBridge(), "BusMarkerBridge");
         webView.setWebViewClient(new BusTimesWebViewClient());
         webView.setWebChromeClient(new BusTimesChromeClient());
         webView.setDownloadListener(new BusTimesDownloadListener());
     }
 
-    private Button createLocateButton() {
+    private Button createFabButton(String glyph, int glyphSize, String description, View.OnClickListener listener) {
         Button button = new Button(this);
-        button.setText("⌂");
-        button.setTextSize(26);
-        button.setTypeface(Typeface.DEFAULT_BOLD);
+        button.setText(glyph);
+        button.setTextSize(glyphSize);
+        button.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         button.setTextColor(Color.WHITE);
-        button.setBackgroundColor(Color.rgb(17, 76, 141));
-        button.setContentDescription("Home: find my location on the live bus map");
-        button.setOnClickListener(v -> centerMapOnUserLocation());
-        return button;
-    }
-
-    private Button createRefreshButton() {
-        Button button = new Button(this);
-        button.setText("↻");
-        button.setTextSize(26);
-        button.setTypeface(Typeface.DEFAULT_BOLD);
-        button.setTextColor(Color.WHITE);
-        button.setBackgroundColor(Color.rgb(17, 76, 141));
-        button.setContentDescription("Refresh the live bus map");
-        button.setOnClickListener(v -> refreshLiveMap());
-        return button;
-    }
-
-    private Button createMicrophoneButton() {
-        Button button = new Button(this);
-        button.setText("🎙");
-        button.setTextSize(22);
-        button.setTypeface(Typeface.DEFAULT_BOLD);
-        button.setTextColor(Color.WHITE);
-        button.setBackgroundColor(Color.rgb(17, 76, 141));
-        button.setContentDescription("Voice search for a bus route");
-        button.setOnClickListener(v -> startVoiceSearch());
+        button.setStateListAnimator(null);
+        button.setAllCaps(false);
+        button.setMinWidth(0);
+        button.setMinHeight(0);
+        button.setPadding(0, 0, 0, 0);
+        android.graphics.drawable.GradientDrawable gradient = UiTheme.circleGradient(this, UiTheme.BLUE, UiTheme.BLUE_DEEP);
+        gradient.setStroke(dp(1), UiTheme.withAlpha(Color.WHITE, 70));
+        button.setBackground(UiTheme.ripple(gradient));
+        button.setContentDescription(description);
+        button.setOnClickListener(listener);
+        UiTheme.pressScale(button);
         return button;
     }
 
     private Button createArToggleButton() {
         Button button = new Button(this);
-        button.setText("AR View");
+        button.setText("✦ AR View");
         button.setTextSize(13);
-        button.setTypeface(Typeface.DEFAULT_BOLD);
+        button.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         button.setTextColor(Color.WHITE);
-        button.setBackgroundColor(Color.rgb(17, 76, 141));
+        button.setStateListAnimator(null);
+        button.setAllCaps(false);
+        button.setMinWidth(0);
+        button.setMinHeight(0);
+        button.setPadding(dp(18), dp(10), dp(18), dp(10));
+        android.graphics.drawable.GradientDrawable gradient = UiTheme.pill(this,
+                UiTheme.withAlpha(UiTheme.INK_LIGHT, 235), UiTheme.withAlpha(UiTheme.CYAN, 160), 1.2f, 24f);
+        button.setBackground(UiTheme.ripple(gradient));
         button.setContentDescription("Switch between standard map and AR bus stop finder");
         button.setOnClickListener(v -> toggleArMode());
+        UiTheme.pressScale(button);
         return button;
     }
 
@@ -264,37 +312,186 @@ public class MainActivity extends Activity {
         LinearLayout controls = new LinearLayout(this);
         controls.setOrientation(LinearLayout.VERTICAL);
         controls.setGravity(Gravity.CENTER);
-        controls.setBackgroundColor(Color.argb(235, 255, 255, 255));
+        controls.setBackground(UiTheme.pill(this, UiTheme.withAlpha(UiTheme.INK_LIGHT, 225),
+                UiTheme.withAlpha(Color.WHITE, 45), 1f, 27f));
+        controls.setPadding(dp(5), dp(5), dp(5), dp(5));
         controls.setContentDescription("Map zoom controls");
 
         Button zoomInButton = createZoomButton("+", "Zoom in on the live bus map");
         zoomInButton.setOnClickListener(v -> zoomWebMap(true));
         controls.addView(zoomInButton, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(48)));
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(44)));
+
+        controls.addView(createDivider());
 
         Button zoomOutButton = createZoomButton("−", "Zoom out on the live bus map");
         zoomOutButton.setOnClickListener(v -> zoomWebMap(false));
         controls.addView(zoomOutButton, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(48)));
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(44)));
+
+        controls.addView(createDivider());
+
+        nightModeButton = createZoomButton(nightModeEnabled ? "☀" : "🌙", "Toggle night mode");
+        nightModeButton.setTextSize(16);
+        nightModeButton.setOnClickListener(v -> applyNightMode(!nightModeEnabled, false));
+        controls.addView(nightModeButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
 
         return controls;
+    }
+
+    private View createDivider() {
+        View divider = new View(this);
+        divider.setBackgroundColor(UiTheme.withAlpha(Color.WHITE, 40));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, dp(1)));
+        params.setMargins(dp(10), 0, dp(10), 0);
+        divider.setLayoutParams(params);
+        return divider;
     }
 
     private Button createZoomButton(String label, String description) {
         Button button = new Button(this);
         button.setText(label);
-        button.setTextSize(24);
-        button.setTypeface(Typeface.DEFAULT_BOLD);
-        button.setTextColor(Color.rgb(17, 76, 141));
+        button.setTextSize(22);
+        button.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        button.setTextColor(Color.WHITE);
         button.setBackgroundColor(Color.TRANSPARENT);
         button.setContentDescription(description);
         button.setAllCaps(false);
         button.setMinWidth(0);
         button.setMinHeight(0);
+        button.setStateListAnimator(null);
         button.setPadding(0, 0, 0, 0);
         return button;
+    }
+
+    private TextView createStatusPill() {
+        TextView pill = new TextView(this);
+        pill.setText("Live tracking ready · tap a bus for full details");
+        pill.setTextColor(Color.WHITE);
+        pill.setTextSize(12);
+        pill.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        pill.setGravity(Gravity.CENTER);
+        pill.setMaxLines(1);
+        pill.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        pill.setBackground(UiTheme.ripple(UiTheme.pill(this, UiTheme.withAlpha(UiTheme.INK_LIGHT, 235),
+                UiTheme.withAlpha(Color.WHITE, 45), 1f, 20f)));
+        pill.setPadding(dp(16), dp(7), dp(16), dp(7));
+        pill.setOnClickListener(v -> pill.setVisibility(View.GONE));
+        return pill;
+    }
+
+    private TextView createLiveCountPill() {
+        TextView pill = new TextView(this);
+        pill.setText("0 buses live");
+        pill.setTextColor(UiTheme.CYAN);
+        pill.setTextSize(12);
+        pill.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        pill.setGravity(Gravity.CENTER);
+        pill.setBackground(UiTheme.ripple(UiTheme.pill(this, UiTheme.withAlpha(UiTheme.INK_LIGHT, 235),
+                UiTheme.withAlpha(UiTheme.CYAN, 150), 1f, 20f)));
+        pill.setPadding(dp(16), dp(7), dp(16), dp(7));
+        pill.setOnClickListener(v -> showBusListDialog());
+        return pill;
+    }
+
+    private HorizontalScrollView createRouteChipsScroll() {
+        HorizontalScrollView scroller = new HorizontalScrollView(this);
+        scroller.setHorizontalScrollBarEnabled(false);
+        scroller.setFillViewport(true);
+        routeChipRow = new LinearLayout(this);
+        routeChipRow.setOrientation(LinearLayout.HORIZONTAL);
+        routeChipRow.setGravity(Gravity.CENTER_VERTICAL);
+        scroller.addView(routeChipRow, new HorizontalScrollView.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        scroller.setVisibility(View.GONE);
+        return scroller;
+    }
+
+    private void rebuildRouteChips() {
+        long now = System.currentTimeMillis();
+        if (now - lastChipsRebuildMs < CHIPS_REBUILD_INTERVAL_MS) {
+            return;
+        }
+        lastChipsRebuildMs = now;
+
+        Map<String, Integer> routeCounts = new LinkedHashMap<>();
+        for (AnimatedBusMarker marker : trackedBusMarkers.values()) {
+            String route = marker.label == null ? "" : marker.label.trim();
+            if (route.isEmpty()) {
+                continue;
+            }
+            Integer count = routeCounts.get(route);
+            routeCounts.put(route, count == null ? 1 : count + 1);
+        }
+        if (routeCounts.isEmpty()) {
+            routeChipRow.removeAllViews();
+            routeChipsScroll.setVisibility(View.GONE);
+            return;
+        }
+
+        List<Map.Entry<String, Integer>> sorted = new ArrayList<>(routeCounts.entrySet());
+        sorted.sort((a, b) -> b.getValue() - a.getValue());
+        if (sorted.size() > 8) {
+            sorted = sorted.subList(0, 8);
+        }
+
+        routeChipRow.removeAllViews();
+        routeChipRow.addView(makeRouteChip("All", "", sorted.size()));
+        for (Map.Entry<String, Integer> entry : sorted) {
+            routeChipRow.addView(makeRouteChip(entry.getKey() + " ·" + entry.getValue(), entry.getKey(), entry.getValue()));
+        }
+        routeChipsScroll.setVisibility(View.VISIBLE);
+    }
+
+    private TextView makeRouteChip(String label, String route, int count) {
+        boolean selected = activeRouteFilter.isEmpty() ? route.isEmpty() : activeRouteFilter.equalsIgnoreCase(route);
+        TextView chip = UiTheme.pillText(this, label,
+                selected ? UiTheme.INK : Color.WHITE,
+                selected ? UiTheme.CYAN : UiTheme.withAlpha(UiTheme.INK_LIGHT, 235),
+                selected ? UiTheme.CYAN : UiTheme.withAlpha(Color.WHITE, 55));
+        chip.setOnClickListener(v -> selectRouteFilter(route));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.setMargins(dp(5), 0, dp(5), 0);
+        chip.setLayoutParams(params);
+        return chip;
+    }
+
+    private void selectRouteFilter(String route) {
+        activeRouteFilter = route == null ? "" : route.trim();
+        filterMapMarkersForRoute(activeRouteFilter);
+        arBusStopView.setRouteFilter(activeRouteFilter);
+        lastChipsRebuildMs = 0L;
+        rebuildRouteChips();
+    }
+
+    private void showBusListDialog() {
+        if (trackedBusMarkers.isEmpty()) {
+            Toast.makeText(this, "No live buses yet. Add a free BODS key for real-time tracking.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        List<AnimatedBusMarker> markers = new ArrayList<>(trackedBusMarkers.values());
+        markers.sort((a, b) -> Float.compare(a.currentSpeedKph, b.currentSpeedKph));
+        StringBuilder message = new StringBuilder();
+        int shown = 0;
+        for (AnimatedBusMarker marker : markers) {
+            if (shown >= 12) {
+                message.append("\n…and ").append(markers.size() - shown).append(" more");
+                break;
+            }
+            message.append("• Route ").append(marker.label)
+                    .append(" → ").append(firstNonEmpty(marker.destinationName, "unknown"))
+                    .append(" · ").append(marker.currentSpeedKph <= 0.5f ? "stopped" : String.format(Locale.UK, "%.0f mph", marker.currentSpeedKph * 0.621371f))
+                    .append("\n");
+            shown++;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(trackedBusMarkers.size() + " buses live now")
+                .setMessage(message.toString().trim())
+                .setPositiveButton(android.R.string.ok, null)
+                .show();
     }
 
     private void refreshLiveMap() {
@@ -326,17 +523,40 @@ public class MainActivity extends Activity {
         });
     }
 
-    private TextView createHelperChip() {
-        TextView chip = new TextView(this);
-        chip.setText("Tap mic to filter a route, AR for bus stop finder, buses for last seen");
-        chip.setTextColor(Color.WHITE);
-        chip.setTextSize(13);
-        chip.setTypeface(Typeface.DEFAULT_BOLD);
-        chip.setGravity(Gravity.CENTER);
-        chip.setBackgroundColor(Color.argb(220, 17, 76, 141));
-        chip.setPadding(dp(12), dp(8), dp(12), dp(8));
-        chip.setOnClickListener(v -> chip.setVisibility(View.GONE));
-        return chip;
+    private void applyNightMode(boolean night, boolean force) {
+        if (!force && nightModeEnabled == night) {
+            return;
+        }
+        nightModeEnabled = night;
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(PREF_NIGHT_MODE, night).apply();
+        if (nightModeButton != null) {
+            nightModeButton.setText(night ? "☀" : "🌙");
+            nightModeButton.setContentDescription(night ? "Switch back to day mode" : "Switch to night mode");
+        }
+        String css;
+        if (night) {
+            css = "body{background:#0b1226!important;color:#dfe7ff!important}"
+                    + ".maplibregl-canvas,.mapboxgl-canvas,.leaflet-tile-pane,.leaflet-tile-container,.leaflet-tile"
+                    + "{filter:invert(1) hue-rotate(180deg) brightness(.92) contrast(.92) saturate(.85)!important}"
+                    + ".maplibregl-popup-content,.mapboxgl-popup-content,.leaflet-popup-content-wrapper"
+                    + "{background:#101a38!important;color:#dfe7ff!important}"
+                    + ".maplibregl-popup-tip,.mapboxgl-popup-tip,.leaflet-popup-tip"
+                    + "{border-top-color:#101a38!important;border-bottom-color:#101a38!important;"
+                    + "border-left-color:#101a38!important;border-right-color:#101a38!important}"
+                    + "h1,h2,h3,h4,p,span,td,th,li,label,small,strong,b{color:#dfe7ff!important}"
+                    + "a{color:#7fc4ff!important}"
+                    + "header,footer,nav,section,article,aside,table,form,main{background-color:#0e1730!important;color:#dfe7ff!important}"
+                    + "button,input,select,textarea{background-color:#16224a!important;color:#dfe7ff!important;border-color:#2a3a6e!important}";
+        } else {
+            css = "";
+        }
+        String script = "(function(){"
+                + "var style=document.getElementById('bustimes-night');"
+                + "if(!style){style=document.createElement('style');style.id='bustimes-night';document.head.appendChild(style);}"
+                + "style.textContent=\"" + escapeJs(css).replace("\"", "\\\"") + "\";"
+                + "return true;})();";
+        webView.evaluateJavascript(script, ignored -> {
+        });
     }
 
     private int dp(int value) {
@@ -353,6 +573,10 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
+        if (arModeEnabled) {
+            showStandardMap();
+            return;
+        }
         if (webView != null && webView.canGoBack()) {
             webView.goBack();
             return;
@@ -362,6 +586,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        uiHandler.removeCallbacksAndMessages(null);
         if (busTrackingReceiverRegistered) {
             unregisterReceiver(busTrackingReceiver);
             busTrackingReceiverRegistered = false;
@@ -553,7 +778,7 @@ public class MainActivity extends Activity {
                 // The user may have granted approximate location only; keep trying providers allowed by that grant.
             }
         }
-        locateHandler.postDelayed(() -> {
+        scheduleLocateTimeout(() -> {
             if (locateLocationListener == null) {
                 return;
             }
@@ -567,8 +792,19 @@ public class MainActivity extends Activity {
         }, 10_000L);
     }
 
+    private void scheduleLocateTimeout(Runnable runnable, long delayMs) {
+        if (locateTimeoutRunnable != null) {
+            uiHandler.removeCallbacks(locateTimeoutRunnable);
+        }
+        locateTimeoutRunnable = runnable;
+        uiHandler.postDelayed(runnable, delayMs);
+    }
+
     private void stopLocateUpdates() {
-        locateHandler.removeCallbacksAndMessages(null);
+        if (locateTimeoutRunnable != null) {
+            uiHandler.removeCallbacks(locateTimeoutRunnable);
+            locateTimeoutRunnable = null;
+        }
         if (locateLocationListener == null) {
             return;
         }
@@ -642,17 +878,14 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "Route " + route + " is not currently active.", Toast.LENGTH_LONG).show();
             return false;
         }
-        activeRouteFilter = route;
-        filterMapMarkersForRoute(activeRouteFilter);
-        if (arModeEnabled) {
-            showStandardMap();
-        }
+        selectRouteFilter(route);
         arBusStopView.setNavigationTarget("route " + marker.label, marker.latitude, marker.longitude);
         animateMapCameraTo(marker.latitude, marker.longitude, 16f);
-        Toast.makeText(this, "Zooming to live route " + route, Toast.LENGTH_LONG).show();
+        Toast.makeText(this, arModeEnabled
+                ? "AR guiding you to live route " + route
+                : "Zooming to live route " + route, Toast.LENGTH_LONG).show();
         return true;
     }
-
 
     private void animateMapCameraTo(double latitude, double longitude, float zoom) {
         String script = String.format(Locale.US,
@@ -719,11 +952,7 @@ public class MainActivity extends Activity {
     }
 
     private void applyConfirmedRouteFilter(VoiceRouteQuery query) {
-        activeRouteFilter = query.route;
-        filterMapMarkersForRoute(activeRouteFilter);
-        if (arModeEnabled) {
-            showStandardMap();
-        }
+        selectRouteFilter(query.route);
 
         Location targetLocation = query.location != null ? query.location : getCurrentLocalSearchLocation();
         if (targetLocation != null) {
@@ -881,8 +1110,7 @@ public class MainActivity extends Activity {
 
         StringBuilder result = new StringBuilder();
         String[] words = text.split(" ");
-        for (int i = 0; i < words.length; i++) {
-            String word = words[i];
+        for (String word : words) {
             if (word.matches("[0-9]+")) {
                 result.append(word);
             } else if (digitWords.containsKey(word)) {
@@ -906,8 +1134,9 @@ public class MainActivity extends Activity {
         String script = "(function(){"
                 + "window.__bodsRouteFilter='" + escapedRoute + "';"
                 + "Object.keys(window.__bodsMarkers||{}).forEach(function(key){"
-                + "var marker=window.__bodsMarkers[key];var route=(marker.dataset.route||marker.textContent||'').trim();"
-                + "marker.style.display=(!window.__bodsRouteFilter||route.toLowerCase().indexOf(window.__bodsRouteFilter.toLowerCase())!==-1)?'flex':'none';"
+                + "var marker=window.__bodsMarkers[key];var route=(marker.dataset.route||'').trim();"
+                + "var visible=(!window.__bodsRouteFilter||route.toLowerCase().indexOf(window.__bodsRouteFilter.toLowerCase())!==-1);"
+                + "marker.style.display=visible?'block':'none';"
                 + "});"
                 + "return true;})();";
         webView.evaluateJavascript(script, ignored -> {
@@ -933,15 +1162,23 @@ public class MainActivity extends Activity {
         arModeEnabled = true;
         webView.setVisibility(View.GONE);
         arBusStopView.setVisibility(View.VISIBLE);
-        arToggleButton.setText("Map View");
+        arToggleButton.setText("✕ Exit AR");
         refreshButton.setVisibility(View.GONE);
         zoomControls.setVisibility(View.GONE);
+        routeChipsScroll.setVisibility(View.GONE);
+        statusPill.setVisibility(View.GONE);
         arBusStopView.setRouteFilter(activeRouteFilter);
         arBusStopView.showStopsNear(hasLocationPermission()
                 ? getBestLastKnownLocation((LocationManager) getSystemService(Context.LOCATION_SERVICE))
                 : null);
         arBusStopView.startAr();
         startArLocationUpdates();
+        if (!Double.isNaN(pendingNavigationLatitude) && !Double.isNaN(pendingNavigationLongitude)) {
+            arBusStopView.setNavigationTarget(pendingNavigationName, pendingNavigationLatitude, pendingNavigationLongitude);
+            pendingNavigationLatitude = Double.NaN;
+            pendingNavigationLongitude = Double.NaN;
+            pendingNavigationName = null;
+        }
         bringNativeControlsToFront();
     }
 
@@ -998,12 +1235,15 @@ public class MainActivity extends Activity {
         arBusStopView.destroyAr();
         arBusStopView.setVisibility(View.GONE);
         webView.setVisibility(View.VISIBLE);
-        arToggleButton.setText("AR View");
+        arToggleButton.setText("✦ AR View");
         refreshButton.setVisibility(View.VISIBLE);
         zoomControls.setVisibility(View.VISIBLE);
+        statusPill.setVisibility(View.VISIBLE);
+        if (!trackedBusMarkers.isEmpty()) {
+            routeChipsScroll.setVisibility(View.VISIBLE);
+        }
         bringNativeControlsToFront();
     }
-
 
     private void hideAdsOnPage() {
         String script = "(function(){"
@@ -1028,7 +1268,9 @@ public class MainActivity extends Activity {
         microphoneButton.bringToFront();
         arToggleButton.bringToFront();
         zoomControls.bringToFront();
-        helperChip.bringToFront();
+        statusPill.bringToFront();
+        liveCountPill.bringToFront();
+        routeChipsScroll.bringToFront();
     }
 
     private void registerBusTrackingReceiver() {
@@ -1043,6 +1285,38 @@ public class MainActivity extends Activity {
         busTrackingReceiverRegistered = true;
     }
 
+    private void openBusDetailsFromAr(BusSnapshot snapshot) {
+        BusDetailsSheet.show(this, snapshot, new BusDetailsSheet.Callbacks() {
+            @Override
+            public void onNavigateToBus(double navLatitude, double navLongitude) {
+                arBusStopView.setNavigationTarget("route " + snapshot.lineName, navLatitude, navLongitude);
+            }
+
+            @Override
+            public boolean isFollowingBus(String followId) {
+                return followId != null && followId.equals(followBusId);
+            }
+
+            @Override
+            public void onShowBusOnMap(double mapLatitude, double mapLongitude) {
+                if (arModeEnabled) {
+                    showStandardMap();
+                    animateMapCameraTo(mapLatitude, mapLongitude, 16f);
+                }
+            }
+
+            @Override
+            public void onFollowBus(String followId, boolean follow) {
+                if (follow) {
+                    startFollowingBus(followId);
+                } else {
+                    stopFollowingBus(null);
+                    Toast.makeText(MainActivity.this, "Stopped following", Toast.LENGTH_SHORT).show();
+                }
+            }
+        });
+    }
+
     private void updateTrackedBusMarker(Intent intent) {
         String id = intent.getStringExtra(BusPosition.EXTRA_ID);
         if (id == null || id.trim().isEmpty()) {
@@ -1055,6 +1329,7 @@ public class MainActivity extends Activity {
         String expectedArrivalTime = intent.getStringExtra(BusPosition.EXTRA_EXPECTED_ARRIVAL_TIME);
         String recordedAt = intent.getStringExtra(BusPosition.EXTRA_RECORDED_AT);
         String occupancy = intent.getStringExtra(BusPosition.EXTRA_OCCUPANCY);
+        String operatorName = intent.getStringExtra(BusPosition.EXTRA_OPERATOR);
         double nextLatitude = intent.getDoubleExtra(BusPosition.EXTRA_LATITUDE, Double.NaN);
         double nextLongitude = intent.getDoubleExtra(BusPosition.EXTRA_LONGITUDE, Double.NaN);
         float nextBearing = intent.getFloatExtra(BusPosition.EXTRA_BEARING, Float.NaN);
@@ -1066,9 +1341,12 @@ public class MainActivity extends Activity {
         if (marker == null) {
             marker = new AnimatedBusMarker(id, firstNonEmpty(lineName, lineRef, "Bus"), lineRef, destinationName,
                     expectedArrivalTime, nextLatitude, nextLongitude, Float.isNaN(nextBearing) ? 0f : nextBearing,
-                    firstNonEmpty(recordedAt, "Unknown"), firstNonEmpty(occupancy, "Information Unknown"));
+                    firstNonEmpty(recordedAt, "Unknown"), firstNonEmpty(occupancy, "Information Unknown"),
+                    firstNonEmpty(operatorName, ""));
             trackedBusMarkers.put(id, marker);
-            marker.renderAt(nextLatitude, nextLongitude, marker.bearing);
+            marker.renderAt(nextLatitude, nextLongitude, marker.bearing, true);
+            updateLiveCountPill();
+            rebuildRouteChips();
             return;
         }
 
@@ -1076,7 +1354,112 @@ public class MainActivity extends Activity {
                 ? bearingBetween(marker.latitude, marker.longitude, nextLatitude, nextLongitude)
                 : nextBearing;
         marker.animateTo(nextLatitude, nextLongitude, bearing, firstNonEmpty(recordedAt, "Unknown"),
-                firstNonEmpty(occupancy, "Information Unknown"), destinationName, expectedArrivalTime);
+                firstNonEmpty(occupancy, "Information Unknown"), destinationName, expectedArrivalTime,
+                firstNonEmpty(operatorName, ""));
+        updateLiveCountPill();
+        rebuildRouteChips();
+    }
+
+    private void updateLiveCountPill() {
+        int count = trackedBusMarkers.size();
+        liveCountPill.setText(count + (count == 1 ? " bus live" : " buses live"));
+    }
+
+    private void removeStaleMarkers() {
+        if (trackedBusMarkers.isEmpty()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        List<String> staleIds = new ArrayList<>();
+        for (AnimatedBusMarker marker : trackedBusMarkers.values()) {
+            if (now - marker.lastUpdateWallClockMs > MARKER_STALE_MS) {
+                staleIds.add(marker.id);
+            }
+        }
+        if (staleIds.isEmpty()) {
+            return;
+        }
+        StringBuilder removals = new StringBuilder("(function(){");
+        for (String id : staleIds) {
+            removals.append("var m=window.__bodsMarkers&&window.__bodsMarkers['")
+                    .append(escapeJs(id)).append("'];if(m){m.remove();delete window.__bodsMarkers['")
+                    .append(escapeJs(id)).append("'];}");
+            trackedBusMarkers.remove(id);
+            if (id.equals(followBusId)) {
+                stopFollowingBus("The bus you were following went offline.");
+            }
+        }
+        removals.append("return true;})();");
+        webView.evaluateJavascript(removals.toString(), ignored -> {
+        });
+        updateLiveCountPill();
+        lastChipsRebuildMs = 0L;
+        rebuildRouteChips();
+    }
+
+    private void startFollowingBus(String busId) {
+        followBusId = busId;
+        uiHandler.removeCallbacks(followRunnable);
+        uiHandler.postDelayed(followRunnable, 400L);
+        Toast.makeText(this, "Following this bus — the map will keep it centred", Toast.LENGTH_SHORT).show();
+    }
+
+    private void stopFollowingBus(String reason) {
+        followBusId = null;
+        uiHandler.removeCallbacks(followRunnable);
+        if (reason != null && !reason.isEmpty()) {
+            Toast.makeText(this, reason, Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void stepFollowMode() {
+        if (followBusId == null) {
+            return;
+        }
+        AnimatedBusMarker marker = trackedBusMarkers.get(followBusId);
+        if (marker == null) {
+            stopFollowingBus("The bus you were following went offline.");
+            return;
+        }
+        if (arModeEnabled) {
+            arBusStopView.setNavigationTarget("route " + marker.label, marker.latitude, marker.longitude);
+        } else {
+            animateMapCameraTo(marker.latitude, marker.longitude, 15.5f);
+        }
+        uiHandler.postDelayed(followRunnable, FOLLOW_INTERVAL_MS);
+    }
+
+    private String computeDistanceText(double latitude, double longitude) {
+        if (!hasLocationPermission()) {
+            return "";
+        }
+        Location userLocation = getBestLastKnownLocation((LocationManager) getSystemService(Context.LOCATION_SERVICE));
+        if (userLocation == null) {
+            return "";
+        }
+        Location target = new Location("bus");
+        target.setLatitude(latitude);
+        target.setLongitude(longitude);
+        float metres = userLocation.distanceTo(target);
+        if (metres < 1000f) {
+            return String.format(Locale.UK, "%.0fm away", metres);
+        }
+        return String.format(Locale.UK, "%.1fkm away", metres / 1000f);
+    }
+
+    private int parseEtaMinutes(String etaText) {
+        if (etaText == null) {
+            return -1;
+        }
+        String digits = etaText.replaceAll("[^0-9]", " ").trim();
+        if (digits.isEmpty()) {
+            return -1;
+        }
+        try {
+            return Integer.parseInt(digits.split("\\s+")[0]);
+        } catch (NumberFormatException exception) {
+            return -1;
+        }
     }
 
     private float bearingBetween(double startLatitude, double startLongitude, double endLatitude, double endLongitude) {
@@ -1089,7 +1472,6 @@ public class MainActivity extends Activity {
         return (float) ((Math.toDegrees(Math.atan2(y, x)) + 360.0) % 360.0);
     }
 
-
     private double parseDouble(String value, double fallback) {
         if (value == null) {
             return fallback;
@@ -1101,13 +1483,15 @@ public class MainActivity extends Activity {
         }
     }
 
-
     private String etaText(String expectedArrivalTime) {
         Date expected = parseBodsTime(expectedArrivalTime);
         if (expected == null) {
             return "ETA unknown";
         }
         long minutes = Math.max(0L, Math.round((expected.getTime() - System.currentTimeMillis()) / 60000.0));
+        if (minutes == 0) {
+            return "Arriving now";
+        }
         return String.format(Locale.UK, "Arriving in %d mins", minutes);
     }
 
@@ -1148,8 +1532,8 @@ public class MainActivity extends Activity {
                 .replace("\r", "");
     }
 
-    private void renderNativeBusMarker(String id, String label, String destination, String etaText, double latitude, double longitude,
-            float bearing, String lastSeen, String occupancy) {
+    private void renderNativeBusMarker(String id, String label, String destination, String etaText, double latitude,
+            double longitude, float bearing, String lastSeen, String occupancy, float speedKph, String operator) {
         String script = String.format(Locale.US,
                 "(function(){"
                         + "window.__bodsMarkers=window.__bodsMarkers||{};"
@@ -1162,24 +1546,66 @@ public class MainActivity extends Activity {
                         + "if(getComputedStyle(container).position==='static')container.style.position='relative';"
                         + "var marker=window.__bodsMarkers['%s'];"
                         + "var occupancy='%s';"
-                        + "var markerColor=(occupancy==='Full/Crowded')?'#d32f2f':(occupancy==='Standing Room Only'?'#fbc02d':(occupancy==='Easy Seating'?'#2e7d32':'#1976d2'));"
-                        + "if(!marker){marker=document.createElement('div');marker.className='native-bods-bus-marker';"
-                        + "marker.style.cssText='position:absolute;z-index:50;width:34px;height:34px;margin-left:-17px;margin-top:-17px;border-radius:17px;background:'+markerColor+';color:white;border:2px solid white;box-shadow:0 2px 6px rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;font:bold 12px sans-serif;pointer-events:auto;cursor:pointer;transform-origin:center center;';"
-                        + "container.appendChild(marker);window.__bodsMarkers['%s']=marker;}"
-                        + "marker.style.background=markerColor;marker.textContent='%s';marker.dataset.route='%s';marker.dataset.occupancy=occupancy;"
+                        + "var markerColor=(occupancy==='Full/Crowded')?'#ff5a5f':(occupancy==='Standing Room Only'?'#ffb300':(occupancy==='Easy Seating'?'#2ad37e':'#2e7cf6'));"
+                        + "if(!marker){"
+                        + "marker=document.createElement('div');"
+                        + "marker.className='native-bods-bus-marker';"
+                        + "marker.style.cssText='position:absolute;z-index:50;width:0;height:0;pointer-events:auto;cursor:pointer;';"
+                        + "var badge=document.createElement('div');"
+                        + "badge.className='bods-badge';"
+                        + "badge.style.cssText='position:absolute;left:-17px;top:-17px;width:34px;height:34px;border-radius:50%;"
+                        + "border:2px solid rgba(255,255,255,.95);box-shadow:0 4px 10px rgba(0,0,0,.5);"
+                        + "display:flex;align-items:center;justify-content:center;font:bold 12px/1 sans-serif;color:#fff;"
+                        + "box-sizing:border-box;';"
+                        + "var arrow=document.createElement('div');"
+                        + "arrow.className='bods-arrow';"
+                        + "arrow.style.cssText='position:absolute;left:-6px;top:-5px;width:0;height:0;"
+                        + "border-left:6px solid transparent;border-right:6px solid transparent;border-bottom:10px solid '+markerColor+';"
+                        + "transform-origin:6px 5px;';"
+                        + "marker.appendChild(arrow);marker.appendChild(badge);"
+                        + "container.appendChild(marker);window.__bodsMarkers['%s']=marker;"
+                        + "marker.onclick=function(event){if(event)event.stopPropagation();"
+                        + "if(window.BusMarkerBridge){window.BusMarkerBridge.showBusDetails("
+                        + "marker.dataset.id,marker.dataset.route,marker.dataset.destination,marker.dataset.eta,"
+                        + "marker.dataset.lastSeen,marker.dataset.occupancy,marker.dataset.lat,marker.dataset.lng,"
+                        + "marker.dataset.speed,marker.dataset.bearing,marker.dataset.operator);}};"
+                        + "}"
+                        + "var badge=marker.firstChild.nextSibling;"
+                        + "var arrow=marker.firstChild;"
+                        + "badge.textContent='%s';badge.style.background=markerColor;"
+                        + "badge.style.boxShadow='0 4px 10px rgba(0,0,0,.5),0 0 14px '+markerColor;"
+                        + "arrow.style.borderBottomColor=markerColor;"
+                        + "arrow.style.transform='rotate('+parseFloat('%f')+'deg) translateY(-26px)';"
+                        + "marker.dataset.id='%s';marker.dataset.route='%s';marker.dataset.occupancy=occupancy;"
                         + "marker.dataset.lng=%f;marker.dataset.lat=%f;marker.dataset.bearing=%f;"
                         + "marker.dataset.destination='%s';marker.dataset.eta='%s';marker.dataset.lastSeen='%s';"
-                        + "marker.title='Route %s to '+marker.dataset.destination+'\\n'+marker.dataset.eta+'\\nOccupancy: '+occupancy+'\\nLast seen: %s';"
-                        + "marker.onclick=function(event){if(event)event.stopPropagation();if(window.BusMarkerBridge){window.BusMarkerBridge.showBusDetails('%s',marker.dataset.lastSeen,marker.dataset.occupancy,marker.dataset.lat,marker.dataset.lng,marker.dataset.destination,marker.dataset.eta);}};"
-                        + "if(window.__bodsRouteFilter){marker.style.display=(marker.dataset.route.toLowerCase().indexOf(window.__bodsRouteFilter.toLowerCase())!==-1)?'flex':'none';}"
-                        + "window.__bodsPlaceMarker=function(m){var p=map.project([parseFloat(m.dataset.lng),parseFloat(m.dataset.lat)]);m.style.left=p.x+'px';m.style.top=p.y+'px';m.style.transform='rotate('+parseFloat(m.dataset.bearing)+'deg)';};"
+                        + "marker.dataset.speed='%f';marker.dataset.operator='%s';"
+                        + "marker.title='Route %s to %s\\n%s\\nSpeed: %s\\nOccupancy: '+occupancy+'\\nLast seen: %s\\nTap for full details';"
+                        + "if(window.__bodsRouteFilter){"
+                        + "var visible=marker.dataset.route.toLowerCase().indexOf(window.__bodsRouteFilter.toLowerCase())!==-1;"
+                        + "marker.style.display=visible?'block':'none';}"
+                        + "window.__bodsPlaceMarker=function(m){var p=map.project([parseFloat(m.dataset.lng),parseFloat(m.dataset.lat)]);"
+                        + "m.style.left=p.x+'px';m.style.top=p.y+'px';};"
                         + "window.__bodsPlaceMarker(marker);"
-                        + "if(!window.__bodsMarkersListening){window.__bodsMarkersListening=true;var update=function(){Object.keys(window.__bodsMarkers).forEach(function(key){window.__bodsPlaceMarker(window.__bodsMarkers[key]);});};map.on&&map.on('move',update);map.on&&map.on('zoom',update);map.on&&map.on('resize',update);}"
+                        + "if(!window.__bodsMarkersListening){window.__bodsMarkersListening=true;"
+                        + "var update=function(){Object.keys(window.__bodsMarkers).forEach(function(key){window.__bodsPlaceMarker(window.__bodsMarkers[key]);});};"
+                        + "map.on&&map.on('move',update);map.on&&map.on('zoom',update);map.on&&map.on('resize',update);}"
                         + "return true;})();",
-                escapeJs(id), escapeJs(id), escapeJs(occupancy), escapeJs(label), escapeJs(label), longitude, latitude, bearing,
-                escapeJs(destination), escapeJs(etaText), escapeJs(lastSeen), escapeJs(label), escapeJs(lastSeen), escapeJs(label));
+                escapeJs(id), escapeJs(occupancy), escapeJs(id),
+                escapeJs(label), bearing,
+                escapeJs(id), escapeJs(label), longitude, latitude, bearing,
+                escapeJs(destination), escapeJs(etaText), escapeJs(lastSeen), speedKph, escapeJs(operator),
+                escapeJs(label), escapeJs(destination), escapeJs(etaText), escapeJs(speedText(speedKph)),
+                escapeJs(lastSeen));
         webView.evaluateJavascript(script, ignored -> {
         });
+    }
+
+    private String speedText(float speedKph) {
+        if (speedKph <= 0.5f) {
+            return "stopped";
+        }
+        return String.format(Locale.UK, "%.0f mph", speedKph * 0.621371f);
     }
 
     private void openOutsideApp(Uri uri) {
@@ -1273,23 +1699,66 @@ public class MainActivity extends Activity {
 
     private class BusMarkerBridge {
         @JavascriptInterface
-        public void showBusDetails(String route, String lastSeen, String occupancy, String latitude, String longitude,
-                String destination, String etaText) {
+        public void showBusDetails(String busId, String route, String destination, String etaText, String lastSeen,
+                String occupancy, String latitude, String longitude, String speed, String bearing, String operator) {
             runOnUiThread(() -> {
                 double targetLatitude = parseDouble(latitude, Double.NaN);
                 double targetLongitude = parseDouble(longitude, Double.NaN);
-                if (!Double.isNaN(targetLatitude) && !Double.isNaN(targetLongitude)) {
-                    arBusStopView.setNavigationTarget("route " + firstNonEmpty(route, "Bus"), targetLatitude, targetLongitude);
+                if (Double.isNaN(targetLatitude) || Double.isNaN(targetLongitude)) {
+                    return;
                 }
-                new AlertDialog.Builder(MainActivity.this)
-                        .setTitle("Route " + firstNonEmpty(route, "Bus"))
-                        .setMessage("Destination: " + firstNonEmpty(destination, "Unknown")
-                                + "\n" + firstNonEmpty(etaText, "ETA unknown")
-                                + "\nLast seen: " + firstNonEmpty(lastSeen, "Unknown")
-                                + "\nOccupancy: " + firstNonEmpty(occupancy, "Information Unknown")
-                                + "\nAR path: select AR View to follow the glowing pavement line.")
-                        .setPositiveButton(android.R.string.ok, null)
-                        .show();
+                BusSnapshot snapshot = new BusSnapshot(
+                        firstNonEmpty(busId, "bus"),
+                        firstNonEmpty(route, "Bus"),
+                        "",
+                        firstNonEmpty(destination, "destination unknown"),
+                        firstNonEmpty(occupancy, "Information Unknown"),
+                        firstNonEmpty(busId, "—"),
+                        firstNonEmpty(lastSeen, ""),
+                        firstNonEmpty(operator, ""),
+                        computeDistanceText(targetLatitude, targetLongitude),
+                        targetLatitude,
+                        targetLongitude,
+                        (float) parseDouble(bearing, Float.NaN),
+                        (float) parseDouble(speed, 0f),
+                        parseEtaMinutes(etaText),
+                        "its next stop");
+                BusDetailsSheet.show(MainActivity.this, snapshot, new BusDetailsSheet.Callbacks() {
+                    @Override
+                    public void onNavigateToBus(double navLatitude, double navLongitude) {
+                        pendingNavigationName = "route " + snapshot.lineName;
+                        pendingNavigationLatitude = navLatitude;
+                        pendingNavigationLongitude = navLongitude;
+                        if (!arModeEnabled) {
+                            toggleArMode();
+                        } else {
+                            showArView();
+                        }
+                    }
+
+                    @Override
+                    public void onFollowBus(String followId, boolean follow) {
+                        if (follow) {
+                            startFollowingBus(followId);
+                        } else {
+                            stopFollowingBus(null);
+                            Toast.makeText(MainActivity.this, "Stopped following", Toast.LENGTH_SHORT).show();
+                        }
+                    }
+
+                    @Override
+                    public boolean isFollowingBus(String followId) {
+                        return followId != null && followId.equals(followBusId);
+                    }
+
+                    @Override
+                    public void onShowBusOnMap(double mapLatitude, double mapLongitude) {
+                        if (arModeEnabled) {
+                            showStandardMap();
+                        }
+                        animateMapCameraTo(mapLatitude, mapLongitude, 16f);
+                    }
+                });
             });
         }
     }
@@ -1300,15 +1769,20 @@ public class MainActivity extends Activity {
         private final String lineRef;
         private String destinationName;
         private String expectedArrivalTime;
+        private String operatorName;
         private double latitude;
         private double longitude;
         private float bearing;
         private String lastSeen;
         private String occupancy;
+        private float currentSpeedKph;
+        private long lastUpdateWallClockMs;
+        private long lastJsRenderMs;
+        private long lastBillboardRenderMs;
         private ValueAnimator animator;
 
         AnimatedBusMarker(String id, String label, String lineRef, String destinationName, String expectedArrivalTime,
-                double latitude, double longitude, float bearing, String lastSeen, String occupancy) {
+                double latitude, double longitude, float bearing, String lastSeen, String occupancy, String operatorName) {
             this.id = id;
             this.label = label;
             this.lineRef = lineRef;
@@ -1319,6 +1793,8 @@ public class MainActivity extends Activity {
             this.bearing = bearing;
             this.lastSeen = lastSeen;
             this.occupancy = occupancy;
+            this.operatorName = operatorName;
+            this.lastUpdateWallClockMs = System.currentTimeMillis();
         }
 
         boolean matchesRoute(String normalizedRoute) {
@@ -1337,8 +1813,13 @@ public class MainActivity extends Activity {
         }
 
         void animateTo(double nextLatitude, double nextLongitude, float nextBearing, String nextLastSeen,
-                String nextOccupancy, String nextDestinationName, String nextExpectedArrivalTime) {
+                String nextOccupancy, String nextDestinationName, String nextExpectedArrivalTime, String nextOperator) {
             cancelAnimation();
+            long now = System.currentTimeMillis();
+            float[] speedResult = estimateSpeedKph(latitude, longitude, nextLatitude, nextLongitude, now);
+            currentSpeedKph = speedResult[0];
+            lastUpdateWallClockMs = now;
+
             double startLatitude = latitude;
             double startLongitude = longitude;
             float startBearing = bearing;
@@ -1346,6 +1827,7 @@ public class MainActivity extends Activity {
             occupancy = nextOccupancy;
             destinationName = nextDestinationName;
             expectedArrivalTime = nextExpectedArrivalTime;
+            operatorName = nextOperator;
             animator = ValueAnimator.ofFloat(0f, 1f);
             animator.setDuration(BUS_MARKER_ANIMATION_MS);
             animator.setInterpolator(new LinearInterpolator());
@@ -1354,16 +1836,47 @@ public class MainActivity extends Activity {
                 latitude = startLatitude + ((nextLatitude - startLatitude) * fraction);
                 longitude = startLongitude + ((nextLongitude - startLongitude) * fraction);
                 bearing = startBearing + shortestBearingDelta(startBearing, nextBearing) * fraction;
-                renderAt(latitude, longitude, bearing);
+                boolean finalFrame = fraction >= 0.999f;
+                renderAt(latitude, longitude, bearing, finalFrame);
             });
             animator.start();
         }
 
-        void renderAt(double latitude, double longitude, float bearing) {
-            String etaText = etaText(expectedArrivalTime);
+        /** Returns {speedKph, unused} — speed estimated from the distance between two polls. */
+        private float[] estimateSpeedKph(double fromLatitude, double fromLongitude,
+                double toLatitude, double toLongitude, long now) {
+            if (lastUpdateWallClockMs <= 0L) {
+                return new float[] { 0f };
+            }
+            long seconds = (now - lastUpdateWallClockMs) / 1000L;
+            if (seconds < 1L || seconds > 180L) {
+                return new float[] { currentSpeedKph };
+            }
+            float[] results = new float[1];
+            float[] distanceHolder = new float[1];
+            Location.distanceBetween(fromLatitude, fromLongitude, toLatitude, toLongitude, distanceHolder);
+            float kph = distanceHolder[0] / seconds * 3.6f;
+            if (kph > 130f) {
+                kph = currentSpeedKph; // impossible jump — GPS glitch, keep previous speed
+            }
+            results[0] = Math.max(0f, kph);
+            return results;
+        }
+
+        void renderAt(double renderLatitude, double renderLongitude, float renderBearing, boolean force) {
+            long now = System.currentTimeMillis();
+            String eta = etaText(expectedArrivalTime);
             String destination = firstNonEmpty(destinationName, "destination unknown");
-            arBusStopView.updateBusBillboard(id, label, destination, etaText, occupancy, latitude, longitude);
-            renderNativeBusMarker(id, label, destination, etaText, latitude, longitude, bearing, lastSeen, occupancy);
+            if (force || now - lastJsRenderMs >= MARKER_JS_THROTTLE_MS) {
+                lastJsRenderMs = now;
+                renderNativeBusMarker(id, label, destination, eta, renderLatitude, renderLongitude,
+                        renderBearing, lastSeen, occupancy, currentSpeedKph, operatorName);
+            }
+            if (force || now - lastBillboardRenderMs >= BILLBOARD_THROTTLE_MS) {
+                lastBillboardRenderMs = now;
+                arBusStopView.updateBusBillboard(id, label, destination, eta, occupancy,
+                        renderLatitude, renderLongitude, renderBearing, currentSpeedKph);
+            }
         }
 
         void cancelAnimation() {
@@ -1385,7 +1898,12 @@ public class MainActivity extends Activity {
                 updateTrackedBusMarker(intent);
             } else if (BusTrackingService.ACTION_TRACKING_STATUS.equals(action)) {
                 String message = intent.getStringExtra(BusTrackingService.EXTRA_STATUS_MESSAGE);
-                if (message != null && message.startsWith("Add a BODS_API_KEY")) {
+                if (message == null) {
+                    return;
+                }
+                statusPill.setVisibility(View.VISIBLE);
+                statusPill.setText(message);
+                if (message.startsWith("Add a BODS_API_KEY")) {
                     Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
                 }
             }
@@ -1396,8 +1914,13 @@ public class MainActivity extends Activity {
         @Override
         public void onPageFinished(WebView view, String url) {
             hideAdsOnPage();
+            applyNightMode(nightModeEnabled, true);
             if (!activeRouteFilter.isEmpty()) {
                 filterMapMarkersForRoute(activeRouteFilter);
+            }
+            // Re-render every tracked marker after a reload so the overlay survives page refreshes.
+            for (AnimatedBusMarker marker : trackedBusMarkers.values()) {
+                marker.renderAt(marker.latitude, marker.longitude, marker.bearing, true);
             }
             bringNativeControlsToFront();
         }
@@ -1420,6 +1943,7 @@ public class MainActivity extends Activity {
             progressBar.setVisibility(newProgress >= 100 ? View.GONE : View.VISIBLE);
             if (newProgress >= 100) {
                 hideAdsOnPage();
+                applyNightMode(nightModeEnabled, true);
                 if (!activeRouteFilter.isEmpty()) {
                     filterMapMarkersForRoute(activeRouteFilter);
                 }

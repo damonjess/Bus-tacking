@@ -193,6 +193,7 @@ public class BusTrackingService extends Service {
             String lineRef = text(journey, "LineRef");
             String lineName = text(journey, "PublishedLineName");
             String destinationName = text(journey, "DestinationName");
+            String operatorName = text(journey, "OperatorRef");
             String expectedArrivalTime = firstNonEmpty(text(journey, "ExpectedArrivalTime"), text(journey, "AimedArrivalTime"));
             String id = firstNonEmpty(vehicleRef, datedJourneyRef, lineRef + ":" + i);
             float bearing = parseFloat(text(journey, "Bearing"), Float.NaN);
@@ -206,7 +207,7 @@ public class BusTrackingService extends Service {
                     text(activity, "Occupancy")));
 
             positions.add(new BusPosition(id, firstNonEmpty(lineName, lineRef, "Bus"), lineRef, destinationName,
-                    expectedArrivalTime, latitude, longitude, bearing, recordedAt, occupancy));
+                    expectedArrivalTime, latitude, longitude, bearing, recordedAt, occupancy, operatorName));
         }
 
         return positions;
@@ -260,6 +261,7 @@ public class BusTrackingService extends Service {
         String lineRef = jsonText(journey, "LineRef");
         String lineName = jsonText(journey, "PublishedLineName");
         String destinationName = jsonText(journey, "DestinationName");
+        String operatorName = jsonText(journey, "OperatorRef");
         String expectedArrivalTime = firstNonEmpty(jsonText(journey, "ExpectedArrivalTime"), jsonText(journey, "AimedArrivalTime"),
                 jsonNestedText(journey, "MonitoredCall", "ExpectedArrivalTime"));
         String id = firstNonEmpty(vehicleRef, datedJourneyRef, lineRef + ":" + index);
@@ -277,7 +279,7 @@ public class BusTrackingService extends Service {
                 jsonNestedText(activity, "VehicleJourney", "OccupancyStatus"),
                 jsonNestedText(activity, "VehicleJourney", "Occupancy")));
         return new BusPosition(id, firstNonEmpty(lineName, lineRef, "Bus"), lineRef, destinationName,
-                expectedArrivalTime, latitude, longitude, bearing, recordedAt, occupancy);
+                expectedArrivalTime, latitude, longitude, bearing, recordedAt, occupancy, operatorName);
     }
 
     private static String jsonNestedText(JSONObject parent, String objectName, String key) {
@@ -320,6 +322,7 @@ public class BusTrackingService extends Service {
         intent.putExtra(BusPosition.EXTRA_BEARING, position.bearing);
         intent.putExtra(BusPosition.EXTRA_RECORDED_AT, position.recordedAt);
         intent.putExtra(BusPosition.EXTRA_OCCUPANCY, position.occupancy);
+        intent.putExtra(BusPosition.EXTRA_OPERATOR, position.operatorName);
         sendBroadcast(intent);
     }
 

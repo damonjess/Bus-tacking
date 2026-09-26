@@ -11,6 +11,7 @@ import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RectF;
 import android.graphics.SurfaceTexture;
+import android.graphics.Typeface;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
@@ -21,11 +22,14 @@ import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.params.StreamConfigurationMap;
 import android.location.Location;
 import android.net.Uri;
 import android.os.Build;
 import android.util.AttributeSet;
+import android.util.Size;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.Surface;
 import android.view.TextureView;
 import android.view.View;
@@ -39,8 +43,10 @@ import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -48,28 +54,40 @@ import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+/**
+ * Location-based AR view: live camera + GPS + compass. Places real nearby bus
+ * stops (OpenStreetMap Overpass) and live BODS buses in the camera view, with a
+ * neon navigation wall, compass ribbon, radar, edge chevrons and tap details.
+ */
 public class ArBusStopView extends FrameLayout implements SensorEventListener {
-    private static final float SCUNTHORPE_DECLINATION_DEGREES_EAST = 2.5f;
     private static final float GPS_LOCK_ACCURACY_METERS = 10f;
     private static final float REROUTE_THRESHOLD_METERS = 5f;
     private static final int MAX_DIRECTIONS_POINTS = 160;
     private static final long CALIBRATION_BYPASS_DELAY_MS = 5_000L;
-    private static final int BILLBOARD_HOVER_OFFSET_DP = 70;
+    private static final float HALF_FOV_DEGREES = 32f;      // approximate horizontal half-FOV
+    private static final int EDGE_CHEVRON_INSET_DP = 18;
+    private static final float STOPS_FETCH_RADIUS_METERS = 150f;
+    private static final float OVERPASS_SEARCH_RADIUS_METERS = 800f;
+    private static final float ARRIVAL_DISTANCE_METERS = 40f;
+    private static final int MAX_VISIBLE_STOPS = 8;
 
     private final TextureView cameraPreview;
     private final TextView statusView;
+    private final TextView targetChip;
     private final Button bypassCalibrationButton;
+    private final Button exitArButton;
     private final PathOverlayView pathOverlayView;
     private final List<BusStopPin> stopPins = new ArrayList<>();
     private final List<BusBillboard> busBillboards = new ArrayList<>();
-    private final List<AnchorPoint> routeAnchors = new ArrayList<>();
     private final SensorManager sensorManager;
     private final Sensor rotationSensor;
     private final Sensor accelerometerSensor;
     private final Sensor magneticSensor;
     private final ExecutorService directionsExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService stopsExecutor = Executors.newSingleThreadExecutor();
     private CameraDevice cameraDevice;
     private CameraCaptureSession captureSession;
+    private Size previewSize;
     private String routeFilter = "";
     private final float[] smoothedAcceleration = new float[3];
     private final float[] smoothedMagneticField = new float[3];
@@ -86,6 +104,15 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
     private boolean arCoreDepthReady;
     private boolean calibrationBypassed;
     private boolean bypassButtonScheduled;
+    private boolean arrivalAnnounced;
+    private boolean fetchingStops;
+    private Location lastStopsFetchLocation;
+    private ArBusTapListener busTapListener;
+
+    /** Callback so AR taps can open the rich bus details sheet in the activity. */
+    public interface ArBusTapListener {
+        void onBusTapped(BusSnapshot snapshot);
+    }
 
     public ArBusStopView(Context context) {
         this(context, null);
@@ -93,7 +120,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
 
     public ArBusStopView(Context context, AttributeSet attrs) {
         super(context, attrs);
-        setBackgroundColor(Color.rgb(12, 22, 34));
+        setBackgroundColor(Color.rgb(10, 16, 32));
         sensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
         rotationSensor = sensorManager == null ? null : sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
         accelerometerSensor = sensorManager == null ? null : sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
@@ -110,6 +137,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
 
             @Override
             public void onSurfaceTextureSizeChanged(SurfaceTexture surface, int width, int height) {
+                openCamera();
             }
 
             @Override
@@ -129,36 +157,97 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
 
         statusView = new TextView(context);
         statusView.setTextColor(Color.WHITE);
-        statusView.setTextSize(16);
+        statusView.setTextSize(14);
         statusView.setGravity(Gravity.CENTER);
-        statusView.setPadding(dp(16), dp(16), dp(16), dp(16));
-        statusView.setBackgroundColor(Color.argb(140, 0, 0, 0));
-        addView(statusView, new LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP));
+        statusView.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        statusView.setBackground(UiTheme.pill(context, UiTheme.withAlpha(UiTheme.INK_LIGHT, 205),
+                UiTheme.withAlpha(Color.WHITE, 40), 1f, 18f));
+        statusView.setPadding(dp(16), dp(8), dp(16), dp(8));
+        addView(statusView, new LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP | Gravity.CENTER_HORIZONTAL) {
+            {
+                setMargins(dp(70), dp(14), dp(70), 0);
+            }
+        });
+
+        targetChip = new TextView(context);
+        targetChip.setTextColor(Color.WHITE);
+        targetChip.setTextSize(12);
+        targetChip.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        targetChip.setGravity(Gravity.CENTER);
+        targetChip.setBackground(UiTheme.pill(context, UiTheme.withAlpha(UiTheme.BLUE, 60),
+                UiTheme.withAlpha(UiTheme.CYAN, 160), 1f, 18f));
+        targetChip.setPadding(dp(16), dp(7), dp(16), dp(7));
+        targetChip.setVisibility(View.GONE);
+        addView(targetChip, new LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP | Gravity.CENTER_HORIZONTAL) {
+            {
+                setMargins(0, dp(64), 0, 0);
+            }
+        });
 
         bypassCalibrationButton = new Button(context);
-        bypassCalibrationButton.setText("Bypass Calibration");
+        bypassCalibrationButton.setText("Bypass calibration");
         bypassCalibrationButton.setAllCaps(false);
+        bypassCalibrationButton.setTextSize(13);
+        bypassCalibrationButton.setTextColor(Color.WHITE);
+        bypassCalibrationButton.setStateListAnimator(null);
+        bypassCalibrationButton.setBackground(UiTheme.ripple(UiTheme.pill(context,
+                UiTheme.withAlpha(UiTheme.AMBER, 60), UiTheme.withAlpha(UiTheme.AMBER, 200), 1.2f, 22f)));
+        bypassCalibrationButton.setPadding(dp(18), dp(8), dp(18), dp(8));
         bypassCalibrationButton.setVisibility(View.GONE);
         bypassCalibrationButton.setOnClickListener(view -> bypassCalibration());
         LayoutParams bypassParams = new LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
-        bypassParams.setMargins(0, 0, 0, dp(110));
+        bypassParams.setMargins(0, 0, 0, dp(120));
         addView(bypassCalibrationButton, bypassParams);
-        updateStatus("Location-Based AR Bus Stop Finder\nUses live camera + GPS + compass to place stop pins.");
+
+        exitArButton = new Button(context);
+        exitArButton.setText("✕ Exit AR");
+        exitArButton.setAllCaps(false);
+        exitArButton.setTextSize(12);
+        exitArButton.setTextColor(Color.WHITE);
+        exitArButton.setStateListAnimator(null);
+        exitArButton.setBackground(UiTheme.ripple(UiTheme.pill(context,
+                UiTheme.withAlpha(UiTheme.INK_LIGHT, 210), UiTheme.withAlpha(Color.WHITE, 50), 1f, 20f)));
+        exitArButton.setPadding(dp(14), dp(6), dp(14), dp(6));
+        exitArButton.setContentDescription("Exit AR view and return to the live map");
+        LayoutParams exitParams = new LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM | Gravity.START);
+        exitParams.setMargins(dp(16), 0, 0, dp(24));
+        addView(exitArButton, exitParams);
+        exitArButton.setOnClickListener(v -> {
+            // Walk the context chain to the hosting Activity and trigger its back handling,
+            // which MainActivity maps to "leave AR".
+            Context ctx = getContext();
+            while (ctx instanceof android.content.ContextWrapper) {
+                if (ctx instanceof android.app.Activity) {
+                    ((android.app.Activity) ctx).onBackPressed();
+                    return;
+                }
+                ctx = ((android.content.ContextWrapper) ctx).getBaseContext();
+            }
+        });
+
+        updateStatus("AR Bus Finder — point your camera around to see stops and live buses");
+    }
+
+    public void setBusTapListener(ArBusTapListener listener) {
+        this.busTapListener = listener;
     }
 
     public void startAr() {
         cameraRequested = true;
         calibrationBypassed = false;
         bypassButtonScheduled = false;
+        arrivalAnnounced = false;
         bypassCalibrationButton.setVisibility(View.GONE);
         initializeArCoreDepthAndPlaneDetection();
         startCompass();
         if (cameraPreview.isAvailable()) {
             openCamera();
         }
-        updateStatus("Location-Based AR active — camera, GPS and compass place nearest bus stop pins.");
+        updateStatus("AR active — GPS + compass are placing real stops and live buses.");
     }
 
     public void pauseAr() {
@@ -178,22 +267,39 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
     }
 
     public void setNavigationTarget(String name, double latitude, double longitude) {
+        // Follow mode nudges the target every few seconds: keep the existing route when
+        // the new destination is essentially the same place to avoid re-routing storms.
+        if (navigationTarget != null) {
+            float[] moved = new float[1];
+            Location.distanceBetween(navigationTarget.latitude, navigationTarget.longitude,
+                    latitude, longitude, moved);
+            if (moved[0] < 50f) {
+                updateTargetChip();
+                updateArrivalState();
+                renderPins();
+                return;
+            }
+        }
         navigationTarget = new NavigationTarget(name, latitude, longitude);
+        arrivalAnnounced = false;
         pathOverlayView.setTarget(navigationTarget);
         pathOverlayView.setDirectionsStatus("Directions API: Loading");
-        updateStatus("AR wayfinding path locked to " + name + " — follow the glowing neon wall.");
+        targetChip.setVisibility(View.VISIBLE);
+        updateTargetChip();
+        updateStatus("AR wayfinding locked to " + name + " — follow the neon wall.");
         requestWalkingRouteIfReady(true);
     }
 
     public void clearNavigationTarget() {
         navigationTarget = null;
+        targetChip.setVisibility(View.GONE);
         pathOverlayView.setTarget(null);
         pathOverlayView.setRoute(Collections.emptyList());
         renderPins();
     }
 
     public void updateBusBillboard(String id, String lineName, String destinationName, String etaText, String occupancy,
-            double latitude, double longitude) {
+            double latitude, double longitude, float bearingDegrees, float speedKph) {
         if (id == null || id.trim().isEmpty()) {
             return;
         }
@@ -209,12 +315,15 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             busBillboards.add(billboard);
         }
         billboard.lineName = lineName == null || lineName.trim().isEmpty() ? "Bus" : lineName.trim();
-        billboard.destinationName = destinationName == null || destinationName.trim().isEmpty() ? "destination unknown" : destinationName.trim();
+        billboard.destinationName = destinationName == null || destinationName.trim().isEmpty()
+                ? "destination unknown" : destinationName.trim();
         billboard.etaText = etaText == null || etaText.trim().isEmpty() ? "ETA unknown" : etaText.trim();
         billboard.occupancy = occupancy == null || occupancy.trim().isEmpty() ? "Information Unknown" : occupancy.trim();
         billboard.delayExplanation = explainDelay(billboard.lineName, billboard.etaText, billboard.occupancy);
         billboard.latitude = latitude;
         billboard.longitude = longitude;
+        billboard.bearingDegrees = bearingDegrees;
+        billboard.speedKph = speedKph;
         billboard.lastUpdatedMs = System.currentTimeMillis();
         renderPins();
     }
@@ -231,7 +340,6 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             userLocation = location;
             pathOverlayView.setUserLocation(null);
             pathOverlayView.setCalibrating(true);
-            stopPins.clear();
             scheduleCalibrationBypassButton();
             String message = location == null
                     ? "Calibrating… waiting for GPS lock before placing AR stops."
@@ -247,22 +355,112 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         if (navigationTarget == null) {
             updateStatus(calibrationBypassed && !accurateEnough
                     ? "Calibration bypassed — using best GPS with rotation-vector-stabilized AR markers."
-                    : "Location-Based AR active — GPS locked, rotation-vector heading corrected to true north.");
+                    : "AR locked — real stops + live buses placed around you.");
+        } else {
+            updateTargetChip();
         }
         pathOverlayView.setCalibrating(false);
         pathOverlayView.setUserLocation(userLocation);
         requestWalkingRouteIfReady(false);
-        stopPins.clear();
-
-        stopPins.add(new BusStopPin("Nearest stop", firstRoute(), userLocation.getLatitude() + 0.00045,
-                userLocation.getLongitude() + 0.00025));
-        stopPins.add(new BusStopPin("Opposite stop", firstRoute(), userLocation.getLatitude() - 0.00035,
-                userLocation.getLongitude() + 0.00035));
-        stopPins.add(new BusStopPin("Next stop ahead", firstRoute(), userLocation.getLatitude() + 0.00080,
-                userLocation.getLongitude() - 0.00018));
+        maybeFetchNearbyStops();
+        updateArrivalState();
         renderPins();
     }
 
+    private void maybeFetchNearbyStops() {
+        if (userLocation == null) {
+            return;
+        }
+        if (lastStopsFetchLocation != null && userLocation.distanceTo(lastStopsFetchLocation) < STOPS_FETCH_RADIUS_METERS) {
+            return;
+        }
+        if (fetchingStops) {
+            return;
+        }
+        fetchingStops = true;
+        lastStopsFetchLocation = new Location(userLocation);
+        final double lat = userLocation.getLatitude();
+        final double lon = userLocation.getLongitude();
+        stopsExecutor.execute(() -> {
+            List<BusStopPin> fetched = fetchNearbyStops(lat, lon);
+            fetchingStops = false;
+            if (fetched == null) {
+                post(() -> updateStatus("Could not load nearby stops — showing live buses only."));
+                return;
+            }
+            post(() -> {
+                stopPins.clear();
+                stopPins.addAll(fetched);
+                if (stopPins.isEmpty()) {
+                    updateStatus("No bus stops found within " + Math.round(OVERPASS_SEARCH_RADIUS_METERS)
+                            + "m — live buses still shown in AR.");
+                }
+                renderPins();
+            });
+        });
+    }
+
+    /** Queries OpenStreetMap Overpass for highway=bus_stop nodes around a point. Returns null on failure. */
+    private List<BusStopPin> fetchNearbyStops(double latitude, double longitude) {
+        HttpURLConnection connection = null;
+        try {
+            String query = "[out:json][timeout:15];"
+                    + "node(around:" + (int) OVERPASS_SEARCH_RADIUS_METERS + "," + latitude + "," + longitude + ")"
+                    + "[highway=bus_stop];out body " + (MAX_VISIBLE_STOPS * 3) + ";";
+            String body = "data=" + URLEncoder.encode(query, "UTF-8");
+            connection = (HttpURLConnection) new URL("https://overpass-api.de/api/interpreter").openConnection();
+            connection.setRequestMethod("POST");
+            connection.setConnectTimeout(8_000);
+            connection.setReadTimeout(15_000);
+            connection.setDoOutput(true);
+            connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+            try (OutputStream output = connection.getOutputStream()) {
+                output.write(body.getBytes("UTF-8"));
+            }
+            if (connection.getResponseCode() < 200 || connection.getResponseCode() >= 300) {
+                return null;
+            }
+            JSONObject json = new JSONObject(readString(connection.getInputStream()));
+            JSONArray elements = json.optJSONArray("elements");
+            if (elements == null) {
+                return null;
+            }
+            List<BusStopPin> pins = new ArrayList<>();
+            Location origin = new Location("origin");
+            origin.setLatitude(latitude);
+            origin.setLongitude(longitude);
+            for (int i = 0; i < elements.length() && pins.size() < MAX_VISIBLE_STOPS; i++) {
+                JSONObject element = elements.optJSONObject(i);
+                if (element == null || !"node".equals(element.optString("type"))) {
+                    continue;
+                }
+                double stopLat = element.optDouble("lat", Double.NaN);
+                double stopLon = element.optDouble("lon", Double.NaN);
+                if (Double.isNaN(stopLat) || Double.isNaN(stopLon)) {
+                    continue;
+                }
+                JSONObject tags = element.optJSONObject("tags");
+                String name = tags == null ? "" : tags.optString("name", "");
+                String routeRef = tags == null ? "" : tags.optString("route_ref", "");
+                if (name.isEmpty()) {
+                    name = "Bus stop";
+                }
+                Location stopLocation = new Location("stop");
+                stopLocation.setLatitude(stopLat);
+                stopLocation.setLongitude(stopLon);
+                pins.add(new BusStopPin(name, routeRef.isEmpty() ? "Bus" : routeRef, stopLat, stopLon,
+                        origin.distanceTo(stopLocation)));
+            }
+            pins.sort((a, b) -> Float.compare(a.cachedDistance, b.cachedDistance));
+            return pins;
+        } catch (Exception exception) {
+            return null;
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
 
     private void scheduleCalibrationBypassButton() {
         if (bypassButtonScheduled || calibrationBypassed) {
@@ -290,6 +488,34 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         pathOverlayView.setUserLocation(userLocation);
         updateStatus("Calibration bypassed — rendering with best GPS and rotation-vector-stabilized heading.");
         showStopsNear(userLocation);
+    }
+
+    private void updateArrivalState() {
+        if (navigationTarget == null || userLocation == null) {
+            return;
+        }
+        float distance = distanceTo(navigationTarget.latitude, navigationTarget.longitude);
+        boolean arrived = distance <= ARRIVAL_DISTANCE_METERS;
+        pathOverlayView.setArrived(arrived);
+        if (arrived && !arrivalAnnounced) {
+            arrivalAnnounced = true;
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            updateStatus("You have arrived at " + navigationTarget.name + " 🎉");
+        } else if (!arrived) {
+            arrivalAnnounced = false;
+        }
+    }
+
+    private void updateTargetChip() {
+        if (navigationTarget == null || userLocation == null) {
+            targetChip.setVisibility(View.GONE);
+            return;
+        }
+        float distance = distanceTo(navigationTarget.latitude, navigationTarget.longitude);
+        int walkMinutes = Math.max(1, Math.round(distance / 80f));
+        targetChip.setText(String.format(Locale.UK, "➤ %s · %.0fm · ~%d min walk",
+                navigationTarget.name, distance, walkMinutes));
+        targetChip.setVisibility(View.VISIBLE);
     }
 
     @Override
@@ -405,13 +631,57 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         return fallbackCameraId;
     }
 
+    /** Picks the largest SurfaceTexture size that matches the sensor aspect ratio so the preview is not stretched. */
+    private Size choosePreviewSize(CameraManager cameraManager, String cameraId) {
+        try {
+            CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(cameraId);
+            StreamConfigurationMap map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+            if (map == null) {
+                return null;
+            }
+            android.graphics.Rect sensorSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+            double targetAspect = sensorSize != null
+                    ? (double) sensorSize.width() / (double) sensorSize.height()
+                    : (double) cameraPreview.getWidth() / Math.max(1, cameraPreview.getHeight());
+            Size[] choices = map.getOutputSizes(SurfaceTexture.class);
+            Size best = null;
+            double bestScore = Double.MAX_VALUE;
+            int viewWidth = Math.max(1, cameraPreview.getWidth());
+            int viewHeight = Math.max(1, cameraPreview.getHeight());
+            for (Size candidate : choices) {
+                double aspect = (double) candidate.getWidth() / (double) candidate.getHeight();
+                double aspectScore = Math.abs(aspect - targetAspect);
+                double areaScore = Math.abs(candidate.getWidth() * candidate.getHeight() - viewWidth * viewHeight)
+                        / (double) (viewWidth * viewHeight);
+                double score = aspectScore * 3.0 + areaScore;
+                if (score < bestScore) {
+                    bestScore = score;
+                    best = candidate;
+                }
+            }
+            return best;
+        } catch (Exception exception) {
+            return null;
+        }
+    }
+
     private void startCameraPreview() {
         if (cameraDevice == null || !cameraPreview.isAvailable()) {
             return;
         }
         try {
+            CameraManager cameraManager = (CameraManager) getContext().getSystemService(Context.CAMERA_SERVICE);
+            String cameraId = findBackCameraId(cameraManager);
+            Size chosen = choosePreviewSize(cameraManager, cameraId);
+            if (chosen != null) {
+                previewSize = chosen;
+            }
             SurfaceTexture texture = cameraPreview.getSurfaceTexture();
-            texture.setDefaultBufferSize(Math.max(1, cameraPreview.getWidth()), Math.max(1, cameraPreview.getHeight()));
+            if (previewSize != null) {
+                texture.setDefaultBufferSize(previewSize.getWidth(), previewSize.getHeight());
+            } else {
+                texture.setDefaultBufferSize(Math.max(1, cameraPreview.getWidth()), Math.max(1, cameraPreview.getHeight()));
+            }
             Surface surface = new Surface(texture);
             CaptureRequest.Builder requestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             requestBuilder.addTarget(surface);
@@ -462,43 +732,124 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         return ((to - from + 540f) % 360f) - 180f;
     }
 
+    private boolean routeMatchesFilter(String routes) {
+        if (routeFilter.isEmpty() || routes == null) {
+            return true;
+        }
+        String lowerFilter = routeFilter.toLowerCase(Locale.UK);
+        for (String token : routes.split("[,\\s]+")) {
+            if (token.toLowerCase(Locale.UK).contains(lowerFilter)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void renderPins() {
-        while (getChildCount() > 4) {
-            removeViewAt(4);
+        // Child views: 0 camera, 1 overlay, 2 status, 3 target chip, 4 bypass, 5 exit.
+        while (getChildCount() > 6) {
+            removeViewAt(6);
         }
         if (!gpsLocked) {
             return;
         }
+        int width = Math.max(1, getWidth());
+        float pixelsPerDegree = (width / 2f) / HALF_FOV_DEGREES;
+        float center = width / 2f;
+
         int visiblePins = 0;
         for (BusStopPin pin : stopPins) {
-            if (!routeFilter.isEmpty() && !pin.route.equalsIgnoreCase(routeFilter)) {
+            if (!routeMatchesFilter(pin.route)) {
                 continue;
             }
-            visiblePins++;
-            TextView marker = createPinView(pin);
-            float targetX = screenXFor(pin);
-            float targetY = screenYFor(pin, visiblePins);
-            pin.displayedX = Float.isNaN(pin.displayedX) ? targetX : lerp(pin.displayedX, targetX, 0.20f);
-            pin.displayedY = Float.isNaN(pin.displayedY) ? targetY : lerp(pin.displayedY, targetY, 0.20f);
-            if (navigationTarget == null && visiblePins == 1) {
-                setNavigationTarget(pin.name, pin.latitude, pin.longitude);
+            if (visiblePins >= MAX_VISIBLE_STOPS) {
+                break;
             }
-            LayoutParams params = new LayoutParams(dp(160), ViewGroup.LayoutParams.WRAP_CONTENT);
-            params.leftMargin = dp((int) pin.displayedX);
-            params.topMargin = dp((int) pin.displayedY);
-            addView(marker, params);
+            visiblePins++;
+            float relativeBearing = shortestBearingDelta(smoothedCompassBearing, bearingTo(pin.latitude, pin.longitude));
+            FrameLayout container = new FrameLayout(getContext());
+            TextView marker = createPinView(pin);
+            container.addView(marker);
+            container.setOnClickListener(v -> {
+                performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+                setNavigationTarget("🚏 " + pin.name, pin.latitude, pin.longitude);
+            });
+            UiTheme.pressScale(container);
+
+            boolean onScreen = Math.abs(relativeBearing) <= HALF_FOV_DEGREES;
+            LayoutParams params = new LayoutParams(dp(170), ViewGroup.LayoutParams.WRAP_CONTENT);
+            if (onScreen) {
+                float x = center + relativeBearing * pixelsPerDegree - dp(85);
+                pin.displayedX = Float.isNaN(pin.displayedX) ? x : lerp(pin.displayedX, x, 0.22f);
+                float y = screenYForDistance(distanceTo(pin.latitude, pin.longitude), 0) - dp(20);
+                pin.displayedY = Float.isNaN(pin.displayedY) ? y : lerp(pin.displayedY, y, 0.22f);
+                params.leftMargin = (int) Math.max(dp(2), Math.min(width - dp(172), pin.displayedX));
+                params.topMargin = (int) Math.max(dp(100), pin.displayedY);
+            } else {
+                // Off-screen: collapse to an edge dot; the chevron is drawn by the overlay.
+                params.width = dp(10);
+                params.height = dp(10);
+                pin.displayedX = relativeBearing < 0 ? dp(EDGE_CHEVRON_INSET_DP)
+                        : width - dp(EDGE_CHEVRON_INSET_DP) - dp(10);
+                pin.displayedY = getHeight() * 0.52f;
+                container.removeAllViews();
+                View dot = new View(getContext());
+                dot.setBackground(UiTheme.pill(getContext(), UiTheme.withAlpha(UiTheme.TEAL, 230),
+                        UiTheme.withAlpha(Color.WHITE, 160), 1f, 5f));
+                container.addView(dot, new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                params.leftMargin = (int) pin.displayedX;
+                params.topMargin = (int) pin.displayedY;
+                container.setOnClickListener(null);
+                container.setClickable(false);
+            }
+            addView(container, params);
         }
 
-        renderBusBillboards();
+        renderBusBillboards(center, pixelsPerDegree);
 
-        if (visiblePins == 0 && !stopPins.isEmpty()) {
-            updateStatus(String.format(Locale.UK, "No AR bus stop pins match route %s.", routeFilter));
+        if (visiblePins == 0 && !stopPins.isEmpty() && !routeFilter.isEmpty()) {
+            updateStatus(String.format(Locale.UK, "No AR stop pins match route %s.", routeFilter));
         }
+        pathOverlayView.setChevrons(computeChevrons());
+        pathOverlayView.invalidate();
     }
 
+    private List<float[]> computeChevrons() {
+        List<float[]> chevrons = new ArrayList<>();
+        if (!gpsLocked) {
+            return chevrons;
+        }
+        int width = Math.max(1, getWidth());
+        float height = Math.max(1, getHeight());
+        if (navigationTarget != null) {
+            float relativeBearing = shortestBearingDelta(smoothedCompassBearing,
+                    bearingTo(navigationTarget.latitude, navigationTarget.longitude));
+            if (Math.abs(relativeBearing) > HALF_FOV_DEGREES) {
+                float x = relativeBearing < 0 ? dp(EDGE_CHEVRON_INSET_DP) : width - dp(EDGE_CHEVRON_INSET_DP);
+                chevrons.add(new float[] { x, height * 0.5f, relativeBearing < 0 ? 0f : 1f, UiTheme.CYAN });
+            }
+        }
+        for (BusBillboard billboard : busBillboards) {
+            if (System.currentTimeMillis() - billboard.lastUpdatedMs > 120_000L) {
+                continue;
+            }
+            if (!routeMatchesFilter(billboard.lineName)) {
+                continue;
+            }
+            float relativeBearing = shortestBearingDelta(smoothedCompassBearing,
+                    bearingTo(billboard.latitude, billboard.longitude));
+            if (Math.abs(relativeBearing) > HALF_FOV_DEGREES && Math.abs(relativeBearing) < 120f) {
+                float x = relativeBearing < 0 ? dp(EDGE_CHEVRON_INSET_DP + 14) : width - dp(EDGE_CHEVRON_INSET_DP + 14);
+                chevrons.add(new float[] { x, height * 0.44f, relativeBearing < 0 ? 0f : 1f,
+                        UiTheme.occupancyColor(billboard.occupancy) });
+            }
+        }
+        return chevrons;
+    }
 
     private String explainDelay(String lineName, String etaText, String occupancy) {
-        if (etaText == null || !etaText.contains("Arriving in")) {
+        if (etaText == null || !(etaText.contains("Arriving in") || etaText.contains("Arriving now"))) {
             return "AI Delay Predictor: awaiting live ETA";
         }
         int minutes = 0;
@@ -511,7 +862,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             }
         }
         if (minutes >= 8) {
-            return String.format(Locale.UK, "AI Delay Predictor: Route %s may be delayed by traffic or weather near Scunthorpe town centre.", lineName);
+            return String.format(Locale.UK, "AI Delay Predictor: Route %s may be delayed by traffic or weather.", lineName);
         }
         if ("Full/Crowded".equals(occupancy)) {
             return String.format(Locale.UK, "AI Delay Predictor: Route %s boarding may be slower because the bus is crowded.", lineName);
@@ -519,39 +870,123 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         return "AI Delay Predictor: running on time";
     }
 
-    private void renderBusBillboards() {
+    private void renderBusBillboards(float center, float pixelsPerDegree) {
         long now = System.currentTimeMillis();
+        int width = Math.max(1, getWidth());
+        int shown = 0;
         for (BusBillboard billboard : busBillboards) {
             if (now - billboard.lastUpdatedMs > 120_000L) {
                 continue;
             }
-            if (!routeFilter.isEmpty() && !billboard.lineName.toLowerCase(Locale.UK).contains(routeFilter.toLowerCase(Locale.UK))) {
+            if (!routeMatchesFilter(billboard.lineName)) {
                 continue;
             }
-            TextView view = createBusBillboardView(billboard);
-            float targetX = screenXFor(billboard);
-            float targetY = screenYFor(billboard);
-            billboard.displayedX = Float.isNaN(billboard.displayedX) ? targetX : lerp(billboard.displayedX, targetX, 0.24f);
-            billboard.displayedY = Float.isNaN(billboard.displayedY) ? targetY : lerp(billboard.displayedY, targetY, 0.24f);
+            if (shown >= 6) {
+                break;
+            }
+            float relativeBearing = shortestBearingDelta(smoothedCompassBearing,
+                    bearingTo(billboard.latitude, billboard.longitude));
+            if (Math.abs(relativeBearing) > HALF_FOV_DEGREES) {
+                continue; // chevron drawn instead
+            }
+            shown++;
+            FrameLayout card = new FrameLayout(getContext());
+            card.addView(createBusBillboardView(billboard), new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            card.setOnClickListener(v -> {
+                performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+                if (busTapListener != null) {
+                    busTapListener.onBusTapped(buildSnapshot(billboard));
+                }
+            });
+            UiTheme.pressScale(card);
+            float x = center + relativeBearing * pixelsPerDegree - dp(105);
+            billboard.displayedX = Float.isNaN(billboard.displayedX) ? x : lerp(billboard.displayedX, x, 0.24f);
+            float y = screenYForDistance(distanceTo(billboard.latitude, billboard.longitude), 36f);
+            billboard.displayedY = Float.isNaN(billboard.displayedY) ? y : lerp(billboard.displayedY, y, 0.24f);
             LayoutParams params = new LayoutParams(dp(210), ViewGroup.LayoutParams.WRAP_CONTENT);
-            params.leftMargin = dp((int) billboard.displayedX);
-            params.topMargin = dp((int) billboard.displayedY);
-            addView(view, params);
+            params.leftMargin = (int) Math.max(dp(2), Math.min(width - dp(212), billboard.displayedX));
+            params.topMargin = (int) Math.max(dp(96), billboard.displayedY);
+            addView(card, params);
         }
     }
 
-    private TextView createBusBillboardView(BusBillboard billboard) {
-        TextView view = new TextView(getContext());
-        view.setText(String.format(Locale.UK, "%s %s\n%s\nStatus: %s\n%s",
-                occupancyIcon(billboard.occupancy), billboardTitle(billboard),
-                billboard.etaText, billboard.occupancy, billboard.delayExplanation));
-        view.setTextColor(Color.WHITE);
-        view.setTextSize(14);
-        view.setGravity(Gravity.CENTER);
-        view.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-        view.setBackgroundColor(Color.argb(225, 0, 0, 0));
-        view.setPadding(dp(12), dp(10), dp(12), dp(10));
-        return view;
+    private BusSnapshot buildSnapshot(BusBillboard billboard) {
+        return new BusSnapshot(
+                billboard.id,
+                billboard.lineName,
+                "",
+                billboard.destinationName,
+                billboard.occupancy,
+                billboard.id,
+                "",
+                "",
+                distanceTextTo(billboard.latitude, billboard.longitude),
+                billboard.latitude,
+                billboard.longitude,
+                billboard.bearingDegrees,
+                billboard.speedKph,
+                parseEtaMinutes(billboard.etaText),
+                "its next stop");
+    }
+
+    private int parseEtaMinutes(String etaText) {
+        if (etaText == null) {
+            return -1;
+        }
+        String digits = etaText.replaceAll("[^0-9]", " ").trim();
+        if (digits.isEmpty()) {
+            return etaText.contains("Arriving now") ? 0 : -1;
+        }
+        try {
+            return Integer.parseInt(digits.split("\\s+")[0]);
+        } catch (NumberFormatException exception) {
+            return -1;
+        }
+    }
+
+    private String distanceTextTo(double latitude, double longitude) {
+        float metres = distanceTo(latitude, longitude);
+        if (metres < 1000f) {
+            return String.format(Locale.UK, "%.0fm away", metres);
+        }
+        return String.format(Locale.UK, "%.1fkm away", metres / 1000f);
+    }
+
+    private FrameLayout createBusBillboardView(BusBillboard billboard) {
+        FrameLayout card = new FrameLayout(getContext());
+        int color = UiTheme.occupancyColor(billboard.occupancy);
+
+        TextView body = new TextView(getContext());
+        body.setText(String.format(Locale.UK, "%s\n%s · %s\n%s",
+                billboardTitle(billboard),
+                billboard.etaText,
+                billboard.speedKph <= 0.5f ? "stopped" : String.format(Locale.UK, "%.0f mph", billboard.speedKph * 0.621371f),
+                billboard.delayExplanation));
+        body.setTextColor(Color.WHITE);
+        body.setTextSize(12);
+        body.setGravity(Gravity.CENTER);
+        body.setTypeface(Typeface.create("sans-serif", Typeface.NORMAL));
+        body.setBackground(UiTheme.pill(getContext(), UiTheme.withAlpha(UiTheme.INK, 216),
+                UiTheme.withAlpha(color, 200), 1.2f, 14f));
+        body.setPadding(dp(10), dp(8), dp(10), dp(8));
+        card.addView(body, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // Route number bubble overlapping the top-left of the card.
+        TextView bubble = new TextView(getContext());
+        bubble.setText(billboard.lineName);
+        bubble.setTextColor(Color.WHITE);
+        bubble.setTextSize(13);
+        bubble.setTypeface(Typeface.create("sans-serif-black", Typeface.NORMAL));
+        bubble.setGravity(Gravity.CENTER);
+        bubble.setBackground(UiTheme.circleGradient(getContext(), color, UiTheme.withAlpha(color, 180)));
+        card.addView(bubble, new FrameLayout.LayoutParams(dp(34), dp(34), Gravity.START | Gravity.TOP) {
+            {
+                setMargins(dp(-6), dp(-12), 0, 0);
+            }
+        });
+        return card;
     }
 
     private String billboardTitle(BusBillboard billboard) {
@@ -562,33 +997,48 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         if (lowerLine.contains(" to ") || (!lowerDestination.isEmpty() && lowerLine.contains(lowerDestination))) {
             return line;
         }
-        return line + " to " + destination;
+        return line + " → " + destination;
     }
 
-    private String occupancyIcon(String occupancy) {
-        if ("Easy Seating".equals(occupancy)) {
-            return "🟢";
-        }
-        if ("Standing Room Only".equals(occupancy)) {
-            return "🟡";
-        }
-        if ("Full/Crowded".equals(occupancy)) {
-            return "🔴";
-        }
-        return "🔵";
+    private TextView createPinView(BusStopPin pin) {
+        TextView view = new TextView(getContext());
+        view.setText(String.format(Locale.UK, "🚏 %s\n%s · %.0fm · tap to walk",
+                pin.name, pin.route.isEmpty() ? "Bus" : pin.route, distanceTo(pin.latitude, pin.longitude)));
+        view.setTextColor(Color.WHITE);
+        view.setTextSize(12);
+        view.setGravity(Gravity.CENTER);
+        view.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        view.setBackground(UiTheme.pill(getContext(), UiTheme.withAlpha(UiTheme.TEAL, 56),
+                UiTheme.withAlpha(UiTheme.TEAL, 210), 1.2f, 14f));
+        view.setPadding(dp(10), dp(8), dp(10), dp(8));
+        return view;
     }
 
-    private int screenXFor(BusBillboard billboard) {
-        float relativeBearing = (bearingTo(billboard.latitude, billboard.longitude) - smoothedCompassBearing + 540f) % 360f - 180f;
-        int center = Math.max(0, getWidth() / 2 - dp(105));
-        int offset = (int) (relativeBearing * dp(4));
-        int max = Math.max(0, getWidth() - dp(220));
-        return Math.max(0, Math.min(max, center + offset));
+    private float screenYForDistance(float distanceMeters, float verticalOffsetDp) {
+        float horizon = getHeight() * 0.42f;
+        float ground = getHeight() - dp(64);
+        float depth = Math.min(1f, distanceMeters / 220f);
+        float y = ground - (ground - horizon) * depth;
+        return Math.max(dp(96), y - dpf(verticalOffsetDp));
     }
 
-    private int screenYFor(BusBillboard billboard) {
-        float distance = distanceTo(billboard.latitude, billboard.longitude);
-        return Math.max(dp(95), 120 + Math.min(220, (int) distance) - dp(BILLBOARD_HOVER_OFFSET_DP));
+    private float dpf(float value) {
+        return value * getResources().getDisplayMetrics().density + 0.5f;
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        directionsExecutor.shutdownNow();
+        stopsExecutor.shutdownNow();
+        super.onDetachedFromWindow();
+    }
+
+    private int dp(int value) {
+        return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    private float lerp(float from, float to, float fraction) {
+        return from + (to - from) * fraction;
     }
 
     private Location smoothLocation(Location previous, Location next, float alpha) {
@@ -620,14 +1070,13 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         return (float) ((Math.toDegrees(orientation[0]) + 360.0) % 360.0);
     }
 
-
     private float trueNorthBearing(float magneticBearing) {
         return (magneticBearing + magneticDeclination() + 360f) % 360f;
     }
 
     private float magneticDeclination() {
         if (userLocation == null) {
-            return SCUNTHORPE_DECLINATION_DEGREES_EAST;
+            return 2.5f; // Scunthorpe default
         }
         GeomagneticField field = new GeomagneticField(
                 (float) userLocation.getLatitude(),
@@ -641,7 +1090,8 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         if (!gpsLocked || userLocation == null || navigationTarget == null) {
             return;
         }
-        if (!force && !pathOverlayView.isRouteEmpty() && distanceFromRoute(userLocation, pathOverlayView.routePoints) <= REROUTE_THRESHOLD_METERS) {
+        if (!force && !pathOverlayView.isRouteEmpty()
+                && distanceFromRoute(userLocation, pathOverlayView.routePoints) <= REROUTE_THRESHOLD_METERS) {
             return;
         }
         long now = System.currentTimeMillis();
@@ -653,8 +1103,7 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         NavigationTarget target = navigationTarget;
         if (BuildConfig.GOOGLE_DIRECTIONS_API_KEY.isEmpty()) {
             List<Location> fallback = smoothRoute(fallbackRoute(origin, target));
-            createGpsAnchorsForRoute(fallback);
-            pathOverlayView.setDirectionsStatus("Directions API: Failed");
+            pathOverlayView.setDirectionsStatus("Directions API: off — direct hint");
             pathOverlayView.setRoute(fallback);
             return;
         }
@@ -666,22 +1115,11 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
                 route = fallbackRoute(origin, target);
             }
             List<Location> smoothed = smoothRoute(route);
-            createGpsAnchorsForRoute(smoothed);
             post(() -> {
                 pathOverlayView.setDirectionsStatus(directionsOk ? "Directions API: OK" : "Directions API: Failed");
                 pathOverlayView.setRoute(smoothed);
             });
         });
-    }
-
-    private void createGpsAnchorsForRoute(List<Location> route) {
-        synchronized (routeAnchors) {
-            routeAnchors.clear();
-            for (int i = 0; i < route.size(); i += Math.max(1, route.size() / 24)) {
-                Location point = route.get(i);
-                routeAnchors.add(new AnchorPoint(point.getLatitude(), point.getLongitude(), 0f));
-            }
-        }
     }
 
     private List<Location> fetchWalkingDirections(Location origin, NavigationTarget target) {
@@ -857,45 +1295,9 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         }
     }
 
-    private float lerp(float from, float to, float fraction) {
-        return from + (to - from) * fraction;
-    }
-
-    private TextView createPinView(BusStopPin pin) {
-        TextView view = new TextView(getContext());
-        view.setText(String.format(Locale.UK, "📍 %s\nRoute %s · %.0fm", pin.name, pin.route, distanceTo(pin)));
-        view.setTextColor(Color.WHITE);
-        view.setTextSize(14);
-        view.setGravity(Gravity.CENTER);
-        view.setBackgroundColor(Color.argb(230, 17, 76, 141));
-        view.setPadding(dp(10), dp(8), dp(10), dp(8));
-        return view;
-    }
-
-    private int screenXFor(BusStopPin pin) {
-        float relativeBearing = (bearingTo(pin) - smoothedCompassBearing + 540f) % 360f - 180f;
-        int center = Math.max(0, getWidth() / 2 - dp(80));
-        int offset = (int) (relativeBearing * dp(4));
-        int max = Math.max(0, getWidth() - dp(170));
-        return Math.max(0, Math.min(max, center + offset));
-    }
-
-    private int screenYFor(BusStopPin pin, int index) {
-        return 130 + Math.min(180, (int) distanceTo(pin)) + (index * 20);
-    }
-
-    private float bearingTo(BusStopPin pin) {
-        if (userLocation == null) {
-            return 0f;
-        }
-        return bearingTo(pin.latitude, pin.longitude);
-    }
-
-    private float distanceTo(BusStopPin pin) {
-        if (userLocation == null) {
-            return 0f;
-        }
-        return distanceTo(pin.latitude, pin.longitude);
+    private void updateStatus(String text) {
+        statusView.setText(text);
+        pathOverlayView.setStatusText(text);
     }
 
     private float bearingTo(double latitude, double longitude) {
@@ -918,77 +1320,79 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         return userLocation.distanceTo(target);
     }
 
-    private String firstRoute() {
-        return routeFilter.isEmpty() ? "Bus" : routeFilter;
-    }
-
-    private void updateStatus(String text) {
-        statusView.setText(text);
-    }
-
-    @Override
-    protected void onDetachedFromWindow() {
-        directionsExecutor.shutdownNow();
-        super.onDetachedFromWindow();
-    }
-
-    private int dp(int value) {
-        return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
-    }
-
-
+    /**
+     * Canvas overlay drawing the navigation wall, arrows, compass ribbon, radar,
+     * distance rings, chevrons, HUD and arrival banner.
+     */
     private final class PathOverlayView extends ViewGroup {
         private final Paint glowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint ribbonPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint arrowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint wallPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint miniMapPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint miniMapPathPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint panelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint radarPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint radarBlipPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint radarSweepPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint ghostPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint shelterPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint calibratingPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint ringPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint chevronPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint smallTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint arrivalPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private Location currentLocation;
         private NavigationTarget target;
         private final List<Location> routePoints = new ArrayList<>();
+        private List<float[]> chevrons = new ArrayList<>();
         private float bearing;
         private boolean calibrating;
+        private boolean arrived;
         private boolean depthOcclusionEnabled;
-        private String directionsStatus = "Directions API: Failed";
+        private String directionsStatus = "Directions API: off";
+        private String statusText = "";
         private long animationStartedAt = System.currentTimeMillis();
 
         PathOverlayView(Context context) {
             super(context);
             setWillNotDraw(false);
-            glowPaint.setColor(Color.argb(120, 0, 176, 255));
+            glowPaint.setColor(UiTheme.withAlpha(UiTheme.CYAN, 130));
             glowPaint.setStyle(Paint.Style.STROKE);
             glowPaint.setStrokeCap(Paint.Cap.ROUND);
             glowPaint.setStrokeJoin(Paint.Join.ROUND);
-            glowPaint.setStrokeWidth(dp(52));
-            glowPaint.setMaskFilter(new BlurMaskFilter(dp(18), BlurMaskFilter.Blur.NORMAL));
-            ribbonPaint.setColor(Color.argb(185, 255, 214, 0));
+            glowPaint.setStrokeWidth(dp(46));
+            glowPaint.setMaskFilter(new BlurMaskFilter(dp(16), BlurMaskFilter.Blur.NORMAL));
+            ribbonPaint.setColor(UiTheme.withAlpha(Color.rgb(255, 214, 0), 185));
             ribbonPaint.setStyle(Paint.Style.STROKE);
             ribbonPaint.setStrokeCap(Paint.Cap.ROUND);
             ribbonPaint.setStrokeJoin(Paint.Join.ROUND);
-            ribbonPaint.setStrokeWidth(dp(34));
-            arrowPaint.setColor(Color.argb(235, 255, 255, 255));
+            ribbonPaint.setStrokeWidth(dp(30));
+            arrowPaint.setColor(UiTheme.withAlpha(Color.WHITE, 235));
             arrowPaint.setStyle(Paint.Style.FILL);
-            wallPaint.setColor(Color.argb(170, 255, 235, 59));
+            wallPaint.setColor(UiTheme.withAlpha(UiTheme.CYAN, 60));
             wallPaint.setStyle(Paint.Style.FILL);
-            wallPaint.setMaskFilter(new BlurMaskFilter(dp(14), BlurMaskFilter.Blur.NORMAL));
-            miniMapPaint.setColor(Color.argb(185, 0, 0, 0));
-            miniMapPaint.setStyle(Paint.Style.FILL);
-            miniMapPathPaint.setColor(Color.rgb(33, 150, 243));
-            miniMapPathPaint.setStyle(Paint.Style.STROKE);
-            miniMapPathPaint.setStrokeWidth(dp(4));
-            miniMapPathPaint.setStrokeCap(Paint.Cap.ROUND);
-            ghostPaint.setColor(Color.argb(120, 0, 229, 255));
+            wallPaint.setMaskFilter(new BlurMaskFilter(dp(12), BlurMaskFilter.Blur.NORMAL));
+            panelPaint.setColor(UiTheme.withAlpha(UiTheme.INK, 185));
+            panelPaint.setStyle(Paint.Style.FILL);
+            radarPaint.setStyle(Paint.Style.STROKE);
+            radarPaint.setStrokeWidth(dp(1));
+            radarPaint.setColor(UiTheme.withAlpha(UiTheme.TEAL, 120));
+            radarBlipPaint.setStyle(Paint.Style.FILL);
+            radarSweepPaint.setStyle(Paint.Style.FILL);
+            radarSweepPaint.setColor(UiTheme.withAlpha(UiTheme.TEAL, 40));
+            ghostPaint.setColor(UiTheme.withAlpha(UiTheme.CYAN, 120));
             ghostPaint.setStyle(Paint.Style.FILL_AND_STROKE);
-            shelterPaint.setColor(Color.argb(95, 0, 255, 180));
-            shelterPaint.setStyle(Paint.Style.STROKE);
-            shelterPaint.setStrokeWidth(dp(3));
-            calibratingPaint.setColor(Color.WHITE);
-            calibratingPaint.setTextSize(dp(15));
-            calibratingPaint.setTextAlign(Paint.Align.CENTER);
+            ringPaint.setStyle(Paint.Style.STROKE);
+            ringPaint.setStrokeWidth(dp(1));
+            ringPaint.setColor(UiTheme.withAlpha(Color.WHITE, 50));
+            chevronPaint.setStyle(Paint.Style.FILL);
+            textPaint.setColor(Color.WHITE);
+            textPaint.setTextSize(dp(14));
+            textPaint.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+            smallTextPaint.setColor(UiTheme.TEXT_DIM);
+            smallTextPaint.setTextSize(dp(11));
+            arrivalPaint.setColor(UiTheme.GREEN);
+            arrivalPaint.setTextSize(dp(18));
+            arrivalPaint.setTypeface(Typeface.create("sans-serif-black", Typeface.NORMAL));
+            arrivalPaint.setTextAlign(Paint.Align.CENTER);
         }
 
         void setUserLocation(Location currentLocation) {
@@ -1018,9 +1422,23 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             invalidate();
         }
 
+        void setStatusText(String statusText) {
+            this.statusText = statusText;
+            invalidate();
+        }
+
         void setCalibrating(boolean calibrating) {
             this.calibrating = calibrating;
             invalidate();
+        }
+
+        void setArrived(boolean arrived) {
+            this.arrived = arrived;
+            invalidate();
+        }
+
+        void setChevrons(List<float[]> chevronList) {
+            this.chevrons = chevronList;
         }
 
         void setDepthOcclusionEnabled(boolean depthOcclusionEnabled) {
@@ -1039,100 +1457,265 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
-            drawFutureHud(canvas);
-            if (calibrating) {
-                canvas.drawText("Calibrating… locking GPS and AR floor", getWidth() / 2f, getHeight() / 2f, calibratingPaint);
+            if (getWidth() == 0 || getHeight() == 0) {
                 return;
             }
-            if (currentLocation == null || getWidth() == 0 || getHeight() == 0) {
+            drawCompassRibbon(canvas);
+            drawDistanceRings(canvas);
+            if (calibrating) {
+                canvas.drawText("Calibrating… locking GPS and AR floor", getWidth() / 2f, getHeight() / 2f, textPaint);
                 return;
             }
             drawGhostBuses(canvas);
-            drawVirtualShelters(canvas);
+            if (currentLocation == null) {
+                return;
+            }
             if (target == null) {
-                drawMiniMap(canvas, Collections.emptyList());
+                drawRadar(canvas);
+                drawHud(canvas);
                 return;
             }
             List<Location> drawableRoute = routePoints.isEmpty() ? fallbackRoute(currentLocation, target) : routePoints;
             List<float[]> projectedPoints = projectRoute(drawableRoute);
-            drawMiniMap(canvas, drawableRoute);
-            if (projectedPoints.size() < 2) {
-                return;
+            if (projectedPoints.size() >= 2) {
+                drawVerticalNavigationWall(canvas, projectedPoints);
+                drawAnimatedArrows(canvas, projectedPoints);
             }
-
-            drawVerticalNavigationWall(canvas, projectedPoints);
-            drawAnimatedArrows(canvas, projectedPoints);
+            drawRadar(canvas);
+            drawHud(canvas);
+            if (arrived) {
+                drawArrivalBanner(canvas);
+            }
             if (!depthOcclusionEnabled) {
-                canvas.drawText("ARCore depth unavailable — GPS anchor wall fallback", getWidth() / 2f, getHeight() - dp(18), calibratingPaint);
+                smallTextPaint.setTextAlign(Paint.Align.CENTER);
+                canvas.drawText("ARCore depth unavailable — GPS anchor wall fallback",
+                        getWidth() / 2f, getHeight() - dp(16), smallTextPaint);
             }
             postInvalidateOnAnimation();
         }
 
+        private void drawCompassRibbon(Canvas canvas) {
+            float ribbonWidth = dp(230);
+            float left = getWidth() / 2f - ribbonWidth / 2f;
+            float top = dp(6);
+            RectF panel = new RectF(left, top, left + ribbonWidth, top + dp(30));
+            canvas.drawRoundRect(panel, dp(15), dp(15), panelPaint);
+
+            float centerX = getWidth() / 2f;
+            float tickTop = top + dp(6);
+            float tickBottom = top + dp(14);
+            smallTextPaint.setTextAlign(Paint.Align.CENTER);
+            for (int angle = -180; angle < 180; angle += 15) {
+                float relative = shortestBearingDelta(bearing, angle);
+                if (Math.abs(relative) > 45f) {
+                    continue;
+                }
+                float x = centerX + (relative / 45f) * (ribbonWidth / 2f - dp(10));
+                boolean major = angle % 45 == 0;
+                Paint tick = major ? textPaint : smallTextPaint;
+                canvas.drawLine(x, tickTop, x, tickBottom, tick);
+                if (major) {
+                    String label;
+                    switch (((angle % 360) + 360) % 360) {
+                        case 0: label = "N"; break;
+                        case 45: label = "NE"; break;
+                        case 90: label = "E"; break;
+                        case 135: label = "SE"; break;
+                        case 180: label = "S"; break;
+                        case 225: label = "SW"; break;
+                        case 270: label = "W"; break;
+                        default: label = "NW"; break;
+                    }
+                    canvas.drawText(label, x, top + dp(26), smallTextPaint);
+                }
+            }
+            // Center heading notch.
+            Paint notch = new Paint();
+            notch.setColor(UiTheme.CYAN);
+            notch.setStrokeWidth(dp(2));
+            canvas.drawLine(centerX, top, centerX, top + dp(8), notch);
+        }
+
+        private void drawDistanceRings(Canvas canvas) {
+            if (currentLocation == null) {
+                return;
+            }
+            float horizon = getHeight() * 0.42f;
+            float ground = getHeight() - dp(64);
+            smallTextPaint.setTextAlign(Paint.Align.LEFT);
+            for (float ringDistance : new float[] { 25f, 50f }) {
+                float depth = Math.min(1f, ringDistance / 220f);
+                float y = ground - (ground - horizon) * depth;
+                canvas.drawLine(dp(12), y, getWidth() - dp(12), y, ringPaint);
+                canvas.drawText(String.format(Locale.UK, "%.0fm", ringDistance), dp(16), y - dp(4), smallTextPaint);
+            }
+        }
 
         private void drawVerticalNavigationWall(Canvas canvas, List<float[]> points) {
             for (int i = 1; i < points.size(); i++) {
                 float[] previous = points.get(i - 1);
                 float[] point = points.get(i);
                 float alpha = Math.min(previous[2], point[2]);
-                wallPaint.setAlpha((int) (190 * alpha));
+                wallPaint.setAlpha((int) (150 * alpha));
                 Path wall = new Path();
                 wall.moveTo(previous[0], previous[1]);
                 wall.lineTo(point[0], point[1]);
-                wall.lineTo(point[0], Math.max(dp(90), point[1] - dp(120)));
-                wall.lineTo(previous[0], Math.max(dp(90), previous[1] - dp(120)));
+                wall.lineTo(point[0], Math.max(dp(90), point[1] - dp(130)));
+                wall.lineTo(previous[0], Math.max(dp(90), previous[1] - dp(130)));
                 wall.close();
                 canvas.drawPath(wall, wallPaint);
             }
             Path topEdge = new Path();
             float[] first = points.get(0);
-            topEdge.moveTo(first[0], Math.max(dp(90), first[1] - dp(120)));
+            topEdge.moveTo(first[0], Math.max(dp(90), first[1] - dp(130)));
             for (int i = 1; i < points.size(); i++) {
                 float[] point = points.get(i);
-                topEdge.lineTo(point[0], Math.max(dp(90), point[1] - dp(120)));
+                topEdge.lineTo(point[0], Math.max(dp(90), point[1] - dp(130)));
             }
             canvas.drawPath(topEdge, glowPaint);
+
+            // Destination flag at the end of the wall.
+            float[] last = points.get(points.size() - 1);
+            chevronPaint.setColor(UiTheme.CYAN);
+            float flagY = Math.max(dp(90), last[1] - dp(150));
+            canvas.drawCircle(last[0], flagY, dp(6), chevronPaint);
+            canvas.drawLine(last[0], flagY, last[0], last[1], chevronPaint);
         }
 
-        private void drawMiniMap(Canvas canvas, List<Location> route) {
-            float radius = dp(62);
-            float centerX = getWidth() - radius - dp(18);
-            float centerY = getHeight() - radius - dp(28);
-            canvas.drawCircle(centerX, centerY, radius, miniMapPaint);
-            miniMapPathPaint.setColor(Color.rgb(33, 150, 243));
-            canvas.drawCircle(centerX, centerY, dp(4), arrowPaint);
-            if (route == null || route.size() < 2 || currentLocation == null) {
-                return;
+        private void drawRadar(Canvas canvas) {
+            float radius = dp(56);
+            float centerX = dp(70);
+            float centerY = getHeight() - radius - dp(84);
+            canvas.save();
+            canvas.translate(centerX, centerY);
+            // Rings.
+            for (float fraction : new float[] { 1f, 0.66f, 0.33f }) {
+                canvas.drawCircle(0, 0, radius * fraction, radarPaint);
             }
-            Path miniPath = new Path();
-            boolean started = false;
-            for (Location point : route) {
-                float distance = Math.min(250f, currentLocation.distanceTo(point));
-                float relativeBearing = (currentLocation.bearingTo(point) - bearing + 540f) % 360f - 180f;
-                double angle = Math.toRadians(relativeBearing - 90f);
-                float scaled = (distance / 250f) * (radius - dp(10));
-                float x = centerX + (float) Math.cos(angle) * scaled;
-                float y = centerY + (float) Math.sin(angle) * scaled;
-                if (!started) {
-                    miniPath.moveTo(x, y);
-                    started = true;
-                } else {
-                    miniPath.lineTo(x, y);
+            // Sweep.
+            long sweepPhase = (System.currentTimeMillis() % 3000L);
+            float sweepAngle = (sweepPhase / 3000f) * 360f;
+            canvas.save();
+            canvas.rotate(-sweepAngle);
+            Path wedge = new Path();
+            wedge.moveTo(0, 0);
+            wedge.arcTo(new RectF(-radius, -radius, radius, radius), -30, 30);
+            wedge.close();
+            canvas.drawPath(wedge, radarSweepPaint);
+            canvas.restore();
+            // Blips: live buses.
+            long now = System.currentTimeMillis();
+            if (currentLocation != null) {
+                for (BusBillboard billboard : busBillboards) {
+                    if (now - billboard.lastUpdatedMs > 120_000L) {
+                        continue;
+                    }
+                    float distance = distanceTo(billboard.latitude, billboard.longitude);
+                    if (distance > 320f) {
+                        continue;
+                    }
+                    float relativeBearing = shortestBearingDelta(bearing,
+                            bearingTo(billboard.latitude, billboard.longitude));
+                    double angle = Math.toRadians(relativeBearing - 90f);
+                    float scaled = (Math.min(distance, 320f) / 320f) * radius;
+                    radarBlipPaint.setColor(UiTheme.occupancyColor(billboard.occupancy));
+                    canvas.drawCircle((float) Math.cos(angle) * scaled, (float) Math.sin(angle) * scaled, dp(4), radarBlipPaint);
+                }
+                // Stop blips.
+                radarBlipPaint.setColor(UiTheme.withAlpha(Color.WHITE, 220));
+                for (BusStopPin pin : stopPins) {
+                    float distance = distanceTo(pin.latitude, pin.longitude);
+                    if (distance > 320f) {
+                        continue;
+                    }
+                    float relativeBearing = shortestBearingDelta(bearing, bearingTo(pin.latitude, pin.longitude));
+                    double angle = Math.toRadians(relativeBearing - 90f);
+                    float scaled = (Math.min(distance, 320f) / 320f) * radius;
+                    canvas.drawCircle((float) Math.cos(angle) * scaled, (float) Math.sin(angle) * scaled, dp(3), radarBlipPaint);
+                }
+                // Target blip pulses.
+                if (target != null) {
+                    float distance = distanceTo(target.latitude, target.longitude);
+                    if (distance <= 320f) {
+                        float relativeBearing = shortestBearingDelta(bearing, bearingTo(target.latitude, target.longitude));
+                        double angle = Math.toRadians(relativeBearing - 90f);
+                        float scaled = (Math.min(distance, 320f) / 320f) * radius;
+                        float pulse = 1f + 0.4f * (1f - (sweepPhase / 3000f));
+                        radarBlipPaint.setColor(UiTheme.CYAN);
+                        canvas.drawCircle((float) Math.cos(angle) * scaled, (float) Math.sin(angle) * scaled,
+                                dp(5) * pulse, radarBlipPaint);
+                    }
                 }
             }
-            canvas.drawPath(miniPath, miniMapPathPaint);
-            canvas.drawText("MAP", centerX, centerY + radius - dp(8), calibratingPaint);
+            canvas.restore();
+            // Frame + label.
+            canvas.drawCircle(centerX, centerY, radius, radarPaint);
+            smallTextPaint.setTextAlign(Paint.Align.CENTER);
+            canvas.drawText("RADAR", centerX, centerY + radius + dp(14), smallTextPaint);
         }
 
-        private void drawFutureHud(Canvas canvas) {
-            float left = dp(10);
-            float top = dp(76);
-            float right = Math.min(getWidth() - dp(10), left + dp(245));
-            float bottom = top + dp(92);
-            canvas.drawRoundRect(new RectF(left, top, right, bottom), dp(12), dp(12), miniMapPaint);
-            canvas.drawText("Future HUD", left + dp(12), top + dp(22), calibratingPaint);
-            canvas.drawText(directionsStatus, left + dp(12), top + dp(43), calibratingPaint);
-            canvas.drawText("X-Ray ghost buses: " + nearbyBusCount(), left + dp(12), top + dp(64), calibratingPaint);
-            canvas.drawText("AI Delay Predictor: local", left + dp(12), top + dp(84), calibratingPaint);
+        private void drawHud(Canvas canvas) {
+            float left = dp(12);
+            float top = dp(44);
+            float right = Math.min(getWidth() - dp(12), left + dp(215));
+            float bottom = top + dp(74);
+            canvas.drawRoundRect(new RectF(left, top, right, bottom), dp(14), dp(14), panelPaint);
+            textPaint.setTextAlign(Paint.Align.LEFT);
+            canvas.drawText("Future HUD", left + dp(12), top + dp(19), textPaint);
+            canvas.drawText(directionsStatus, left + dp(12), top + dp(37), smallTextPaint);
+            canvas.drawText("X-Ray ghost buses nearby: " + nearbyBusCount(), left + dp(12), top + dp(54), smallTextPaint);
+            canvas.drawText(statusText.isEmpty() ? "AR ready" : statusText, left + dp(12), top + dp(69), smallTextPaint);
+        }
+
+        private void drawArrivalBanner(Canvas canvas) {
+            float centerX = getWidth() / 2f;
+            float centerY = getHeight() * 0.30f;
+            RectF banner = new RectF(centerX - dp(140), centerY - dp(26), centerX + dp(140), centerY + dp(26));
+            Paint bannerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            bannerPaint.setColor(UiTheme.withAlpha(UiTheme.GREEN, 210));
+            canvas.drawRoundRect(banner, dp(22), dp(22), bannerPaint);
+            canvas.drawText("YOU HAVE ARRIVED 🎉", centerX, centerY + dp(6), arrivalPaint);
+            postInvalidateOnAnimation();
+        }
+
+        private void drawGhostBuses(Canvas canvas) {
+            if (currentLocation == null) {
+                return;
+            }
+            long now = System.currentTimeMillis();
+            smallTextPaint.setTextAlign(Paint.Align.CENTER);
+            for (BusBillboard billboard : busBillboards) {
+                if (now - billboard.lastUpdatedMs > 120_000L) {
+                    continue;
+                }
+                float distance = distanceTo(billboard.latitude, billboard.longitude);
+                if (distance > 1000f) {
+                    continue;
+                }
+                float relativeBearing = shortestBearingDelta(bearing, bearingTo(billboard.latitude, billboard.longitude));
+                if (Math.abs(relativeBearing) > HALF_FOV_DEGREES) {
+                    continue;
+                }
+                float pixelsPerDegree = (getWidth() / 2f) / HALF_FOV_DEGREES;
+                float x = getWidth() / 2f + relativeBearing * pixelsPerDegree;
+                float y = Math.max(dp(145), getHeight() * 0.58f - Math.min(dp(180), distance / 4f));
+                float pulse = 0.45f + 0.55f * (1f - Math.min(1f, distance / 1000f));
+                ghostPaint.setAlpha((int) (60 + 110 * pulse));
+                canvas.drawRoundRect(new RectF(x - dp(30), y - dp(20), x + dp(30), y + dp(20)), dp(12), dp(12), ghostPaint);
+                canvas.drawCircle(x - dp(15), y + dp(20), dp(4 + (int) (pulse * 4)), ghostPaint);
+                canvas.drawCircle(x + dp(15), y + dp(20), dp(4 + (int) (pulse * 4)), ghostPaint);
+                canvas.drawText("X-Ray " + billboard.lineName + " · " + Math.round(distance) + "m"
+                                + (billboard.speedKph <= 0.5f ? " · stopped" : ""),
+                        x, y - dp(28), smallTextPaint);
+            }
+            drawEdgeChevrons(canvas);
+        }
+
+        private void drawEdgeChevrons(Canvas canvas) {
+            for (float[] chevron : chevrons) {
+                chevronPaint.setColor((int) chevron[3]);
+                UiTheme.drawChevron(canvas, chevron[0], chevron[1], dp(9), chevron[2] > 0.5f, chevronPaint);
+            }
         }
 
         private int nearbyBusCount() {
@@ -1150,64 +1733,22 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             return count;
         }
 
-        private void drawGhostBuses(Canvas canvas) {
-            if (currentLocation == null) {
-                return;
-            }
-            long now = System.currentTimeMillis();
-            for (BusBillboard billboard : busBillboards) {
-                if (now - billboard.lastUpdatedMs > 120_000L) {
-                    continue;
-                }
-                float distance = distanceTo(billboard.latitude, billboard.longitude);
-                if (distance > 1000f) {
-                    continue;
-                }
-                float relativeBearing = (bearingTo(billboard.latitude, billboard.longitude) - bearing + 540f) % 360f - 180f;
-                float x = getWidth() / 2f + relativeBearing * dp(5);
-                float y = Math.max(dp(145), getHeight() * 0.58f - Math.min(dp(180), distance / 4f));
-                float pulse = 0.45f + 0.55f * (1f - Math.min(1f, distance / 1000f));
-                ghostPaint.setAlpha((int) (80 + 120 * pulse));
-                canvas.drawRoundRect(new RectF(x - dp(28), y - dp(18), x + dp(28), y + dp(18)), dp(12), dp(12), ghostPaint);
-                canvas.drawCircle(x - dp(14), y + dp(18), dp(5 + (int) (pulse * 5)), ghostPaint);
-                canvas.drawCircle(x + dp(14), y + dp(18), dp(5 + (int) (pulse * 5)), ghostPaint);
-                canvas.drawText("X-Ray " + billboard.lineName + " " + Math.round(distance) + "m", x, y - dp(28), calibratingPaint);
-            }
-        }
-
-        private void drawVirtualShelters(Canvas canvas) {
-            if (currentLocation == null) {
-                return;
-            }
-            for (BusStopPin pin : stopPins) {
-                float distance = distanceTo(pin.latitude, pin.longitude);
-                if (distance > 90f) {
-                    continue;
-                }
-                float x = screenXFor(pin) + dp(80);
-                float y = screenYFor(pin, 1);
-                RectF shelter = new RectF(x - dp(50), y - dp(65), x + dp(50), y + dp(25));
-                canvas.drawRoundRect(shelter, dp(10), dp(10), shelterPaint);
-                canvas.drawText("Virtual AR Bus Shelter", x, y - dp(42), calibratingPaint);
-                canvas.drawText("Live board + occupancy heat-map", x, y - dp(20), calibratingPaint);
-            }
-        }
-
         private List<float[]> projectRoute(List<Location> route) {
             List<float[]> projected = new ArrayList<>();
+            float pixelsPerDegree = (getWidth() / 2f) / HALF_FOV_DEGREES;
             for (Location point : route) {
                 float distance = Math.max(0.5f, currentLocation.distanceTo(point));
                 if (distance > 65f) {
                     continue;
                 }
-                float relativeBearing = (currentLocation.bearingTo(point) - bearing + 540f) % 360f - 180f;
+                float relativeBearing = shortestBearingDelta(bearing, currentLocation.bearingTo(point));
                 if (Math.abs(relativeBearing) > 70f) {
                     continue;
                 }
                 float horizon = getHeight() * 0.42f;
-                float ground = getHeight() - dp(42);
+                float ground = getHeight() - dp(64);
                 float depth = Math.min(1f, distance / 65f);
-                float x = getWidth() / 2f + relativeBearing * dp(6);
+                float x = getWidth() / 2f + relativeBearing * pixelsPerDegree;
                 float y = ground - (ground - horizon) * depth;
                 float alpha = Math.max(0.18f, 1f - depth);
                 projected.add(new float[] { x, y, alpha });
@@ -1261,32 +1802,21 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
         }
     }
 
-    private static final class AnchorPoint {
-        final double latitude;
-        final double longitude;
-        final float altitudeMeters;
-
-        AnchorPoint(double latitude, double longitude, float altitudeMeters) {
-            this.latitude = latitude;
-            this.longitude = longitude;
-            this.altitudeMeters = altitudeMeters;
-        }
-    }
-
-
     private static final class BusStopPin {
         final String name;
         final String route;
         final double latitude;
         final double longitude;
+        final float cachedDistance;
         float displayedX = Float.NaN;
         float displayedY = Float.NaN;
 
-        BusStopPin(String name, String route, double latitude, double longitude) {
+        BusStopPin(String name, String route, double latitude, double longitude, float cachedDistance) {
             this.name = name;
             this.route = route;
             this.latitude = latitude;
             this.longitude = longitude;
+            this.cachedDistance = cachedDistance;
         }
     }
 }
