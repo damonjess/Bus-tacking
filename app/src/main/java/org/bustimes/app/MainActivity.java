@@ -113,6 +113,9 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     private static final String PREF_SHOW_STOPS = "show_stops";
     private static final String PREF_FAVORITES = "favorite_routes";
 
+    /** Rows a departure board shows before it reports how many are left. */
+    private static final int MAX_BOARD_ROWS = 8;
+
     private static final long STALE_BUS_MS = 4 * 60 * 1000L;
     private static final int REQ_LOCATION = 41;
     private static final int REQ_NOTIFICATIONS = 42;
@@ -137,6 +140,8 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     }
 
     private static final class Stop {
+        /** OpenStreetMap node id, or 0 for a stop from a cache written before ids were kept. */
+        long id;
         String name;
         String routes;
         double lat;
@@ -205,6 +210,13 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     private EditText searchInput;
     private LinearLayout favoritesList;
     private LinearLayout accountList;
+
+    // departure board state, held while a stop sheet is open so it can follow the live feed
+    private BottomSheetDialog stopBoardDialog;
+    private LinearLayout stopBoardRows;
+    private TextView stopBoardTitle;
+    private TextView stopBoardNote;
+    private Stop stopBoardStop;
 
     private final Runnable stopFetchRunnable = () -> {
         if (map == null) return;
@@ -809,13 +821,11 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             bus = new Bus();
             buses.put(id, bus);
         } else if (bus.pos != null) {
-            long dt = now - bus.receivedMs;
-            if (dt >= 4000) {
-                float[] result = new float[1];
-                Location.distanceBetween(bus.pos.latitude, bus.pos.longitude, lat, lon, result);
-                float kph = (float) (result[0] / (dt / 1000.0) * 3.6);
-                bus.speedKph = kph > 120f ? Float.NaN : kph;
-            }
+            // Measure against the feed's own timestamps: roughly half the fleet repeats its previous
+            // fix between two of our polls, so the poll interval is the wrong denominator.
+            bus.speedKph = VehicleSpeed.estimate(
+                    bus.pos.latitude, bus.pos.longitude, ArrivalAlerts.parseIso(bus.pos.recordedAt),
+                    lat, lon, ArrivalAlerts.parseIso(pos.recordedAt), bus.speedKph, now);
         }
         bus.pos = pos;
         bus.receivedMs = now;
@@ -982,6 +992,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         rebuildChips();
         map.invalidate();
         rebuildCurrentTab();
+        renderStopBoard();
     }
 
     private boolean isBusVisible(BusPosition pos) {
@@ -1457,6 +1468,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
                 JSONObject element = elements.getJSONObject(i);
                 JSONObject tags = element.optJSONObject("tags");
                 Stop stop = new Stop();
+                stop.id = element.optLong("id", 0L);
                 stop.lat = element.getDouble("lat");
                 stop.lon = element.getDouble("lon");
                 stop.name = tags == null ? "" : tags.optString("name", "");
@@ -1499,6 +1511,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             for (int i = 0; i < elements.length(); i++) {
                 JSONObject obj = elements.getJSONObject(i);
                 Stop stop = new Stop();
+                stop.id = obj.optLong("id", 0L);
                 stop.lat = obj.getDouble("lat");
                 stop.lon = obj.getDouble("lon");
                 stop.name = obj.optString("name", "");
@@ -1520,6 +1533,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             JSONArray array = new JSONArray();
             for (Stop stop : stops) {
                 JSONObject obj = new JSONObject();
+                obj.put("id", stop.id);
                 obj.put("lat", stop.lat);
                 obj.put("lon", stop.lon);
                 obj.put("name", stop.name);
@@ -1593,7 +1607,35 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
 
     private void showStopSheet(Stop stop) {
         LinearLayout card = sheetCard();
-        card.addView(tv(stop.name, 20, UiTheme.WHITE, true));
+
+        // name with a trailing save star: saving the stop is what puts its board on Favorites
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.addView(tv(stop.name, 20, UiTheme.WHITE, true),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        boolean saved = StopFavorites.isFavorite(this, stop.id, stop.lat, stop.lon);
+        TextView star = UiTheme.pillText(this, saved ? "\u2605 Saved" : "\u2606 Save",
+                saved ? UiTheme.INK : UiTheme.WHITE,
+                saved ? UiTheme.CYAN : UiTheme.INK_LIGHT,
+                UiTheme.CYAN);
+        star.setOnClickListener(v -> {
+            StopFavorites.toggle(this, new StopFavorites.FavoriteStop(
+                    stop.id, stop.name, stop.routes, stop.lat, stop.lon));
+            boolean nowSaved = StopFavorites.isFavorite(this, stop.id, stop.lat, stop.lon);
+            star.setText(nowSaved ? "\u2605 Saved" : "\u2606 Save");
+            star.setTextColor(nowSaved ? UiTheme.INK : UiTheme.WHITE);
+            star.setBackground(UiTheme.ripple(UiTheme.pill(this,
+                    nowSaved ? UiTheme.CYAN : UiTheme.INK_LIGHT, UiTheme.CYAN, 1f, 20f)));
+            Toast.makeText(this, nowSaved
+                    ? stop.name + " saved to Favorites"
+                    : stop.name + " removed from Favorites", Toast.LENGTH_SHORT).show();
+            if (currentTab == TAB_FAVORITES) {
+                rebuildFavorites();
+            }
+        });
+        header.addView(star);
+        card.addView(header);
         if (userLocation != null) {
             card.addView(tv(formatDistance(meters(userLocation.getLatitude(), userLocation.getLongitude(),
                     stop.lat, stop.lon)) + " from you", 13, UiTheme.TEXT_DIM, false));
@@ -1604,35 +1646,19 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             card.addView(routes);
         }
 
-        TextView title = tv("Buses within 600 m", 13, UiTheme.TEXT_DIM, false);
-        title.setPadding(0, dp(16), 0, dp(6));
-        card.addView(title);
+        stopBoardTitle = tv("Next departures", 13, UiTheme.TEXT_DIM, false);
+        stopBoardTitle.setPadding(0, dp(16), 0, dp(6));
+        card.addView(stopBoardTitle);
+
+        stopBoardRows = new LinearLayout(this);
+        stopBoardRows.setOrientation(LinearLayout.VERTICAL);
+        card.addView(stopBoardRows);
+
+        stopBoardNote = tv("", 12, UiTheme.TEXT_DIM, false);
+        stopBoardNote.setPadding(0, dp(6), 0, 0);
+        card.addView(stopBoardNote);
 
         final BottomSheetDialog dialog = sheetDialog(card);
-        List<Bus> near = new ArrayList<>();
-        for (Bus bus : buses.values()) {
-            if (bus.pos != null && meters(stop.lat, stop.lon, bus.pos.latitude, bus.pos.longitude) <= 600) {
-                near.add(bus);
-            }
-        }
-        Collections.sort(near, Comparator.<Bus>comparingDouble(
-                b -> meters(stop.lat, stop.lon, b.pos.latitude, b.pos.longitude)));
-        if (near.isEmpty()) {
-            card.addView(tv(TextUtils.isEmpty(BuildConfig.BODS_API_KEY)
-                    ? "Live buses need a BODS API key." : "No live buses near this stop right now.",
-                    14, UiTheme.WHITE, false));
-        } else {
-            for (int i = 0; i < Math.min(near.size(), 6); i++) {
-                Bus bus = near.get(i);
-                View row = busRow(bus, meters(stop.lat, stop.lon, bus.pos.latitude, bus.pos.longitude));
-                final String busId = bus.pos.id;
-                row.setOnClickListener(v -> {
-                    dialog.dismiss();
-                    showBus(busId);
-                });
-                card.addView(row);
-            }
-        }
 
         LinearLayout actions = new LinearLayout(this);
         actions.setOrientation(LinearLayout.HORIZONTAL);
@@ -1662,12 +1688,104 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         actions.addView(notify, notifyLp);
         actions.addView(show);
         card.addView(actions);
+
+        stopBoardStop = stop;
+        stopBoardDialog = dialog;
+        dialog.setOnDismissListener(d -> {
+            stopBoardStop = null;
+            stopBoardDialog = null;
+            stopBoardRows = null;
+            stopBoardTitle = null;
+            stopBoardNote = null;
+        });
+        renderStopBoard();
         dialog.show();
+    }
+
+    /** The live fleet as the departure board sees it. */
+    private List<StopDepartures.Vehicle> liveVehicles() {
+        List<StopDepartures.Vehicle> vehicles = new ArrayList<>();
+        for (Bus bus : buses.values()) {
+            if (bus.pos == null) {
+                continue;
+            }
+            vehicles.add(new StopDepartures.Vehicle(bus.pos.id, bus.pos.lineName,
+                    bus.pos.destinationName, bus.pos.latitude, bus.pos.longitude,
+                    bus.pos.bearing, bus.speedKph));
+        }
+        return vehicles;
+    }
+
+    /**
+     * Fills the open stop sheet with its departure board. Called again at the end of every poll so the
+     * sheet tracks the live feed instead of freezing on whatever was true when it was opened.
+     */
+    private void renderStopBoard() {
+        if (stopBoardRows == null || stopBoardTitle == null || stopBoardStop == null) {
+            return;
+        }
+        Stop stop = stopBoardStop;
+        stopBoardRows.removeAllViews();
+        stopBoardNote.setText("");
+
+        List<StopDepartures.Vehicle> vehicles = liveVehicles();
+        List<StopDepartures.Departure> board =
+                StopDepartures.board(vehicles, stop.lat, stop.lon, stop.routes);
+        boolean servingThisStop = !board.isEmpty();
+        if (!servingThisStop) {
+            // Either nothing on this stop's routes is running, or the OSM route names do not match the
+            // feed's line names. Fall back to what is genuinely nearby so the sheet is never a dead end.
+            board = StopDepartures.board(vehicles, stop.lat, stop.lon, "");
+        }
+        stopBoardTitle.setText(servingThisStop ? "Next departures" : "Live buses nearby");
+
+        if (board.isEmpty()) {
+            stopBoardRows.addView(tv(TextUtils.isEmpty(BuildConfig.BODS_API_KEY)
+                    ? "Live buses need a BODS API key."
+                    : "No live buses near this stop right now.", 14, UiTheme.WHITE, false));
+            return;
+        }
+
+        boolean timed = false;
+        int shown = 0;
+        for (StopDepartures.Departure departure : board) {
+            if (shown == MAX_BOARD_ROWS) {
+                break;
+            }
+            Bus bus = buses.get(departure.busId);
+            if (bus == null || bus.pos == null) {
+                continue;
+            }
+            shown++;
+            timed |= departure.hasTime();
+            String label = departure.minutesLabel();
+            View row = busRow(bus, departure.distanceMeters, label.isEmpty() ? null : label);
+            final String busId = departure.busId;
+            row.setOnClickListener(v -> {
+                if (stopBoardDialog != null) {
+                    stopBoardDialog.dismiss();
+                }
+                showBus(busId);
+            });
+            stopBoardRows.addView(row);
+        }
+        if (shown < board.size()) {
+            stopBoardNote.setText("Showing the next " + shown + " of " + board.size() + ".");
+        } else if (timed) {
+            stopBoardNote.setText("Times are estimated from each bus's live speed and distance.");
+        }
     }
 
     // ------------------------------------------------------------------ list screens
 
     private View busRow(Bus bus, double distanceMeters) {
+        return busRow(bus, distanceMeters, null);
+    }
+
+    /**
+     * @param rightLabel overrides the distance on the right, e.g. a departure board's "4 min"
+     */
+    private View busRow(Bus bus, double distanceMeters, String rightLabel) {
         BusPosition p = bus.pos;
         int color = UiTheme.occupancyColor(p.occupancy);
         LinearLayout row = new LinearLayout(this);
@@ -1691,7 +1809,8 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             middle.addView(tv(sub.toString(), 12, UiTheme.TEXT_DIM, false));
         }
         row.addView(middle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        row.addView(tv(formatDistance(distanceMeters), 13, UiTheme.CYAN, true));
+        row.addView(tv(rightLabel == null ? formatDistance(distanceMeters) : rightLabel,
+                13, UiTheme.CYAN, true));
 
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -1891,6 +2010,18 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             return;
         }
         favoritesList.removeAllViews();
+
+        favoritesList.addView(sectionTitle("Favorite stops"));
+        List<StopFavorites.FavoriteStop> savedStops = StopFavorites.sortedSaved(this);
+        if (savedStops.isEmpty()) {
+            favoritesList.addView(note("Tap the star on any stop to keep its departure board here."));
+        } else {
+            double[] ref = refPoint();
+            for (StopFavorites.FavoriteStop savedStop : savedStops) {
+                favoritesList.addView(favoriteStopCard(savedStop, ref));
+            }
+        }
+
         favoritesList.addView(sectionTitle("Favorite routes"));
         List<String> favs = new ArrayList<>(favorites());
         Collections.sort(favs, MainActivity::compareRoutes);
@@ -1903,6 +2034,68 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             RouteInfo info = summary.get(route);
             favoritesList.addView(routeCard(route, info == null ? new RouteInfo() : info));
         }
+    }
+
+    /**
+     * A saved stop: how far away it is and how many buses are inbound, taken from the same departure
+     * board the stop sheet shows. Tapping it opens that board, so Favorites is one tap from arrivals.
+     */
+    private View favoriteStopCard(StopFavorites.FavoriteStop saved, double[] ref) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setBackground(UiTheme.ripple(UiTheme.pill(this, UiTheme.INK_LIGHT, Color.parseColor("#24304F"), 1f, 16)));
+        row.setPadding(dp(12), dp(12), dp(12), dp(12));
+
+        IconView icon = new IconView(this, IconView.PIN);
+        icon.setIconColor(UiTheme.CYAN);
+        icon.setAccentColor(UiTheme.CYAN);
+        row.addView(icon, new LinearLayout.LayoutParams(dp(28), dp(28)));
+
+        int inbound = StopDepartures.board(liveVehicles(), saved.latitude, saved.longitude,
+                saved.routes).size();
+        LinearLayout middle = new LinearLayout(this);
+        middle.setOrientation(LinearLayout.VERTICAL);
+        middle.setPadding(dp(12), 0, dp(8), 0);
+        middle.addView(tv(saved.name, 15, UiTheme.WHITE, true));
+        StringBuilder sub = new StringBuilder(inbound == 0
+                ? "No live buses inbound"
+                : inbound + (inbound == 1 ? " bus inbound" : " buses inbound"));
+        if (!saved.routes.isEmpty()) {
+            sub.append(" \u00B7 Routes ").append(saved.routes);
+        }
+        middle.addView(tv(sub.toString(), 12, UiTheme.TEXT_DIM, false));
+        row.addView(middle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(tv(formatDistance(meters(ref[0], ref[1], saved.latitude, saved.longitude)),
+                13, UiTheme.CYAN, true));
+
+        TextView remove = UiTheme.pillText(this, "\u2715", UiTheme.WHITE, UiTheme.INK_LIGHT, UiTheme.BLUE);
+        remove.setOnClickListener(v -> {
+            StopFavorites.remove(this, saved.key());
+            rebuildFavorites();
+        });
+        LinearLayout.LayoutParams removeLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        removeLp.leftMargin = dp(8);
+        row.addView(remove, removeLp);
+
+        row.setOnClickListener(v -> showStopSheet(stopShapeFor(saved)));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = dp(10);
+        row.setLayoutParams(lp);
+        return row;
+    }
+
+    /** Rebuilds the live Stop shape a saved stop needs in order to show its departure board. */
+    private Stop stopShapeFor(StopFavorites.FavoriteStop saved) {
+        Stop stop = new Stop();
+        stop.id = saved.osmId;
+        stop.name = saved.name;
+        stop.routes = saved.routes;
+        stop.lat = saved.latitude;
+        stop.lon = saved.longitude;
+        return stop;
     }
 
     private void rebuildAccount() {
@@ -1959,10 +2152,13 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         }
 
         accountList.addView(sectionTitle("This device"));
-        accountList.addView(note(favorites().size() + " favorite routes saved"));
+        int savedStopCount = StopFavorites.load(this).size();
+        accountList.addView(note(favorites().size() + " favorite routes and " + savedStopCount
+                + (savedStopCount == 1 ? " favorite stop" : " favorite stops") + " saved"));
         TextView clear = UiTheme.pillText(this, "Clear favorites", UiTheme.WHITE, UiTheme.INK_LIGHT, UiTheme.BLUE);
         clear.setOnClickListener(v -> {
             prefs.edit().remove(PREF_FAVORITES).apply();
+            StopFavorites.clear(this);
             rebuildAccount();
         });
         accountList.addView(clear, new LinearLayout.LayoutParams(
