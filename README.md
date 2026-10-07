@@ -46,6 +46,34 @@ A map-first Android wrapper for [bustimes.org](https://bustimes.org/) focused on
 - Marker throttling (300 ms for map overlays, 600 ms for AR cards) keeps 60 fps while hundreds of vehicles animate.
 - Speed and heading are estimated between polls and surfaced in the details sheet and AR cards.
 
+### Live tracking & map UX
+
+- **Bus gliding**: because BODS only reports a vehicle every 15 seconds, each marker is interpolated
+  from its previous fix to the new one over 2.5 seconds with a `ValueAnimator`, so buses slide along
+  the road instead of jumping between points. A brand new marker, a stationary vehicle and a fix that
+  leaps more than 5 km are placed directly, since none of those has anything sensible to glide from.
+- **Route line overlays**: tapping a live bus or a route chip draws that route's shape on the map.
+  The geometry is the real OpenStreetMap `route=bus` relation for that route, fetched through the
+  Overpass API and joined into continuous lines by `RouteShapeJoiner` (the member ways are joined
+  end-to-end in either direction, and stop/platform members are skipped). Shapes are cached in memory
+  and on disk for a week, and because public Overpass instances are often busy, the request falls
+  through a short list of instances. If OSM has no shape for a route the app says so rather than
+  drawing an invented line. The line is cleared by the **All** chip.
+- **Proximity / arrival alerts**: "notify me when route 350 is 5 minutes away". Tap **Notify me** on a
+  bus details sheet (the alert is anchored to your location) or on a stop sheet (anchored to that
+  stop, and the route is picked from the live buses currently at it), then choose how close counts as
+  close. A notification is raised when polling sees that route's vehicle inside the alert radius, or
+  earlier when the BODS feed supplies a live ETA at or under the chosen minutes. Alerts raise once per
+  10 minutes per route, are listed and cleared from the **Account** tab, and tapping a notification
+  opens the map filtered to that route.
+
+  Each minute preset also stands for the radius used when the feed has no ETA (2 min ≈ 400 m,
+  5 min ≈ 800 m, 10 min ≈ 1.6 km, 15 min ≈ 2.4 km). While any alert is armed the BODS poller keeps
+  running with the map off screen so alerts can still fire, and the feed's bounding box is widened to
+  cover the alert's surroundings. This is a plain started service rather than a foreground service,
+  so Android may still stop it under memory pressure; alerts are checked in-app whenever the map is
+  open, and in the poller the rest of the time.
+
 ## Build locally
 
 Open the project in Android Studio or build from the command line with an Android SDK installed:
@@ -94,3 +122,13 @@ This repository includes a GitHub Actions workflow at `.github/workflows/build-a
 The workflow also runs automatically for pushes to `main`/`work` and for pull requests.
 
 The project uses the Android Gradle Plugin. `gradle.properties` enables AndroidX for compatibility with Android dependencies used by local and GitHub Actions builds. ARCore support sets the app minimum SDK to Android 7.0 / API 24.
+
+## Tests
+
+Focused JVM unit tests cover the pieces of live tracking with real logic to get wrong: the arrival
+alert rules and their one-alert-per-route bookkeeping, SIRI-VM arrival time parsing, and Overpass
+route shape joining and parsing (including a captured payload of a real route 350 relation).
+
+```bash
+gradle :app:testDebugUnitTest
+```
