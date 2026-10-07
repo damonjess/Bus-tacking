@@ -1,6 +1,7 @@
 package org.bustimes.app;
 
 import android.Manifest;
+import android.animation.ValueAnimator;
 import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -8,6 +9,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -20,6 +22,7 @@ import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -27,9 +30,11 @@ import android.text.Editable;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.text.TextWatcher;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.animation.LinearInterpolator;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -47,6 +52,7 @@ import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
 
 import com.google.android.material.bottomsheet.BottomSheetDialog;
+import com.google.android.material.button.MaterialButton;
 import com.google.android.material.switchmaterial.SwitchMaterial;
 
 import org.json.JSONArray;
@@ -62,18 +68,17 @@ import org.osmdroid.util.GeoPoint;
 import org.osmdroid.views.CustomZoomButtonsController;
 import org.osmdroid.views.MapView;
 import org.osmdroid.views.overlay.Marker;
+import org.osmdroid.views.overlay.Polyline;
 import org.osmdroid.views.overlay.TilesOverlay;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -85,7 +90,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -111,6 +115,13 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
 
     private static final long STALE_BUS_MS = 4 * 60 * 1000L;
     private static final int REQ_LOCATION = 41;
+    private static final int REQ_NOTIFICATIONS = 42;
+
+    /** How long a bus marker takes to glide between two BODS polls. */
+    private static final long GLIDE_DURATION_MS = 2500L;
+    /** Below this the vehicle is stationary; above it the vehicle was re-reported elsewhere. */
+    private static final double GLIDE_SNAP_METERS = 5000d;
+    private static final double GLIDE_MIN_METERS = 3d;
 
     // Default view until the first GPS fix arrives.
     private static final double DEFAULT_LAT = 53.5786;
@@ -121,6 +132,8 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         long receivedMs;
         float speedKph = Float.NaN;
         Marker marker;
+        /** Runs while the marker slides from its previous poll position to the latest one. */
+        ValueAnimator glide;
     }
 
     private static final class Stop {
@@ -166,6 +179,13 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     private boolean refreshPending;
     private String lastChipSignature = "";
     private long lastListRebuildMs;
+    private long sweepStartMs;
+    private boolean sweepPending;
+
+    // route line overlay state
+    private final List<Polyline> routeLineOverlays = new ArrayList<>();
+    private String routeLineFor;
+    private String routeLineLoadingFor;
 
     // UI
     private int currentTab = -1;
@@ -179,6 +199,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     private MapView map;
     private LinearLayout chipRow;
     private TextView followPill;
+    private TextView routeLinePill;
     private LinearLayout nearbyList;
     private LinearLayout searchResults;
     private EditText searchInput;
@@ -212,7 +233,9 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             if (BusTrackingService.ACTION_BUS_POSITION.equals(action)) {
                 onBusPosition(intent);
             } else if (BusTrackingService.ACTION_CLEAR_TRACKING.equals(action)) {
-                clearBuses();
+                beginSweep();
+            } else if (BusTrackingService.ACTION_POLL_COMPLETE.equals(action)) {
+                endSweep();
             } else if (BusTrackingService.ACTION_TRACKING_STATUS.equals(action)) {
                 setStatus(intent.getStringExtra(BusTrackingService.EXTRA_STATUS_MESSAGE));
             }
@@ -278,6 +301,27 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         if (TextUtils.isEmpty(BuildConfig.BODS_API_KEY)) {
             setStatus("Add a BODS API key to see live buses");
         }
+        handleAlertRouteIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleAlertRouteIntent(intent);
+    }
+
+    /** Tapping an arrival notification opens the map filtered to that route. */
+    private void handleAlertRouteIntent(Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        String route = intent.getStringExtra(AlertNotifier.EXTRA_ROUTE);
+        if (TextUtils.isEmpty(route)) {
+            return;
+        }
+        intent.removeExtra(AlertNotifier.EXTRA_ROUTE);
+        filterToRoute(route);
     }
 
     @Override
@@ -287,6 +331,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         IntentFilter filter = new IntentFilter();
         filter.addAction(BusTrackingService.ACTION_BUS_POSITION);
         filter.addAction(BusTrackingService.ACTION_CLEAR_TRACKING);
+        filter.addAction(BusTrackingService.ACTION_POLL_COMPLETE);
         filter.addAction(BusTrackingService.ACTION_TRACKING_STATUS);
         ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED);
         Intent start = new Intent(this, BusTrackingService.class);
@@ -301,12 +346,16 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     protected void onPause() {
         super.onPause();
         map.onPause();
+        cancelAllGlides();
         try {
             unregisterReceiver(receiver);
         } catch (IllegalArgumentException ignored) {
             // not registered
         }
-        stopService(new Intent(this, BusTrackingService.class));
+        // Armed arrival alerts need the poller to keep running once the map is off screen.
+        if (!ArrivalAlertStore.hasAlerts(this)) {
+            stopService(new Intent(this, BusTrackingService.class));
+        }
         try {
             locationManager.removeUpdates(locationListener);
         } catch (SecurityException ignored) {
@@ -317,6 +366,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        cancelAllGlides();
         handler.removeCallbacksAndMessages(null);
         io.shutdownNow();
         if (map != null) {
@@ -329,6 +379,9 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == REQ_LOCATION) {
             startLocation();
+        }
+        if (requestCode == REQ_NOTIFICATIONS && currentTab == TAB_ACCOUNT) {
+            rebuildAccount();
         }
     }
 
@@ -481,6 +534,18 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
                 Gravity.START | Gravity.BOTTOM);
         followLp.setMargins(dp(12), 0, 0, dp(36));
         frame.addView(followPill, followLp);
+
+        // Route line pill: the visible way to dismiss the line that tapping a bus drew, so a route
+        // line can never get stuck on the map. Sits above the follow pill.
+        routeLinePill = UiTheme.pillText(this, "", UiTheme.CYAN,
+                UiTheme.withAlpha(UiTheme.INK, 225), UiTheme.CYAN);
+        routeLinePill.setVisibility(View.GONE);
+        routeLinePill.setOnClickListener(v -> clearRouteLine());
+        FrameLayout.LayoutParams lineLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.START | Gravity.BOTTOM);
+        lineLp.setMargins(dp(12), 0, 0, dp(84));
+        frame.addView(routeLinePill, lineLp);
 
         // Required OpenStreetMap attribution
         TextView attribution = tv("\u00A9 OpenStreetMap contributors", 10, UiTheme.WHITE, false);
@@ -755,6 +820,14 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         bus.pos = pos;
         bus.receivedMs = now;
 
+        if (!TextUtils.isEmpty(pos.lineName) && RouteShapes.cached(pos.lineName) == null) {
+            final String lineName = pos.lineName;
+            final double busLat = lat;
+            final double busLon = lon;
+            io.execute(() -> RouteShapes.load(this, lineName, busLat, busLon));
+        }
+
+        boolean isNewMarker = bus.marker == null;
         if (bus.marker == null) {
             final String busId = id;
             Marker marker = new Marker(map);
@@ -767,10 +840,63 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             map.getOverlays().add(marker);
             bus.marker = marker;
         }
-        bus.marker.setPosition(new GeoPoint(lat, lon));
         bus.marker.setIcon(busIcon(pos.lineName, pos.occupancy));
         bus.marker.setEnabled(isBusVisible(pos));
+        glideMarkerTo(bus, lat, lon, isNewMarker);
         scheduleRefresh();
+    }
+
+    /**
+     * Slides a bus marker from its previous fix to the new one instead of jumping.
+     *
+     * BODS reports a position every 15 seconds, so the marker is lerped across the whole
+     * interval with a ValueAnimator, which keeps the vehicle moving along the road at roughly the
+     * speed the vehicle is really travelling. A brand new marker or a stationary vehicle is placed
+     * directly, and a fix that leaps kilometres (bad GPS, a re-positioned vehicle) is snapped rather
+     * than slid across the map: neither has anything sensible to glide from.
+     */
+    private void glideMarkerTo(Bus bus, double lat, double lon, boolean firstFix) {
+        if (bus.marker == null || map == null) {
+            return;
+        }
+        cancelGlide(bus);
+        GeoPoint from = bus.marker.getPosition();
+        if (firstFix || from == null) {
+            bus.marker.setPosition(new GeoPoint(lat, lon));
+            return;
+        }
+        final double fromLat = from.getLatitude();
+        final double fromLon = from.getLongitude();
+        double distance = meters(fromLat, fromLon, lat, lon);
+        if (distance < GLIDE_MIN_METERS || distance > GLIDE_SNAP_METERS) {
+            bus.marker.setPosition(new GeoPoint(lat, lon));
+            return;
+        }
+        ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
+        animator.setDuration(GLIDE_DURATION_MS);
+        animator.setInterpolator(new LinearInterpolator());
+        animator.addUpdateListener(animation -> {
+            float t = (float) animation.getAnimatedValue();
+            bus.marker.setPosition(new GeoPoint(
+                    fromLat + (lat - fromLat) * t,
+                    fromLon + (lon - fromLon) * t));
+            map.invalidate();
+        });
+        bus.glide = animator;
+        animator.start();
+    }
+
+    private void cancelGlide(Bus bus) {
+        if (bus.glide != null) {
+            bus.glide.cancel();
+            bus.glide = null;
+        }
+    }
+
+    private void cancelAllGlides() {
+        for (Bus bus : buses.values()) {
+            cancelGlide(bus);
+        }
     }
 
     private void scheduleRefresh() {
@@ -790,6 +916,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
                 }
             }
             map.invalidate();
+            evaluateArrivalAlerts();
             long now = System.currentTimeMillis();
             if (currentTab != TAB_MAP && currentTab != TAB_SEARCH && now - lastListRebuildMs > 4000) {
                 lastListRebuildMs = now;
@@ -804,6 +931,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         while (it.hasNext()) {
             Bus bus = it.next().getValue();
             if (now - bus.receivedMs > STALE_BUS_MS) {
+                cancelGlide(bus);
                 if (bus.marker != null) {
                     map.getOverlays().remove(bus.marker);
                 }
@@ -812,13 +940,44 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         }
     }
 
-    private void clearBuses() {
-        for (Bus bus : buses.values()) {
-            if (bus.marker != null) {
-                map.getOverlays().remove(bus.marker);
+    /**
+     * A fresh BODS snapshot is about to stream in.
+     *
+     * Vehicles are deliberately kept rather than wiped: keeping them is what lets a marker glide
+     * from its previous fix to the new one, and what keeps speed estimation working across polls.
+     * Anything the snapshot does not re-report is removed by {@link #endSweep()}, which matches the
+     * old behaviour of a vehicle vanishing from the map as soon as the feed drops it.
+     */
+    private void beginSweep() {
+        sweepStartMs = System.currentTimeMillis();
+        sweepPending = true;
+    }
+
+    /** Ends a snapshot: any vehicle it did not re-report has left the feed. */
+    private void endSweep() {
+        if (!sweepPending) {
+            return;
+        }
+        sweepPending = false;
+        boolean changed = false;
+        Iterator<Map.Entry<String, Bus>> it = buses.entrySet().iterator();
+        while (it.hasNext()) {
+            Bus bus = it.next().getValue();
+            if (bus.receivedMs < sweepStartMs) {
+                cancelGlide(bus);
+                if (bus.marker != null) {
+                    map.getOverlays().remove(bus.marker);
+                }
+                it.remove();
+                changed = true;
             }
         }
-        buses.clear();
+        if (!changed) {
+            return;
+        }
+        if (followId != null && !buses.containsKey(followId)) {
+            stopFollowing();
+        }
         updateCountPill();
         rebuildChips();
         map.invalidate();
@@ -908,6 +1067,11 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             lastChipSignature = "";
             applyVisibility();
             rebuildChips();
+            if (route == null) {
+                clearRouteLine();
+            } else {
+                showRouteLine(route);
+            }
         });
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -935,6 +1099,140 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             BoundingBox box = BoundingBox.fromGeoPoints(points).increaseByScale(1.4f);
             map.post(() -> map.zoomToBoundingBox(box, true));
         }
+        showRouteLine(route);
+    }
+
+    // ------------------------------------------------------------------ route line overlays
+
+    /**
+     * Draws the mapped shape of a route on the map, the way tapping a live bus or a route chip
+     * is meant to work.
+     *
+     * The geometry comes from the OpenStreetMap {@code route=bus} relation for that route via
+     * Overpass (see {@link RouteShapes}); when OSM has no shape for the route the app says so
+     * instead of drawing an invented line.
+     */
+    private void showRouteLine(String route) {
+        double lat = map != null && map.getMapCenter() != null ? map.getMapCenter().getLatitude() : 51.5;
+        double lon = map != null && map.getMapCenter() != null ? map.getMapCenter().getLongitude() : 0.0;
+        showRouteLine(route, lat, lon);
+    }
+
+    private void showRouteLine(String route, double lat, double lon) {
+        if (map == null || TextUtils.isEmpty(route)) {
+            return;
+        }
+        if (route.equalsIgnoreCase(routeLineFor) && !routeLineOverlays.isEmpty()) {
+            return;
+        }
+        routeLineFor = route;
+        List<List<GeoPoint>> cached = RouteShapes.cached(route);
+        if (cached != null) {
+            drawRouteLine(cached);
+            return;
+        }
+        if (route.equalsIgnoreCase(routeLineLoadingFor)) {
+            return;
+        }
+        routeLineLoadingFor = route;
+        final String requested = route;
+        final double queryLat = lat;
+        final double queryLon = lon;
+        io.execute(() -> {
+            List<List<GeoPoint>> lines = RouteShapes.load(this, requested, queryLat, queryLon);
+            handler.post(() -> {
+                if (requested.equalsIgnoreCase(routeLineLoadingFor)) {
+                    routeLineLoadingFor = null;
+                }
+                if (!requested.equalsIgnoreCase(routeLineFor)) {
+                    return; // the user has moved on to another route
+                }
+                if (lines == null) {
+                    Toast.makeText(this, "Couldn't load the route line for " + requested,
+                            Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                drawRouteLine(lines);
+                if (lines.isEmpty()) {
+                    Toast.makeText(this, "No mapped route line for " + requested + " in OpenStreetMap yet",
+                            Toast.LENGTH_SHORT).show();
+                }
+            });
+        });
+    }
+
+    private void drawRouteLine(List<List<GeoPoint>> lines) {
+        clearRouteLineOverlays();
+        if (map == null || lines.isEmpty()) {
+            if (map != null) {
+                map.invalidate();
+            }
+            return;
+        }
+        List<Polyline> overlays = new ArrayList<>();
+        // a wider dark casing under the coloured line keeps it readable over satellite tiles
+        for (List<GeoPoint> points : lines) {
+            Polyline casing = new Polyline(map);
+            casing.setPoints(points);
+            casing.setColor(UiTheme.withAlpha(UiTheme.INK, 200));
+            casing.setWidth(dp(9));
+            overlays.add(casing);
+        }
+        for (List<GeoPoint> points : lines) {
+            Polyline line = new Polyline(map);
+            line.setPoints(points);
+            line.setColor(UiTheme.CYAN);
+            line.setWidth(dp(4.5f));
+            overlays.add(line);
+        }
+        routeLineOverlays.addAll(overlays);
+        map.getOverlays().addAll(0, overlays);
+        updateRouteLinePill();
+        map.invalidate();
+    }
+
+    /** Hides the route line and forgets which route it belonged to. */
+    private void clearRouteLine() {
+        routeLineFor = null;
+        routeLineLoadingFor = null;
+        clearRouteLineOverlays();
+        if (map != null) {
+            map.invalidate();
+        }
+    }
+
+    private void clearRouteLineOverlays() {
+        if (map != null && !routeLineOverlays.isEmpty()) {
+            map.getOverlays().removeAll(routeLineOverlays);
+        }
+        routeLineOverlays.clear();
+        updateRouteLinePill();
+    }
+
+    /**
+     * Shows a dismissible "Route N \u2715" pill whenever a route line is on the map. Tapping it - or
+     * the **All** chip - removes the line; without it the only way to get rid of the line was to tap
+     * a different bus.
+     */
+    private void updateRouteLinePill() {
+        if (routeLinePill == null) {
+            return;
+        }
+        if (routeLineOverlays.isEmpty() || TextUtils.isEmpty(routeLineFor)) {
+            routeLinePill.setVisibility(View.GONE);
+        } else {
+            routeLinePill.setText("Route " + routeLineFor + "  \u2715");
+            routeLinePill.setVisibility(View.VISIBLE);
+        }
+    }
+
+    /** Keeps route lines at the bottom of the overlay stack, under stops and bus markers. */
+    private void sendRouteLinesToBack() {
+        if (map == null || routeLineOverlays.isEmpty()) {
+            return;
+        }
+        map.getOverlays().removeAll(routeLineOverlays);
+        map.getOverlays().addAll(0, routeLineOverlays);
     }
 
     // ------------------------------------------------------------------ icons
@@ -1131,53 +1429,108 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         });
     }
 
+    private static final Map<String, List<Stop>> STOP_MEMORY_CACHE = new HashMap<>();
+    private static final long STOP_CACHE_TTL_MS = 24L * 60 * 60 * 1000; // 24 hours
+
+    private static String stopCacheKey(double lat, double lon) {
+        return String.format(Locale.UK, "%.2f_%.2f", Math.round(lat * 100) / 100.0, Math.round(lon * 100) / 100.0);
+    }
+
     private List<Stop> loadStops(double lat, double lon) throws Exception {
+        String key = stopCacheKey(lat, lon);
+        List<Stop> memory = STOP_MEMORY_CACHE.get(key);
+        if (memory != null) {
+            return memory;
+        }
+        List<Stop> disk = readStopCache(lat, lon);
+        if (disk != null) {
+            STOP_MEMORY_CACHE.put(key, disk);
+            return disk;
+        }
+
         String query = "[out:json][timeout:20];node(around:1200," + lat + "," + lon
                 + ")[highway=bus_stop];out body 150;";
-        HttpURLConnection connection = (HttpURLConnection) new URL("https://overpass-api.de/api/interpreter")
-                .openConnection();
+        JSONArray elements = new JSONObject(Overpass.post(query)).optJSONArray("elements");
+        List<Stop> result = new ArrayList<>();
+        if (elements != null) {
+            for (int i = 0; i < elements.length(); i++) {
+                JSONObject element = elements.getJSONObject(i);
+                JSONObject tags = element.optJSONObject("tags");
+                Stop stop = new Stop();
+                stop.lat = element.getDouble("lat");
+                stop.lon = element.getDouble("lon");
+                stop.name = tags == null ? "" : tags.optString("name", "");
+                if (stop.name.isEmpty()) {
+                    stop.name = "Bus stop";
+                }
+                stop.routes = tags == null ? "" : tags.optString("route_ref", "").replace(";", ", ");
+                result.add(stop);
+            }
+        }
+        STOP_MEMORY_CACHE.put(key, result);
+        writeStopCache(lat, lon, result);
+        return result;
+    }
+
+    private File stopCacheFile(double lat, double lon) {
+        File directory = new File(getCacheDir(), "bus_stops");
+        if (!directory.exists() && !directory.mkdirs()) {
+            return null;
+        }
+        return new File(directory, stopCacheKey(lat, lon) + ".json");
+    }
+
+    private List<Stop> readStopCache(double lat, double lon) {
+        File file = stopCacheFile(lat, lon);
+        if (file == null || !file.isFile() || System.currentTimeMillis() - file.lastModified() > STOP_CACHE_TTL_MS) {
+            return null;
+        }
         try {
-            connection.setRequestMethod("POST");
-            connection.setDoOutput(true);
-            connection.setConnectTimeout(10_000);
-            connection.setReadTimeout(25_000);
-            connection.setRequestProperty("User-Agent", "BusTimesLive/1.0 (Android)");
-            connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
-            try (OutputStream out = connection.getOutputStream()) {
-                out.write(("data=" + URLEncoder.encode(query, "UTF-8")).getBytes(StandardCharsets.UTF_8));
-            }
-            int code = connection.getResponseCode();
-            if (code != 200) {
-                throw new IOException("HTTP " + code);
-            }
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-            try (InputStream in = connection.getInputStream()) {
+            try (InputStream in = new FileInputStream(file)) {
                 byte[] buffer = new byte[8192];
                 int read;
                 while ((read = in.read(buffer)) != -1) {
                     bytes.write(buffer, 0, read);
                 }
             }
-            JSONArray elements = new JSONObject(bytes.toString("UTF-8")).optJSONArray("elements");
+            JSONArray elements = new JSONArray(new String(bytes.toByteArray(), StandardCharsets.UTF_8));
             List<Stop> result = new ArrayList<>();
-            if (elements != null) {
-                for (int i = 0; i < elements.length(); i++) {
-                    JSONObject element = elements.getJSONObject(i);
-                    JSONObject tags = element.optJSONObject("tags");
-                    Stop stop = new Stop();
-                    stop.lat = element.getDouble("lat");
-                    stop.lon = element.getDouble("lon");
-                    stop.name = tags == null ? "" : tags.optString("name", "");
-                    if (stop.name.isEmpty()) {
-                        stop.name = "Bus stop";
-                    }
-                    stop.routes = tags == null ? "" : tags.optString("route_ref", "").replace(";", ", ");
-                    result.add(stop);
-                }
+            for (int i = 0; i < elements.length(); i++) {
+                JSONObject obj = elements.getJSONObject(i);
+                Stop stop = new Stop();
+                stop.lat = obj.getDouble("lat");
+                stop.lon = obj.getDouble("lon");
+                stop.name = obj.optString("name", "");
+                stop.routes = obj.optString("routes", "");
+                result.add(stop);
             }
             return result;
-        } finally {
-            connection.disconnect();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private void writeStopCache(double lat, double lon, List<Stop> stops) {
+        File file = stopCacheFile(lat, lon);
+        if (file == null) {
+            return;
+        }
+        try {
+            JSONArray array = new JSONArray();
+            for (Stop stop : stops) {
+                JSONObject obj = new JSONObject();
+                obj.put("lat", stop.lat);
+                obj.put("lon", stop.lon);
+                obj.put("name", stop.name);
+                obj.put("routes", stop.routes);
+                array.put(obj);
+            }
+            try (OutputStream out = new FileOutputStream(file)) {
+                out.write(array.toString().getBytes(StandardCharsets.UTF_8));
+            }
+        } catch (Exception e) {
+            Log.w("MainActivity", "Could not cache bus stops", e);
         }
     }
 
@@ -1209,6 +1562,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             map.getOverlays().remove(userMarker);
             map.getOverlays().add(userMarker);
         }
+        sendRouteLinesToBack();
         map.invalidate();
         rebuildCurrentTab();
     }
@@ -1228,18 +1582,12 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         }
         long ageSeconds = Math.max(0, (System.currentTimeMillis() - bus.receivedMs) / 1000);
         String lastSeen = ageSeconds < 60 ? ageSeconds + "s ago" : (ageSeconds / 60) + "m ago";
-        int etaMinutes = -1;
-        long arrival = parseIso(p.expectedArrivalTime);
-        if (arrival > 0) {
-            long diff = arrival - System.currentTimeMillis();
-            if (diff > -60_000L) {
-                etaMinutes = (int) Math.max(0, diff / 60_000L);
-            }
-        }
+        int etaMinutes = ArrivalAlerts.etaMinutesFrom(p.expectedArrivalTime);
         String vehicleId = p.id.startsWith("bus:") ? "" : p.id;
         BusSnapshot snapshot = new BusSnapshot(p.id, p.lineName, p.lineRef, p.destinationName, p.occupancy,
                 vehicleId, lastSeen, p.operatorName, distance, p.latitude, p.longitude,
                 p.bearing, bus.speedKph, etaMinutes, "");
+        showRouteLine(p.lineName, p.latitude, p.longitude);
         BusDetailsSheet.show(this, snapshot, this);
     }
 
@@ -1294,6 +1642,11 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             dialog.dismiss();
             onNavigateToBus(stop.lat, stop.lon);
         });
+        TextView notify = UiTheme.pillText(this, "Notify me", UiTheme.WHITE, UiTheme.INK_LIGHT, UiTheme.BLUE);
+        notify.setOnClickListener(v -> {
+            dialog.dismiss();
+            openAlertSheet(routesAtStop(stop), stop.name, stop.lat, stop.lon);
+        });
         TextView show = UiTheme.pillText(this, "Show on map", UiTheme.WHITE, UiTheme.INK_LIGHT, UiTheme.BLUE);
         show.setOnClickListener(v -> {
             dialog.dismiss();
@@ -1303,6 +1656,10 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         lp.rightMargin = dp(8);
         actions.addView(walk, lp);
+        LinearLayout.LayoutParams notifyLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        notifyLp.rightMargin = dp(8);
+        actions.addView(notify, notifyLp);
         actions.addView(show);
         card.addView(actions);
         dialog.show();
@@ -1562,6 +1919,45 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
                 ? "BODS API key found. " + (lastStatus.isEmpty() ? "Waiting for the first update." : lastStatus)
                 : "No BODS API key in this build. Add BODS_API_KEY to local.properties and rebuild."));
 
+        accountList.addView(sectionTitle("Arrival alerts"));
+        List<ArrivalAlert> armed = ArrivalAlertStore.sorted(this);
+        if (armed.isEmpty()) {
+            accountList.addView(note("Tap any live bus or route chip, then Notify me, to be told when that route is about to arrive."));
+        } else {
+            accountList.addView(note(armed.size() + (armed.size() == 1 ? " alert armed" : " alerts armed")
+                    + ". The live poller keeps running in the background while alerts are armed."));
+            for (ArrivalAlert alert : armed) {
+                LinearLayout row = new LinearLayout(this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setPadding(0, dp(6), 0, dp(6));
+                row.addView(tv(alert.summary(), 14, UiTheme.WHITE, false),
+                        new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                TextView remove = UiTheme.pillText(this, "Remove", UiTheme.WHITE, UiTheme.INK_LIGHT, UiTheme.BLUE);
+                final String alertId = alert.id;
+                remove.setOnClickListener(v -> {
+                    ArrivalAlertStore.remove(this, alertId);
+                    rebuildAccount();
+                });
+                row.addView(remove);
+                accountList.addView(row);
+            }
+            TextView clearAlerts = UiTheme.pillText(this, "Clear all alerts", UiTheme.WHITE, UiTheme.INK_LIGHT, UiTheme.BLUE);
+            clearAlerts.setOnClickListener(v -> {
+                ArrivalAlertStore.clear(this);
+                rebuildAccount();
+            });
+            accountList.addView(clearAlerts, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        }
+        if (!AlertNotifier.canPost(this)) {
+            accountList.addView(note("Notifications are off for this app, so alerts can't be shown."));
+            TextView enable = UiTheme.pillText(this, "Allow notifications", UiTheme.INK, UiTheme.CYAN, UiTheme.CYAN);
+            enable.setOnClickListener(v -> ensureNotificationPermission());
+            accountList.addView(enable, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        }
+
         accountList.addView(sectionTitle("This device"));
         accountList.addView(note(favorites().size() + " favorite routes saved"));
         TextView clear = UiTheme.pillText(this, "Clear favorites", UiTheme.WHITE, UiTheme.INK_LIGHT, UiTheme.BLUE);
@@ -1649,14 +2045,198 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         return favorites().contains(route);
     }
 
+    // ------------------------------------------------------------------ arrival alerts
+
     @Override
-    public void onToggleAlert(String busId, String route) {
-        Toast.makeText(this, "Arrival alerts aren't available yet", Toast.LENGTH_SHORT).show();
+    public void onConfigureAlert(String route) {
+        double[] point = refPoint();
+        openAlertSheet(Collections.singletonList(route),
+                userLocation != null ? "your location" : "the map centre", point[0], point[1]);
     }
 
     @Override
-    public boolean isAlertArmed(String busId, String route) {
-        return false;
+    public boolean isAlertArmedForRoute(String route) {
+        return ArrivalAlertStore.isArmedForRoute(this, route);
+    }
+
+    /** Re-checks armed alerts against the live buses currently on the map. */
+    private void evaluateArrivalAlerts() {
+        if (!ArrivalAlertStore.hasAlerts(this)) {
+            return;
+        }
+        List<BusPosition> positions = new ArrayList<>();
+        for (Bus bus : buses.values()) {
+            if (bus.pos != null) {
+                positions.add(bus.pos);
+            }
+        }
+        ArrivalAlerts.evaluate(this, ArrivalAlerts.candidatesFromPositions(positions));
+    }
+
+    private void ensureNotificationPermission() {
+        AlertNotifier.ensureChannel(this);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[] {Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIFICATIONS);
+        }
+    }
+
+    /** Distinct routes of the live buses currently sitting at a stop. */
+    private List<String> routesAtStop(Stop stop) {
+        List<String> routes = new ArrayList<>();
+        for (Bus bus : buses.values()) {
+            if (bus.pos == null || bus.pos.lineName.isEmpty()) {
+                continue;
+            }
+            if (meters(stop.lat, stop.lon, bus.pos.latitude, bus.pos.longitude) > 600) {
+                continue;
+            }
+            boolean seen = false;
+            for (String route : routes) {
+                if (route.equalsIgnoreCase(bus.pos.lineName)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                routes.add(bus.pos.lineName);
+            }
+        }
+        Collections.sort(routes, MainActivity::compareRoutes);
+        return routes;
+    }
+
+    private void styleAlertChip(TextView chip, boolean selected) {
+        chip.setTextColor(selected ? UiTheme.INK : UiTheme.WHITE);
+        chip.setBackground(UiTheme.ripple(UiTheme.pill(this,
+                selected ? UiTheme.CYAN : UiTheme.withAlpha(UiTheme.INK, 225),
+                selected ? UiTheme.CYAN : UiTheme.BLUE, 1f, 20f)));
+    }
+
+    /**
+     * "Notify me when route 350 is 5 minutes away" picker: choose the route (when the place
+     * serves several) and how close counts as close, then arm the alert.
+     */
+    private void openAlertSheet(List<String> routeOptions, String placeLabel, double lat, double lon) {
+        if (routeOptions == null || routeOptions.isEmpty()) {
+            Toast.makeText(this, "No live route to watch here yet", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        ensureNotificationPermission();
+
+        final String place = TextUtils.isEmpty(placeLabel) ? "your area" : placeLabel;
+        final String[] selectedRoute = {routeOptions.get(0)};
+        final int[] selectedMinutes = {ArrivalAlertRules.normaliseMinutes(ArrivalAlertRules.DEFAULT_MINUTES)};
+
+        LinearLayout card = sheetCard();
+        card.addView(tv("Arrival alert", 20, UiTheme.WHITE, true));
+        final TextView explain = tv("", 13, UiTheme.TEXT_DIM, false);
+        explain.setPadding(0, dp(6), 0, dp(12));
+        card.addView(explain);
+
+        final List<TextView> routeChips = new ArrayList<>();
+        if (routeOptions.size() > 1) {
+            card.addView(tv("Route", 13, UiTheme.TEXT_DIM, false));
+            LinearLayout routeRow = new LinearLayout(this);
+            routeRow.setOrientation(LinearLayout.HORIZONTAL);
+            routeRow.setPadding(0, dp(6), 0, dp(10));
+            for (String route : routeOptions) {
+                TextView routeChip = UiTheme.pillText(this, route, UiTheme.WHITE,
+                        UiTheme.withAlpha(UiTheme.INK, 225), UiTheme.BLUE);
+                routeChips.add(routeChip);
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                lp.rightMargin = dp(8);
+                routeRow.addView(routeChip, lp);
+            }
+            card.addView(routeRow);
+        }
+
+        card.addView(tv("How close counts as close", 13, UiTheme.TEXT_DIM, false));
+        LinearLayout minuteRow = new LinearLayout(this);
+        minuteRow.setOrientation(LinearLayout.HORIZONTAL);
+        minuteRow.setPadding(0, dp(6), 0, dp(12));
+        final List<TextView> minuteChips = new ArrayList<>();
+        for (int minutes : ArrivalAlertRules.MINUTE_PRESETS) {
+            TextView chip = UiTheme.pillText(this, minutes + " min", UiTheme.WHITE,
+                    UiTheme.withAlpha(UiTheme.INK, 225), UiTheme.BLUE);
+            minuteChips.add(chip);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.rightMargin = dp(8);
+            minuteRow.addView(chip, lp);
+        }
+        card.addView(minuteRow);
+
+        final MaterialButton arm = new MaterialButton(this);
+        arm.setAllCaps(false);
+        arm.setTextSize(15f);
+        arm.setCornerRadius(dp(22));
+        arm.setBackgroundTintList(ColorStateList.valueOf(UiTheme.CYAN));
+        arm.setTextColor(UiTheme.INK);
+        card.addView(arm, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        TextView manageNote = tv("Alerts are checked by the live poller, so they still fire when the map is off screen. Manage them in Account.",
+                12, UiTheme.TEXT_DIM, false);
+        manageNote.setPadding(0, dp(10), 0, 0);
+        card.addView(manageNote);
+
+        final Runnable[] refresh = new Runnable[1];
+        refresh[0] = () -> {
+            for (int i = 0; i < routeChips.size(); i++) {
+                styleAlertChip(routeChips.get(i), routeOptions.get(i).equals(selectedRoute[0]));
+            }
+            for (int i = 0; i < minuteChips.size(); i++) {
+                styleAlertChip(minuteChips.get(i), ArrivalAlertRules.MINUTE_PRESETS[i] == selectedMinutes[0]);
+            }
+            int radius = ArrivalAlertRules.radiusForMinutes(selectedMinutes[0]);
+            explain.setText("Ping me when " + selectedRoute[0] + " comes within " + radius
+                    + " m of " + place + ", or when the feed says it is " + selectedMinutes[0]
+                    + " min away.");
+            arm.setText(ArrivalAlertStore.isArmedForRoute(this, selectedRoute[0]) ? "Remove alert" : "Arm alert");
+        };
+        for (int i = 0; i < routeChips.size(); i++) {
+            final String route = routeOptions.get(i);
+            routeChips.get(i).setOnClickListener(v -> {
+                selectedRoute[0] = route;
+                refresh[0].run();
+            });
+        }
+        for (int i = 0; i < minuteChips.size(); i++) {
+            final int minutes = ArrivalAlertRules.MINUTE_PRESETS[i];
+            minuteChips.get(i).setOnClickListener(v -> {
+                selectedMinutes[0] = minutes;
+                refresh[0].run();
+            });
+        }
+        refresh[0].run();
+
+        final BottomSheetDialog dialog = sheetDialog(card);
+        arm.setOnClickListener(v -> {
+            String route = selectedRoute[0];
+            if (ArrivalAlertStore.isArmedForRoute(this, route)) {
+                ArrivalAlertStore.removeForRoute(this, route);
+                Toast.makeText(this, "Alert removed for " + route, Toast.LENGTH_SHORT).show();
+            } else {
+                ArrivalAlertStore.arm(this, new ArrivalAlert(route, place, lat, lon,
+                        selectedMinutes[0], System.currentTimeMillis()));
+                if (AlertNotifier.canPost(this)) {
+                    Toast.makeText(this, "Alerting you when " + route + " is about "
+                            + selectedMinutes[0] + " min from " + place, Toast.LENGTH_LONG).show();
+                } else {
+                    Toast.makeText(this, "Alert saved, but notifications are off. Turn them on in Account.",
+                            Toast.LENGTH_LONG).show();
+                }
+            }
+            dialog.dismiss();
+            if (currentTab == TAB_ACCOUNT) {
+                rebuildAccount();
+            }
+        });
+        dialog.show();
     }
 
     // ------------------------------------------------------------------ helpers
@@ -1690,18 +2270,4 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         }
     }
 
-    /** Parses an ISO-8601 timestamp with an offset; returns 0 when it can't be read. */
-    private static long parseIso(String value) {
-        if (value == null || value.isEmpty()) {
-            return 0;
-        }
-        try {
-            String cleaned = value.replaceFirst("\\.\\d+", "");
-            SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.UK);
-            format.setTimeZone(TimeZone.getTimeZone("UTC"));
-            return format.parse(cleaned).getTime();
-        } catch (Exception e) {
-            return 0;
-        }
-    }
 }

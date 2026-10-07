@@ -17,6 +17,8 @@ import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -27,6 +29,8 @@ import java.util.zip.ZipInputStream;
 public class BusTrackingService extends Service {
     static final String ACTION_BUS_POSITION = "org.bustimes.app.action.BUS_POSITION";
     static final String ACTION_TRACKING_STATUS = "org.bustimes.app.action.TRACKING_STATUS";
+    /** Sent once a full vehicle snapshot has been broadcast, so the map can sweep what it lost. */
+    static final String ACTION_POLL_COMPLETE = "org.bustimes.app.action.POLL_COMPLETE";
     static final String ACTION_REFRESH_NOW = "org.bustimes.app.action.REFRESH_NOW";
     static final String ACTION_START_MAP_TRACKING = "org.bustimes.app.action.START_MAP_TRACKING";
     static final String ACTION_STOP_MAP_TRACKING = "org.bustimes.app.action.STOP_MAP_TRACKING";
@@ -44,6 +48,8 @@ public class BusTrackingService extends Service {
     private ScheduledFuture<?> pollingFuture;
     private boolean mapActive;
     private volatile String activeBoundingBox;
+    /** Vehicles seen in the poll currently being parsed, used to check armed arrival alerts. */
+    private final List<BusPosition> pollBuffer = new ArrayList<>();
 
     @Override
     public void onCreate() {
@@ -90,6 +96,7 @@ public class BusTrackingService extends Service {
         if (pollingFuture != null && !pollingFuture.isCancelled()) {
             return;
         }
+        AlertNotifier.ensureChannel(this);
         pollingFuture = executorService.scheduleWithFixedDelay(this::pollBodsVehicleLocations,
                 0, POLL_INTERVAL_SECONDS, TimeUnit.SECONDS);
     }
@@ -117,6 +124,7 @@ public class BusTrackingService extends Service {
 
     private void pollBodsVehicleLocations() {
         HttpURLConnection connection = null;
+        pollBuffer.clear();
         try {
             URL url = new URL(buildBodsUrl());
             connection = (HttpURLConnection) url.openConnection();
@@ -158,6 +166,9 @@ public class BusTrackingService extends Service {
                 }
                 broadcastStatus(String.format(Locale.UK, "Updated %d BODS vehicle positions", count));
             }
+            // armed arrival alerts are checked against this poll, even with the map off screen
+            ArrivalAlerts.evaluate(this, ArrivalAlerts.candidatesFromPositions(new ArrayList<>(pollBuffer)));
+            broadcastPollComplete();
         } catch (Exception exception) {
             Log.w(TAG, "Stream processing error", exception);
             broadcastStatus("BODS sync failed: " + exception.getMessage());
@@ -178,6 +189,8 @@ public class BusTrackingService extends Service {
         if (TextUtils.isEmpty(bbox)) {
             bbox = DEFAULT_BOUNDING_BOX;
         }
+        // keep the vehicles that can fire an armed alert in the feed, wherever they are
+        bbox = ArrivalAlertStore.expandBoundingBox(this, bbox);
         builder.appendQueryParameter("boundingBox", bbox);
         return builder.build().toString();
     }
@@ -322,10 +335,17 @@ public class BusTrackingService extends Service {
         intent.putExtra(BusPosition.EXTRA_OCCUPANCY, position.occupancy);
         intent.putExtra(BusPosition.EXTRA_OPERATOR, position.operatorName);
         sendBroadcast(intent);
+        pollBuffer.add(position);
     }
 
     private void broadcastClear() {
         Intent intent = new Intent(ACTION_CLEAR_TRACKING);
+        intent.setPackage(getPackageName());
+        sendBroadcast(intent);
+    }
+
+    private void broadcastPollComplete() {
+        Intent intent = new Intent(ACTION_POLL_COMPLETE);
         intent.setPackage(getPackageName());
         sendBroadcast(intent);
     }

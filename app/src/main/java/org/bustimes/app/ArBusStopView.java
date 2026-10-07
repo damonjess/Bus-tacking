@@ -403,26 +403,12 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
 
     /** Queries OpenStreetMap Overpass for highway=bus_stop nodes around a point. Returns null on failure. */
     private List<BusStopPin> fetchNearbyStops(double latitude, double longitude) {
-        HttpURLConnection connection = null;
         try {
             String query = "[out:json][timeout:15];("
                     + "node(around:" + (int) OVERPASS_SEARCH_RADIUS_METERS + "," + latitude + "," + longitude + ")[highway=bus_stop];"
                     + "node(around:" + (int) OVERPASS_SEARCH_RADIUS_METERS + "," + latitude + "," + longitude + ")[public_transport=platform];"
                     + ");out body " + (MAX_VISIBLE_STOPS * 3) + ";";
-            String body = "data=" + URLEncoder.encode(query, "UTF-8");
-            connection = (HttpURLConnection) new URL("https://overpass-api.de/api/interpreter").openConnection();
-            connection.setRequestMethod("POST");
-            connection.setConnectTimeout(8_000);
-            connection.setReadTimeout(15_000);
-            connection.setDoOutput(true);
-            connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
-            try (OutputStream output = connection.getOutputStream()) {
-                output.write(body.getBytes("UTF-8"));
-            }
-            if (connection.getResponseCode() < 200 || connection.getResponseCode() >= 300) {
-                return null;
-            }
-            JSONObject json = new JSONObject(readString(connection.getInputStream()));
+            JSONObject json = new JSONObject(Overpass.post(query));
             JSONArray elements = json.optJSONArray("elements");
             if (elements == null) {
                 return null;
@@ -457,10 +443,6 @@ public class ArBusStopView extends FrameLayout implements SensorEventListener {
             return pins;
         } catch (Exception exception) {
             return null;
-        } finally {
-            if (connection != null) {
-                connection.disconnect();
-            }
         }
     }
 

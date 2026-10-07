@@ -4,6 +4,7 @@ import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.os.SystemClock;
@@ -25,8 +26,9 @@ final class BusDetailsSheet {
         void onShowBusOnMap(double latitude, double longitude);
         void onToggleFavorite(String route);
         boolean isFavorite(String route);
-        void onToggleAlert(String busId, String route);
-        boolean isAlertArmed(String busId, String route);
+        /** Opens the "notify me when this route is N minutes away" picker. */
+        void onConfigureAlert(String route);
+        boolean isAlertArmedForRoute(String route);
     }
 
     private BusDetailsSheet() {}
@@ -48,6 +50,7 @@ final class BusDetailsSheet {
         TextView distText = root.findViewById(R.id.text_distance);
         ImageView btnFav = root.findViewById(R.id.btn_favorite);
         MaterialButton btnFollow = root.findViewById(R.id.btn_follow);
+        MaterialButton btnAlert = root.findViewById(R.id.btn_alert);
         MaterialButton btnWalkAr = root.findViewById(R.id.btn_walk_ar);
         MaterialButton btnShare = root.findViewById(R.id.btn_share);
 
@@ -125,6 +128,20 @@ final class BusDetailsSheet {
         btnFollow.setOnClickListener(v -> {
             if (callbacks != null) {
                 callbacks.onFollowBus(snapshot.busId, !following);
+                dialog.dismiss();
+            }
+        });
+
+        // Arrival alert action
+        boolean alertArmed = callbacks != null && callbacks.isAlertArmedForRoute(snapshot.lineName);
+        btnAlert.setText(alertArmed ? "\u2713 Alert armed" : "Notify me");
+        if (alertArmed) {
+            btnAlert.setTextColor(Color.rgb(0, 229, 255));
+            btnAlert.setStrokeColor(ColorStateList.valueOf(Color.rgb(0, 229, 255)));
+        }
+        btnAlert.setOnClickListener(v -> {
+            if (callbacks != null) {
+                callbacks.onConfigureAlert(snapshot.lineName);
                 dialog.dismiss();
             }
         });

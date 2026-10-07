@@ -56,9 +56,16 @@ A map-first Android wrapper for [bustimes.org](https://bustimes.org/) focused on
   The geometry is the real OpenStreetMap `route=bus` relation for that route, fetched through the
   Overpass API and joined into continuous lines by `RouteShapeJoiner` (the member ways are joined
   end-to-end in either direction, and stop/platform members are skipped). Shapes are cached in memory
-  and on disk for a week, and because public Overpass instances are often busy, the request falls
-  through a short list of instances. If OSM has no shape for a route the app says so rather than
-  drawing an invented line. The line is cleared by the **All** chip.
+  and on disk for a week. If OSM has no shape for a route the app says so rather than drawing an
+  invented line. The line is cleared by the **All** chip.
+- **One resilient Overpass client for every piece of map data**: bus stops, route shapes and the AR
+  stop pins all go through `Overpass`. Public instances are volunteer-run and the canonical one
+  routinely answers "server too busy" (HTTP 504) or "too many requests" (HTTP 429) even for a
+  trivial query, so each mirror is retried with a short backoff, the whole call is bounded by a
+  deadline, and a mirror that will not answer at all cannot stall the map. Only instances that hold
+  the whole planet are listed: a regional mirror answers HTTP 200 with no elements, which would look
+  like "there are no bus stops here" and would then be cached as such. A failed route-shape fetch is
+  also remembered briefly, so the 15-second poller cannot hammer a mirror that is down.
 - **Proximity / arrival alerts**: "notify me when route 350 is 5 minutes away". Tap **Notify me** on a
   bus details sheet (the alert is anchored to your location) or on a stop sheet (anchored to that
   stop, and the route is picked from the live buses currently at it), then choose how close counts as

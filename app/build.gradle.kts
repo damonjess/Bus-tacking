@@ -55,4 +55,8 @@ dependencies {
     implementation("com.google.ar:core:1.48.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("org.osmdroid:osmdroid-android:6.1.20")
+
+    testImplementation("junit:junit:4.13.2")
+    // the platform org.json is a stub in unit tests, so use a real implementation there
+    testImplementation("org.json:json:20250517")
 }
