@@ -381,6 +381,9 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         cancelAllGlides();
         handler.removeCallbacksAndMessages(null);
         io.shutdownNow();
+        for (Stop s : stops) {
+            s.marker = null;
+        }
         if (map != null) {
             map.onDetach();
         }
@@ -829,13 +832,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         }
         bus.pos = pos;
         bus.receivedMs = now;
-
-        if (!TextUtils.isEmpty(pos.lineName) && RouteShapes.cached(pos.lineName) == null) {
-            final String lineName = pos.lineName;
-            final double busLat = lat;
-            final double busLon = lon;
-            io.execute(() -> RouteShapes.load(this, lineName, busLat, busLon));
-        }
 
         boolean isNewMarker = bus.marker == null;
         if (bus.marker == null) {
