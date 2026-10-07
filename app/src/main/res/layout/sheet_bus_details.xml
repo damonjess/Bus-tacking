@@ -207,7 +207,7 @@
                         android:layout_width="wrap_content"
                         android:layout_height="40dp"
                         android:layout_marginEnd="8dp"
-                        android:text="Walk (AR)"
+                        android:text="Walk there"
                         android:textColor="#FFFFFF"
                         android:textSize="12sp"
                         app:cornerRadius="20dp"

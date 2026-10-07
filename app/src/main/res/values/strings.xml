@@ -1,6 +1,5 @@
 <resources>
     <string name="app_name">Bus Times Live</string>
-    <string name="map_url">https://bustimes.org/map</string>
     <string name="ar_view">AR View</string>
     <string name="map_view">Map View</string>
 </resources>

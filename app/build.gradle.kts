@@ -24,6 +24,7 @@ val bodsApiKey = getSecretProperty("BODS_API_KEY")
 val bodsApiBaseUrl = getSecretProperty("BODS_API_BASE_URL")
     .ifEmpty { "https://data.bus-data.dft.gov.uk/api/v1/datafeed/" }
 val bodsBoundingBox = getSecretProperty("BODS_BOUNDING_BOX")
+    .ifEmpty { "-0.80,53.50,-0.50,53.66" }
 val googleDirectionsApiKey = getSecretProperty("GOOGLE_DIRECTIONS_API_KEY")
 
 android {
@@ -52,4 +53,6 @@ android {
 dependencies {
     implementation("com.google.android.material:material:1.12.0")
     implementation("com.google.ar:core:1.48.0")
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("org.osmdroid:osmdroid-android:6.1.20")
 }

@@ -31,6 +31,8 @@ public class BusTrackingService extends Service {
     static final String ACTION_START_MAP_TRACKING = "org.bustimes.app.action.START_MAP_TRACKING";
     static final String ACTION_STOP_MAP_TRACKING = "org.bustimes.app.action.STOP_MAP_TRACKING";
     public static final String ACTION_CLEAR_TRACKING = "org.bustimes.app.CLEAR_TRACKING";
+    public static final String EXTRA_BOUNDING_BOX = "bounding_box";
+    public static final String DEFAULT_BOUNDING_BOX = "-0.8000,53.5000,-0.5000,53.6600";
     static final String EXTRA_STATUS_MESSAGE = "status_message";
 
     private static final String TAG = "BusTrackingService";
@@ -41,6 +43,7 @@ public class BusTrackingService extends Service {
     private ScheduledExecutorService executorService;
     private ScheduledFuture<?> pollingFuture;
     private boolean mapActive;
+    private volatile String activeBoundingBox;
 
     @Override
     public void onCreate() {
@@ -51,6 +54,13 @@ public class BusTrackingService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? ACTION_START_MAP_TRACKING : intent.getAction();
+
+        if (intent != null && intent.hasExtra(EXTRA_BOUNDING_BOX)) {
+            String bbox = intent.getStringExtra(EXTRA_BOUNDING_BOX);
+            if (!TextUtils.isEmpty(bbox)) {
+                activeBoundingBox = bbox;
+            }
+        }
 
         if (ACTION_STOP_MAP_TRACKING.equals(action)) {
             mapActive = false;
@@ -161,9 +171,14 @@ public class BusTrackingService extends Service {
     private String buildBodsUrl() {
         Uri.Builder builder = Uri.parse(BuildConfig.BODS_API_BASE_URL).buildUpon()
                 .appendQueryParameter("api_key", BuildConfig.BODS_API_KEY);
-        if (!TextUtils.isEmpty(BuildConfig.BODS_BOUNDING_BOX)) {
-            builder.appendQueryParameter("boundingBox", BuildConfig.BODS_BOUNDING_BOX);
+        String bbox = BuildConfig.BODS_BOUNDING_BOX;
+        if (TextUtils.isEmpty(bbox)) {
+            bbox = activeBoundingBox;
         }
+        if (TextUtils.isEmpty(bbox)) {
+            bbox = DEFAULT_BOUNDING_BOX;
+        }
+        builder.appendQueryParameter("boundingBox", bbox);
         return builder.build().toString();
     }
 
