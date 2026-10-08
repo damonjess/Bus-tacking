@@ -313,6 +313,10 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         if (TextUtils.isEmpty(BuildConfig.BODS_API_KEY)) {
             setStatus("Add a BODS API key to see live buses");
         }
+        io.execute(() -> {
+            OperatorNames.load(getApplicationContext());
+            handler.post(this::rebuildCurrentTab);
+        });
         handleAlertRouteIntent(getIntent());
     }
 
@@ -807,13 +811,23 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         if (id == null || Double.isNaN(lat) || Double.isNaN(lon)) {
             return;
         }
+        float bearing = intent.getFloatExtra(BusPosition.EXTRA_BEARING, Float.NaN);
+        Bus existingBus = buses.get(id);
+        if ((Float.isNaN(bearing) || bearing < 0f) && existingBus != null && existingBus.pos != null) {
+            double d = meters(existingBus.pos.latitude, existingBus.pos.longitude, lat, lon);
+            if (d >= 15.0) {
+                bearing = (float) StopDepartures.bearingBetween(existingBus.pos.latitude, existingBus.pos.longitude, lat, lon);
+            } else if (existingBus.pos.bearing >= 0f) {
+                bearing = existingBus.pos.bearing;
+            }
+        }
         BusPosition pos = new BusPosition(id,
                 nz(intent.getStringExtra(BusPosition.EXTRA_LINE_NAME)),
                 nz(intent.getStringExtra(BusPosition.EXTRA_LINE_REF)),
-                nz(intent.getStringExtra(BusPosition.EXTRA_DESTINATION_NAME)),
+                tidyName(intent.getStringExtra(BusPosition.EXTRA_DESTINATION_NAME)),
                 nz(intent.getStringExtra(BusPosition.EXTRA_EXPECTED_ARRIVAL_TIME)),
                 lat, lon,
-                intent.getFloatExtra(BusPosition.EXTRA_BEARING, Float.NaN),
+                bearing,
                 nz(intent.getStringExtra(BusPosition.EXTRA_RECORDED_AT)),
                 nz(intent.getStringExtra(BusPosition.EXTRA_OCCUPANCY)),
                 nz(intent.getStringExtra(BusPosition.EXTRA_OPERATOR)));
@@ -1593,9 +1607,9 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         long ageSeconds = Math.max(0, (System.currentTimeMillis() - bus.receivedMs) / 1000);
         String lastSeen = ageSeconds < 60 ? ageSeconds + "s ago" : (ageSeconds / 60) + "m ago";
         int etaMinutes = ArrivalAlerts.etaMinutesFrom(p.expectedArrivalTime);
-        String vehicleId = p.id.startsWith("bus:") ? "" : p.id;
+        String vehicleId = p.id.startsWith("bus:") ? "" : p.id.replace('_', ' ');
         BusSnapshot snapshot = new BusSnapshot(p.id, p.lineName, p.lineRef, p.destinationName, p.occupancy,
-                vehicleId, lastSeen, p.operatorName, distance, p.latitude, p.longitude,
+                vehicleId, lastSeen, OperatorNames.display(p.operatorName), distance, p.latitude, p.longitude,
                 p.bearing, bus.speedKph, etaMinutes, "");
         showRouteLine(p.lineName, p.latitude, p.longitude);
         BusDetailsSheet.show(this, snapshot, this);
@@ -1796,7 +1810,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         middle.setPadding(dp(12), 0, dp(8), 0);
         middle.addView(tv(p.destinationName.isEmpty() ? "In service" : "to " + p.destinationName,
                 15, UiTheme.WHITE, true));
-        StringBuilder sub = new StringBuilder(p.operatorName);
+        StringBuilder sub = new StringBuilder(OperatorNames.display(p.operatorName));
         if (!"Information Unknown".equals(p.occupancy) && !p.occupancy.isEmpty()) {
             if (sub.length() > 0) sub.append(" \u00B7 ");
             sub.append(p.occupancy);
@@ -2163,7 +2177,8 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         accountList.addView(sectionTitle("About"));
         accountList.addView(note("Bus Times Live " + BuildConfig.VERSION_NAME
                 + "\nBus positions: Bus Open Data Service (Department for Transport)."
-                + "\nMap and stops: \u00A9 OpenStreetMap contributors."));
+                + "\nMap and stops: \u00A9 OpenStreetMap contributors."
+                + "\nOperator names loaded: " + OperatorNames.size()));
     }
 
     // ------------------------------------------------------------------ BusDetailsSheet.Callbacks
@@ -2435,6 +2450,10 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
 
     private static String nz(String value) {
         return value == null ? "" : value;
+    }
+
+    private static String tidyName(String value) {
+        return value == null ? "" : value.replace("__", ", ").replace('_', ' ').trim();
     }
 
     /** Orders route names numerically where possible (2A before 12). */

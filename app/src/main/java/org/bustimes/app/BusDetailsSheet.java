@@ -107,9 +107,12 @@ final class BusDetailsSheet {
             ((View) speedText.getParent()).setVisibility(View.GONE);
         } else {
             ((View) speedText.getParent()).setVisibility(View.VISIBLE);
-            speedText.setText(spd.isEmpty() ? "--" : spd);
-            headingText.setText(hdg.isEmpty() ? "--" : hdg);
-            distText.setText(dst.isEmpty() ? "--" : dst);
+            speedText.setVisibility(spd.isEmpty() ? View.GONE : View.VISIBLE);
+            speedText.setText(spd);
+            headingText.setVisibility(hdg.isEmpty() ? View.GONE : View.VISIBLE);
+            headingText.setText(hdg);
+            distText.setVisibility(dst.isEmpty() ? View.GONE : View.VISIBLE);
+            distText.setText(dst);
         }
         // Favorite action
         boolean isFav = callbacks != null && callbacks.isFavorite(snapshot.lineName);

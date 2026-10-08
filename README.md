@@ -7,9 +7,10 @@ A native Android app for real-time UK bus tracking, interactive OpenStreetMap ma
 ## 🌟 Features
 
 - **Live Bus Map**: Track live buses on an interactive map (Standard, Dark, or Terrain styles) with smooth marker animation.
-- **Stop Departures**: Tap any bus stop to view real-time departure boards and routes served.
+- **Route Lines**: Tap any bus marker or route filter chip to draw its full OpenStreetMap route line on the map.
+- **Stop Departures & Favorites**: Tap any bus stop to view real-time departure boards, and save favorite stops and routes for single-tap access.
 - **Bus Metrics**: View real-time speed, heading, ETA, line, operator, and occupancy status.
-- **Search & Favorites**: Search for routes, destinations, and bus stops, and save favorites for quick access.
+- **Search**: Search for routes, destinations, and bus stops with instant suggestions.
 - **Arrival Alerts**: Receive background notifications when a tracked bus is approaching (2, 5, 10, or 15 minutes away).
 - **Nearby Tab**: View a GPS-sorted list of nearby buses and stops within walking distance.
 
@@ -17,7 +18,7 @@ A native Android app for real-time UK bus tracking, interactive OpenStreetMap ma
 
 ## 🛠️ Tech Stack
 
-- **Language**: Java 17 (Android SDK 35, Min SDK 24)
+- **Language**: Java (Built with JDK 17, Android SDK 35, Min SDK 24)
 - **Map Engine**: `osmdroid`
 - **UI Framework**: Material Components & AppCompat
 - **Data Sources**: BODS SIRI-VM feed & OpenStreetMap Overpass API

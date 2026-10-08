@@ -59,4 +59,5 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     // the platform org.json is a stub in unit tests, so use a real implementation there
     testImplementation("org.json:json:20250517")
+    testImplementation("net.sf.kxml:kxml2:2.3.0")
 }

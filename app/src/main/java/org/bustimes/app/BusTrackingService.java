@@ -221,7 +221,7 @@ public class BusTrackingService extends Service {
                 } else if ("LineRef".equalsIgnoreCase(tagName)) {
                     lineRef = parser.nextText();
                 } else if ("DestinationName".equalsIgnoreCase(tagName)) {
-                    destination = parser.nextText();
+                    destination = tidyName(parser.nextText());
                 } else if ("OperatorRef".equalsIgnoreCase(tagName)) {
                     operator = parser.nextText();
                 } else if ("ExpectedArrivalTime".equalsIgnoreCase(tagName)) {
@@ -291,7 +291,7 @@ public class BusTrackingService extends Service {
                     if ("VehicleRef".equalsIgnoreCase(jKey)) id = reader.nextString();
                     else if ("PublishedLineName".equalsIgnoreCase(jKey)) lineName = reader.nextString();
                     else if ("LineRef".equalsIgnoreCase(jKey)) lineRef = reader.nextString();
-                    else if ("DestinationName".equalsIgnoreCase(jKey)) destination = reader.nextString();
+                    else if ("DestinationName".equalsIgnoreCase(jKey)) destination = tidyName(reader.nextString());
                     else if ("OperatorRef".equalsIgnoreCase(jKey)) operator = reader.nextString();
                     else if ("Bearing".equalsIgnoreCase(jKey)) bearing = (float) reader.nextDouble();
                     else if ("VehicleLocation".equalsIgnoreCase(jKey)) {
@@ -355,6 +355,10 @@ public class BusTrackingService extends Service {
         intent.setPackage(getPackageName());
         intent.putExtra(EXTRA_STATUS_MESSAGE, message);
         sendBroadcast(intent);
+    }
+
+    private static String tidyName(String value) {
+        return value == null ? "" : value.replace("__", ", ").replace('_', ' ').trim();
     }
 
     private static String firstNonEmpty(String... values) {
