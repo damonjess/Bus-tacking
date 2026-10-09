@@ -318,6 +318,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             handler.post(this::rebuildCurrentTab);
         });
         handleAlertRouteIntent(getIntent());
+        handleArReturn(getIntent());
     }
 
     @Override
@@ -325,6 +326,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         super.onNewIntent(intent);
         setIntent(intent);
         handleAlertRouteIntent(intent);
+        handleArReturn(intent);
     }
 
     /** Tapping an arrival notification opens the map filtered to that route. */
@@ -338,6 +340,76 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         }
         intent.removeExtra(AlertNotifier.EXTRA_ROUTE);
         filterToRoute(route);
+    }
+
+    /** Opens the camera view, handing over the bus stops already loaded for this area. */
+    private void openAr() {
+        Intent intent = new Intent(this, ArActivity.class);
+        intent.putExtra(ArActivity.EXTRA_BBOX, getMapBoundingBoxString());
+        int n = Math.min(stops.size(), 150);
+        double[] lats = new double[n];
+        double[] lons = new double[n];
+        String[] names = new String[n];
+        String[] routes = new String[n];
+        for (int i = 0; i < n; i++) {
+            Stop stop = stops.get(i);
+            lats[i] = stop.lat;
+            lons[i] = stop.lon;
+            names[i] = stop.name;
+            routes[i] = stop.routes;
+        }
+        intent.putExtra(ArActivity.EXTRA_STOP_LATS, lats);
+        intent.putExtra(ArActivity.EXTRA_STOP_LONS, lons);
+        intent.putExtra(ArActivity.EXTRA_STOP_NAMES, names);
+        intent.putExtra(ArActivity.EXTRA_STOP_ROUTES, routes);
+        startActivity(intent);
+    }
+
+    /** What the camera view asked for when the user tapped a label and came back to the map. */
+    private void handleArReturn(Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        final String alertRoute = intent.getStringExtra(ArActivity.EXTRA_ALERT_ROUTE);
+        if (!TextUtils.isEmpty(alertRoute)) {
+            intent.removeExtra(ArActivity.EXTRA_ALERT_ROUTE);
+            setTab(TAB_MAP);
+            handler.post(() -> onConfigureAlert(alertRoute));
+            return;
+        }
+        if (intent.hasExtra(ArActivity.EXTRA_STOP_LAT)) {
+            final double lat = intent.getDoubleExtra(ArActivity.EXTRA_STOP_LAT, Double.NaN);
+            final double lon = intent.getDoubleExtra(ArActivity.EXTRA_STOP_LON, Double.NaN);
+            intent.removeExtra(ArActivity.EXTRA_STOP_LAT);
+            intent.removeExtra(ArActivity.EXTRA_STOP_LON);
+            if (Double.isNaN(lat) || Double.isNaN(lon)) {
+                return;
+            }
+            onShowBusOnMap(lat, lon);
+            for (Stop stop : stops) {
+                if (meters(stop.lat, stop.lon, lat, lon) < 10) {
+                    final Stop target = stop;
+                    handler.post(() -> showStopSheet(target));
+                    break;
+                }
+            }
+            return;
+        }
+        if (intent.hasExtra(ArActivity.EXTRA_FOCUS_LAT)) {
+            double lat = intent.getDoubleExtra(ArActivity.EXTRA_FOCUS_LAT, Double.NaN);
+            double lon = intent.getDoubleExtra(ArActivity.EXTRA_FOCUS_LON, Double.NaN);
+            String follow = intent.getStringExtra(ArActivity.EXTRA_FOLLOW_BUS);
+            intent.removeExtra(ArActivity.EXTRA_FOCUS_LAT);
+            intent.removeExtra(ArActivity.EXTRA_FOCUS_LON);
+            intent.removeExtra(ArActivity.EXTRA_FOLLOW_BUS);
+            if (Double.isNaN(lat) || Double.isNaN(lon)) {
+                return;
+            }
+            onShowBusOnMap(lat, lon);
+            if (!TextUtils.isEmpty(follow)) {
+                onFollowBus(follow, true);
+            }
+        }
     }
 
     @Override
@@ -445,6 +517,13 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         statusText.setEllipsize(TextUtils.TruncateAt.END);
         titles.addView(statusText);
         header.addView(titles, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        TextView arPill = UiTheme.pillText(this, "AR view", UiTheme.WHITE,
+                UiTheme.withAlpha(UiTheme.BLUE, 60), UiTheme.BLUE);
+        arPill.setOnClickListener(v -> openAr());
+        LinearLayout.LayoutParams arLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        arLp.rightMargin = dp(8);
+        header.addView(arPill, arLp);
         countPill = UiTheme.pillText(this, "", UiTheme.CYAN, UiTheme.withAlpha(UiTheme.CYAN, 30), UiTheme.CYAN);
         header.addView(countPill);
         root.addView(header);
