@@ -46,6 +46,19 @@ final class ArMath {
         return normalize360(magnetic + declinationDeg);
     }
 
+    /** True-north heading of the back camera including aim offset, in degrees. */
+    static double headingDeg(float[] r, double declinationDeg, double aimOffsetDeg) {
+        return headingDeg(r, declinationDeg + aimOffsetDeg);
+    }
+
+    /** Cardinal direction string for a heading in degrees (N, NE, E, SE, S, SW, W, NW). */
+    static String cardinal(double headingDeg) {
+        double norm = normalize360(headingDeg);
+        String[] directions = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+        int index = (int) Math.floor((norm + 22.5) / 45.0) % 8;
+        return directions[index];
+    }
+
     /** tan(half horizontal fov) from tan(half vertical fov) and the preview's aspect ratio. */
     static double tanHalfHorizontal(double tanHalfVertical, int width, int height) {
         return tanHalfVertical * width / (double) height;
@@ -61,7 +74,15 @@ final class ArMath {
      */
     static float[] project(float[] r, double east, double north, double up, double declinationDeg,
                            double tanHalfH, double tanHalfV, int width, int height) {
-        double decl = Math.toRadians(declinationDeg);
+        return project(r, east, north, up, declinationDeg, 0.0, tanHalfH, tanHalfV, width, height);
+    }
+
+    /**
+     * Pixel position of a point with aim offset in degrees.
+     */
+    static float[] project(float[] r, double east, double north, double up, double declinationDeg,
+                           double aimOffsetDeg, double tanHalfH, double tanHalfV, int width, int height) {
+        double decl = Math.toRadians(declinationDeg + aimOffsetDeg);
         // true-north frame -> magnetic-north frame: a target's bearing becomes (bearing - declination)
         double e = east * Math.cos(decl) - north * Math.sin(decl);
         double n = north * Math.cos(decl) + east * Math.sin(decl);

@@ -85,6 +85,7 @@ public class ArActivity extends AppCompatActivity implements BusDetailsSheet.Cal
     static final String EXTRA_STOP_LAT = "ar_stop_lat";
     static final String EXTRA_STOP_LON = "ar_stop_lon";
 
+    private static final String PREF_AIM_OFFSET = "ar_aim_offset";
     private static final int REQ_PERMISSIONS = 61;
     private static final long STALE_BUS_MS = 4 * 60 * 1000L;
     private static final long GLIDE_MS = 2500L;
@@ -161,12 +162,15 @@ public class ArActivity extends AppCompatActivity implements BusDetailsSheet.Cal
     private long sweepStartMs;
     private String bbox;
     private double tanHalfV;
+    private double aimOffset = 0.0;
 
     private PreviewView previewView;
     private OverlayView overlay;
     private TextView statusView;
     private TextView hintView;
     private LinearLayout topBar;
+    private LinearLayout aimBar;
+    private TextView btnAim;
     private volatile int visibleBuses;
     private volatile int visibleStops;
     private String serviceStatus = "";
@@ -251,6 +255,7 @@ public class ArActivity extends AppCompatActivity implements BusDetailsSheet.Cal
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
 
+        loadAimOffset();
         bbox = getIntent().getStringExtra(EXTRA_BBOX);
         if (TextUtils.isEmpty(bbox)) {
             bbox = BusTrackingService.DEFAULT_BOUNDING_BOX;
@@ -371,6 +376,34 @@ public class ArActivity extends AppCompatActivity implements BusDetailsSheet.Cal
         root.addView(topBar, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP));
 
+        aimBar = new LinearLayout(this);
+        aimBar.setOrientation(LinearLayout.HORIZONTAL);
+        aimBar.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView btnLeft15 = createAimButton("\u00AB 15\u00B0");
+        TextView btnLeft3 = createAimButton("\u2039 3\u00B0");
+        btnAim = createAimButton("Aim");
+        TextView btnRight3 = createAimButton("3\u00B0 \u203A");
+        TextView btnRight15 = createAimButton("15\u00B0 \u00BB");
+
+        btnLeft15.setOnClickListener(v -> adjustAim(15.0));
+        btnLeft3.setOnClickListener(v -> adjustAim(3.0));
+        btnAim.setOnClickListener(v -> resetAim());
+        btnRight3.setOnClickListener(v -> adjustAim(-3.0));
+        btnRight15.setOnClickListener(v -> adjustAim(-15.0));
+
+        aimBar.addView(btnLeft15);
+        aimBar.addView(btnLeft3);
+        aimBar.addView(btnAim);
+        aimBar.addView(btnRight3);
+        aimBar.addView(btnRight15);
+
+        FrameLayout.LayoutParams aimLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        aimLp.bottomMargin = dp(64);
+        root.addView(aimBar, aimLp);
+
         hintView = new TextView(this);
         hintView.setTextColor(UiTheme.WHITE);
         hintView.setTextSize(13);
@@ -380,16 +413,78 @@ public class ArActivity extends AppCompatActivity implements BusDetailsSheet.Cal
         FrameLayout.LayoutParams hintLp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
-        hintLp.bottomMargin = dp(24);
+        hintLp.bottomMargin = dp(20);
         root.addView(hintView, hintLp);
 
         root.setOnApplyWindowInsetsListener((v, insets) -> {
             topBar.setPadding(dp(16), insets.getSystemWindowInsetTop() + dp(8), dp(16), dp(8));
-            hintLp.bottomMargin = insets.getSystemWindowInsetBottom() + dp(24);
+            aimLp.bottomMargin = insets.getSystemWindowInsetBottom() + dp(64);
+            aimBar.setLayoutParams(aimLp);
+            hintLp.bottomMargin = insets.getSystemWindowInsetBottom() + dp(20);
             hintView.setLayoutParams(hintLp);
             return insets;
         });
         setContentView(root);
+        updateAimButtonText();
+    }
+
+    private TextView createAimButton(String text) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextColor(UiTheme.WHITE);
+        tv.setTextSize(12);
+        tv.setGravity(Gravity.CENTER);
+        tv.setBackground(UiTheme.pill(this, UiTheme.withAlpha(UiTheme.INK, 200), UiTheme.WHITE, 0, 12));
+        tv.setPadding(dp(10), dp(6), dp(10), dp(6));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.leftMargin = dp(2);
+        lp.rightMargin = dp(2);
+        tv.setLayoutParams(lp);
+        return tv;
+    }
+
+    private void loadAimOffset() {
+        SharedPreferences prefs = getSharedPreferences("bus_times", MODE_PRIVATE);
+        aimOffset = prefs.getFloat(PREF_AIM_OFFSET, 0f);
+    }
+
+    private void saveAimOffset() {
+        getSharedPreferences("bus_times", MODE_PRIVATE).edit()
+                .putFloat(PREF_AIM_OFFSET, (float) aimOffset)
+                .apply();
+    }
+
+    private void adjustAim(double deltaDeg) {
+        aimOffset = ArMath.signedAngle(0, aimOffset + deltaDeg);
+        saveAimOffset();
+        updateAimButtonText();
+        updateHint();
+        if (overlay != null) {
+            overlay.postInvalidate();
+        }
+    }
+
+    private void resetAim() {
+        aimOffset = 0.0;
+        saveAimOffset();
+        updateAimButtonText();
+        updateHint();
+        if (overlay != null) {
+            overlay.postInvalidate();
+        }
+    }
+
+    private void updateAimButtonText() {
+        if (btnAim == null) return;
+        long round = Math.round(aimOffset);
+        if (round == 0) {
+            btnAim.setText("Aim");
+        } else if (round > 0) {
+            btnAim.setText("Aim +" + round + "\u00B0");
+        } else {
+            btnAim.setText("Aim " + round + "\u00B0");
+        }
     }
 
     private void loadStopsFromIntent() {
@@ -571,15 +666,24 @@ public class ArActivity extends AppCompatActivity implements BusDetailsSheet.Cal
             statusView.setText("Allow location access to place buses around you.");
         } else if (loc == null) {
             statusView.setText("Finding your location\u2026");
-        } else if (rotationSensor != null) {
-            statusView.setText(TextUtils.isEmpty(BuildConfig.BODS_API_KEY)
-                    ? "Live buses need a BODS API key."
-                    : (buses.isEmpty() ? "Waiting for live buses\u2026" : buses.size() + " buses live nearby"));
+        } else if (rotationSensor == null) {
+            statusView.setText("This phone has no compass sensor, so AR can't aim.");
+        } else if (rotation != null) {
+            double heading = ArMath.headingDeg(rotation, declination, aimOffset);
+            long hDeg = Math.round(heading) % 360;
+            if (hDeg < 0) hDeg += 360;
+            String card = ArMath.cardinal(heading);
+            String gpsPart = loc.hasAccuracy()
+                    ? " \u00B7 GPS \u00B1" + Math.round(loc.getAccuracy()) + " m"
+                    : "";
+            statusView.setText("Facing " + hDeg + "\u00B0 " + card + gpsPart);
         }
 
         String hint;
         if (compassAccuracy <= SensorManager.SENSOR_STATUS_ACCURACY_LOW && rotationSensor != null) {
-            hint = "Compass needs calibrating: wave your phone in a figure 8.";
+            hint = "Strong magnetic interference: wave your phone in a figure 8.";
+        } else if (loc != null && loc.hasAccuracy() && loc.getAccuracy() > 60f) {
+            hint = "GPS accuracy is \u00B1" + Math.round(loc.getAccuracy()) + " m (poor fix). Labels may be offset.";
         } else if (visibleBuses + visibleStops > 0) {
             hint = visibleBuses + (visibleBuses == 1 ? " bus" : " buses") + " \u00B7 "
                     + visibleStops + (visibleStops == 1 ? " stop" : " stops") + " in view. Tap a label.";
@@ -671,7 +775,7 @@ public class ArActivity extends AppCompatActivity implements BusDetailsSheet.Cal
             all.addAll(stopCandidates);
             Collections.sort(all, (a, b) -> Double.compare(a.distance, b.distance));
             for (Candidate c : all) {
-                c.screen = ArMath.project(r, c.east, c.north, -EYE_HEIGHT_M, decl, tanH, tanV, w, h);
+                c.screen = ArMath.project(r, c.east, c.north, -EYE_HEIGHT_M, decl, aimOffset, tanH, tanV, w, h);
             }
 
             // nearest first: they keep their natural spot and farther labels move up to make room
@@ -783,7 +887,7 @@ public class ArActivity extends AppCompatActivity implements BusDetailsSheet.Cal
         /** Little arrows at the screen edge pointing to the nearest buses that are out of view. */
         private void drawEdgeHints(Canvas canvas, List<Candidate> busCandidates, float[] r,
                                    double decl, int w, int h) {
-            double heading = ArMath.headingDeg(r, decl);
+            double heading = ArMath.headingDeg(r, decl, aimOffset);
             int shown = 0;
             for (Candidate c : busCandidates) {
                 if (shown >= 3) break;
