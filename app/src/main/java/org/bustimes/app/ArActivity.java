@@ -960,8 +960,9 @@ public class ArActivity extends AppCompatActivity implements BusDetailsSheet.Cal
             Location.distanceBetween(loc.getLatitude(), loc.getLongitude(), p.latitude, p.longitude, result);
             distance = formatDistance(result[0]) + " away";
         }
-        long age = Math.max(0, (System.currentTimeMillis() - bus.receivedMs) / 1000);
-        String lastSeen = age < 60 ? age + "s ago" : (age / 60) + "m ago";
+        long fallbackSeconds = Math.max(0, (System.currentTimeMillis() - bus.receivedMs) / 1000);
+        String lastSeen = FixAge.describe(
+                FixAge.ageSeconds(p.recordedAt, System.currentTimeMillis(), fallbackSeconds));
         int eta = ArrivalAlerts.etaMinutesFrom(p.expectedArrivalTime);
         String vehicleId = p.id.startsWith("bus:") ? "" : p.id.replace('_', ' ').trim();
         BusSnapshot snapshot = new BusSnapshot(p.id, p.lineName, p.lineRef, p.destinationName, p.occupancy,

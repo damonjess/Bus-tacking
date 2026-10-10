@@ -50,6 +50,7 @@ public class BusTrackingService extends Service {
     private volatile String activeBoundingBox;
     /** Vehicles seen in the poll currently being parsed, used to check armed arrival alerts. */
     private final List<BusPosition> pollBuffer = new ArrayList<>();
+    private int staleHidden;
 
     @Override
     public void onCreate() {
@@ -125,6 +126,7 @@ public class BusTrackingService extends Service {
     private void pollBodsVehicleLocations() {
         HttpURLConnection connection = null;
         pollBuffer.clear();
+        staleHidden = 0;
         try {
             URL url = new URL(buildBodsUrl());
             connection = (HttpURLConnection) url.openConnection();
@@ -164,7 +166,9 @@ public class BusTrackingService extends Service {
                     broadcastClear();
                     count = parseXmlStreaming(bufferedStream);
                 }
-                broadcastStatus(String.format(Locale.UK, "Updated %d BODS vehicle positions", count));
+                String hidden = staleHidden > 0
+                        ? String.format(Locale.UK, " (%d old reports hidden)", staleHidden) : "";
+                broadcastStatus(String.format(Locale.UK, "Updated %d BODS vehicle positions%s", count, hidden));
             }
             // armed arrival alerts are checked against this poll, even with the map off screen
             ArrivalAlerts.evaluate(this, ArrivalAlerts.candidatesFromPositions(new ArrayList<>(pollBuffer)));
@@ -239,9 +243,10 @@ public class BusTrackingService extends Service {
                 if ("VehicleActivity".equalsIgnoreCase(tagName)) {
                     if (!Double.isNaN(latitude) && !Double.isNaN(longitude)) {
                         String busId = !TextUtils.isEmpty(id) ? id : lineRef + ":" + count;
-                        broadcastPosition(new BusPosition(busId, firstNonEmpty(lineName, lineRef, "Bus"),
-                                lineRef, destination, eta, latitude, longitude, bearing, recordedAt, occupancy, operator));
-                        count++;
+                        if (broadcastPosition(new BusPosition(busId, firstNonEmpty(lineName, lineRef, "Bus"),
+                                lineRef, destination, eta, latitude, longitude, bearing, recordedAt, occupancy, operator))) {
+                            count++;
+                        }
                     }
                 }
             }
@@ -260,8 +265,7 @@ public class BusTrackingService extends Service {
                 reader.beginArray();
                 while (reader.hasNext()) {
                     BusPosition pos = readJsonVehicle(reader, count);
-                    if (pos != null) {
-                        broadcastPosition(pos);
+                    if (pos != null && broadcastPosition(pos)) {
                         count++;
                     }
                 }
@@ -320,7 +324,11 @@ public class BusTrackingService extends Service {
                 eta, latitude, longitude, bearing, recordedAt, occupancy, operator);
     }
 
-    private void broadcastPosition(BusPosition position) {
+    private boolean broadcastPosition(BusPosition position) {
+        if (!FixAge.isLive(position.recordedAt, System.currentTimeMillis())) {
+            staleHidden++;
+            return false;
+        }
         Intent intent = new Intent(ACTION_BUS_POSITION);
         intent.setPackage(getPackageName());
         intent.putExtra(BusPosition.EXTRA_ID, position.id);
@@ -336,6 +344,7 @@ public class BusTrackingService extends Service {
         intent.putExtra(BusPosition.EXTRA_OPERATOR, position.operatorName);
         sendBroadcast(intent);
         pollBuffer.add(position);
+        return true;
     }
 
     private void broadcastClear() {

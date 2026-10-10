@@ -1683,8 +1683,9 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             distance = formatDistance(meters(userLocation.getLatitude(), userLocation.getLongitude(),
                     p.latitude, p.longitude)) + " away";
         }
-        long ageSeconds = Math.max(0, (System.currentTimeMillis() - bus.receivedMs) / 1000);
-        String lastSeen = ageSeconds < 60 ? ageSeconds + "s ago" : (ageSeconds / 60) + "m ago";
+        long fallbackSeconds = Math.max(0, (System.currentTimeMillis() - bus.receivedMs) / 1000);
+        String lastSeen = FixAge.describe(
+                FixAge.ageSeconds(p.recordedAt, System.currentTimeMillis(), fallbackSeconds));
         int etaMinutes = ArrivalAlerts.etaMinutesFrom(p.expectedArrivalTime);
         String vehicleId = p.id.startsWith("bus:") ? "" : p.id.replace('_', ' ');
         BusSnapshot snapshot = new BusSnapshot(p.id, p.lineName, p.lineRef, p.destinationName, p.occupancy,
