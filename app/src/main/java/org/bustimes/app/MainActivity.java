@@ -455,11 +455,11 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     protected void onDestroy() {
         super.onDestroy();
         cancelAllGlides();
+        for (Stop stop : stops) {
+            stop.marker = null;
+        }
         handler.removeCallbacksAndMessages(null);
         io.shutdownNow();
-        for (Stop s : stops) {
-            s.marker = null;
-        }
         if (map != null) {
             map.onDetach();
         }
