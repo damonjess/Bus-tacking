@@ -28,16 +28,25 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK (install required components)
-        uses: android-actions/setup-android@v3
-        with:
-          api-level: 36
-          build-tools: 36.0.0
-          components: |
-            platform-tools
-            platforms;android-36
-            cmdline-tools;latest
-          cache: gradle
+      - name: Install Android commandline tools (manual)
+        shell: bash
+        run: |
+          set -eux
+          export ANDROID_SDK_ROOT="$RUNNER_TEMP/android-sdk"
+          mkdir -p "$ANDROID_SDK_ROOT"
+          cd "$RUNNER_TEMP"
+          curl -fSL "https://dl.google.com/android/repository/commandlinetools-linux-latest.zip" -o commandlinetools.zip
+          unzip -q commandlinetools.zip -d cmdline-tools-temp
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          mv cmdline-tools/* "$ANDROID_SDK_ROOT/cmdline-tools/latest/"
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_SDK_ROOT" --licenses || true
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-36" "build-tools;36.0.0" "cmdline-tools;latest"
+
+      - name: Add Android SDK to environment
+        run: |
+          echo "ANDROID_SDK_ROOT=$RUNNER_TEMP/android-sdk" >> $GITHUB_ENV
+          echo "PATH=$RUNNER_TEMP/android-sdk/cmdline-tools/latest/bin:$RUNNER_TEMP/android-sdk/platform-tools:$PATH" >> $GITHUB_ENV
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -50,7 +59,8 @@ jobs:
           BODS_BOUNDING_BOX: ${{ vars.BODS_BOUNDING_BOX }}
           BODS_API_BASE_URL: ${{ vars.BODS_API_BASE_URL }}
           GOOGLE_DIRECTIONS_API_KEY: ${{ secrets.GOOGLE_DIRECTIONS_API_KEY }}
-        run: gradle --no-daemon :app:assembleDebug
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+        run: ./gradlew --no-daemon :app:assembleDebug
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
