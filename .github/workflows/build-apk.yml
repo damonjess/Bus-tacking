@@ -35,11 +35,18 @@ jobs:
           export ANDROID_SDK_ROOT="$RUNNER_TEMP/android-sdk"
           mkdir -p "$ANDROID_SDK_ROOT"
           cd "$RUNNER_TEMP"
-          curl -fSL "https://dl.google.com/android/repository/commandlinetools-linux-latest.zip" -o commandlinetools.zip
+          # Download specific, known-working commandline tools bundle
+          curl -fSL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o commandlinetools.zip
           unzip -q commandlinetools.zip -d cmdline-tools-temp
           mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools/latest"
-          mv cmdline-tools/* "$ANDROID_SDK_ROOT/cmdline-tools/latest/"
+          # Move the extracted cmdline-tools into the expected location. Handle both possible layouts.
+          if [ -d cmdline-tools-temp/cmdline-tools ]; then
+            mv cmdline-tools-temp/cmdline-tools/* "$ANDROID_SDK_ROOT/cmdline-tools/latest/"
+          else
+            mv cmdline-tools-temp/* "$ANDROID_SDK_ROOT/cmdline-tools/latest/"
+          fi
           export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
+          # Accept licenses and install required components
           yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_SDK_ROOT" --licenses || true
           "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-36" "build-tools;36.0.0" "cmdline-tools;latest"
 
