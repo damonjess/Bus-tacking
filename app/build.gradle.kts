@@ -23,8 +23,10 @@ fun getSecretProperty(propertyName: String): String {
 val bodsApiKey = getSecretProperty("BODS_API_KEY")
 val bodsApiBaseUrl = getSecretProperty("BODS_API_BASE_URL")
     .ifEmpty { "https://data.bus-data.dft.gov.uk/api/v1/datafeed/" }
+// Empty = follow the map viewport (MainActivity / ArActivity send EXTRA_BOUNDING_BOX).
+// Set BODS_BOUNDING_BOX only when you want a fixed region for CI or headless builds.
 val bodsBoundingBox = getSecretProperty("BODS_BOUNDING_BOX")
-    .ifEmpty { "-0.80,53.50,-0.50,53.66" }
+    .ifEmpty { "" }
 val googleDirectionsApiKey = getSecretProperty("GOOGLE_DIRECTIONS_API_KEY")
 
 android {

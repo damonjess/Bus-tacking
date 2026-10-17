@@ -228,11 +228,16 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     };
 
     private String getMapBoundingBoxString() {
-        if (map != null) {
+        // A MapView that has not been laid out yet reports a zero-size box; sending that to the
+        // feed would ask for an empty area and hide every bus, so only real viewports are used.
+        if (map != null && map.getWidth() > 0 && map.getHeight() > 0) {
             BoundingBox box = map.getBoundingBox();
-            if (box != null && (box.getLatNorth() != 0 || box.getLatSouth() != 0)) {
-                return String.format(Locale.US, "%.4f,%.4f,%.4f,%.4f",
+            if (box != null) {
+                String candidate = BoundingBoxes.format(
                         box.getLonWest(), box.getLatSouth(), box.getLonEast(), box.getLatNorth());
+                if (BoundingBoxes.isUsable(candidate)) {
+                    return candidate;
+                }
             }
         }
         return BusTrackingService.DEFAULT_BOUNDING_BOX;
@@ -426,8 +431,22 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         start.setAction(BusTrackingService.ACTION_START_MAP_TRACKING);
         start.putExtra(BusTrackingService.EXTRA_BOUNDING_BOX, getMapBoundingBoxString());
         startService(start);
+        // onResume runs before the first layout, so the map has no usable viewport yet: ask for the
+        // real visible area as soon as it has been measured.
+        map.post(this::refreshFeedForViewport);
         startLocation();
         updateCountPill();
+    }
+
+    /** Re-fetches the feed for the area the map is actually showing. */
+    private void refreshFeedForViewport() {
+        if (map == null) {
+            return;
+        }
+        Intent update = new Intent(this, BusTrackingService.class);
+        update.setAction(BusTrackingService.ACTION_REFRESH_NOW);
+        update.putExtra(BusTrackingService.EXTRA_BOUNDING_BOX, getMapBoundingBoxString());
+        startService(update);
     }
 
     @Override
@@ -593,6 +612,8 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
 
             @Override
             public boolean onZoom(ZoomEvent event) {
+                handler.removeCallbacks(stopFetchRunnable);
+                handler.postDelayed(stopFetchRunnable, 900);
                 return false;
             }
         });

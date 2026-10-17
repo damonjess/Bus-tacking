@@ -36,7 +36,8 @@ public class BusTrackingService extends Service {
     static final String ACTION_STOP_MAP_TRACKING = "org.bustimes.app.action.STOP_MAP_TRACKING";
     public static final String ACTION_CLEAR_TRACKING = "org.bustimes.app.CLEAR_TRACKING";
     public static final String EXTRA_BOUNDING_BOX = "bounding_box";
-    public static final String DEFAULT_BOUNDING_BOX = "-0.8000,53.5000,-0.5000,53.6600";
+    /** Fallback when neither the map nor BuildConfig supplies a box (covers Scunthorpe–Humber). */
+    public static final String DEFAULT_BOUNDING_BOX = "-0.8500,53.4800,-0.4000,53.7500";
     static final String EXTRA_STATUS_MESSAGE = "status_message";
 
     private static final String TAG = "BusTrackingService";
@@ -186,11 +187,15 @@ public class BusTrackingService extends Service {
     private String buildBodsUrl() {
         Uri.Builder builder = Uri.parse(BuildConfig.BODS_API_BASE_URL).buildUpon()
                 .appendQueryParameter("api_key", BuildConfig.BODS_API_KEY);
-        String bbox = BuildConfig.BODS_BOUNDING_BOX;
-        if (TextUtils.isEmpty(bbox)) {
-            bbox = activeBoundingBox;
+        // Prefer the live map viewport (or AR bbox) so panning/zooming actually expands the feed.
+        // BuildConfig is only a static override / CI default; an empty value means "follow the map".
+        // A zero-size box (map measured too early) is ignored rather than asked for, because the
+        // feed answers it with nothing and every marker would disappear.
+        String bbox = activeBoundingBox;
+        if (!BoundingBoxes.isUsable(bbox)) {
+            bbox = BuildConfig.BODS_BOUNDING_BOX;
         }
-        if (TextUtils.isEmpty(bbox)) {
+        if (!BoundingBoxes.isUsable(bbox)) {
             bbox = DEFAULT_BOUNDING_BOX;
         }
         // keep the vehicles that can fire an armed alert in the feed, wherever they are
