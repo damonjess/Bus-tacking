@@ -14,6 +14,7 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.BitmapDrawable;
@@ -75,7 +76,6 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
@@ -115,6 +115,9 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
 
     /** Rows a departure board shows before it reports how many are left. */
     private static final int MAX_BOARD_ROWS = 8;
+
+    /** Minimum zoom level to render individual bus stop markers so zooming out stays uncluttered. */
+    private static final double MIN_STOP_ZOOM = 13.2;
 
     private static final long STALE_BUS_MS = 4 * 60 * 1000L;
     private static final int REQ_LOCATION = 41;
@@ -159,7 +162,9 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     }
 
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private final ExecutorService io = Executors.newSingleThreadExecutor();
+    private final ExecutorService io = Executors.newFixedThreadPool(2);
+    /** Dedicated executor so Overpass map queries never block stop timetable downloads. */
+    private final ExecutorService timetableIo = Executors.newSingleThreadExecutor();
     /** True while a redraw is already queued for the next animation frame. */
     private boolean mapInvalidatePosted;
 
@@ -217,17 +222,22 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
 
     // departure board state, held while a stop sheet is open so it can follow the live feed
     private BottomSheetDialog stopBoardDialog;
+    private LinearLayout stopRouteFilterRow;
+    private String stopSheetRouteFilter;
     private LinearLayout stopBoardRows;
     private TextView stopBoardTitle;
     private TextView stopBoardNote;
     private Stop stopBoardStop;
 
     // published timetable state for the open stop sheet
+    private LinearLayout stopTimetableDayRow;
+    private int stopTimetableDayMode = StopTimetables.MODE_TODAY;
     private LinearLayout stopTimetableRows;
     private TextView stopTimetableNote;
     private TextView stopTimetableButton;
     private List<TxcTimetable.Departure> stopTimetableAll;
     private boolean stopTimetableLoading;
+    private int stopTimetableRequestId;
 
     private final Runnable stopFetchRunnable = () -> {
         if (map == null) return;
@@ -239,8 +249,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     };
 
     private String getMapBoundingBoxString() {
-        // A MapView that has not been laid out yet reports a zero-size box; sending that to the
-        // feed would ask for an empty area and hide every bus, so only real viewports are used.
         if (map != null && map.getWidth() > 0 && map.getHeight() > 0) {
             BoundingBox box = map.getBoundingBox();
             if (box != null) {
@@ -442,8 +450,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         start.setAction(BusTrackingService.ACTION_START_MAP_TRACKING);
         start.putExtra(BusTrackingService.EXTRA_BOUNDING_BOX, getMapBoundingBoxString());
         startService(start);
-        // onResume runs before the first layout, so the map has no usable viewport yet: ask for the
-        // real visible area as soon as it has been measured.
         map.post(this::refreshFeedForViewport);
         startLocation();
         updateCountPill();
@@ -470,7 +476,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         } catch (IllegalArgumentException ignored) {
             // not registered
         }
-        // Armed arrival alerts need the poller to keep running once the map is off screen.
         if (!ArrivalAlertStore.hasAlerts(this)) {
             stopService(new Intent(this, BusTrackingService.class));
         }
@@ -490,6 +495,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         }
         handler.removeCallbacksAndMessages(null);
         io.shutdownNow();
+        timetableIo.shutdownNow();
         if (map != null) {
             map.onDetach();
         }
@@ -623,6 +629,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
 
             @Override
             public boolean onZoom(ZoomEvent event) {
+                applyVisibility();
                 handler.removeCallbacks(stopFetchRunnable);
                 handler.postDelayed(stopFetchRunnable, 900);
                 return false;
@@ -641,7 +648,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         frame.addView(chipScroll, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP));
 
-        // Control stack (lives inside the map screen only, so it never covers other tabs)
+        // Control stack
         LinearLayout stack = new LinearLayout(this);
         stack.setOrientation(LinearLayout.VERTICAL);
         addControl(stack, IconView.PLUS, v -> map.getController().zoomIn());
@@ -665,8 +672,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         followLp.setMargins(dp(12), 0, 0, dp(36));
         frame.addView(followPill, followLp);
 
-        // Route line pill: the visible way to dismiss the line that tapping a bus drew, so a route
-        // line can never get stuck on the map. Sits above the follow pill.
+        // Route line pill
         routeLinePill = UiTheme.pillText(this, "", UiTheme.CYAN,
                 UiTheme.withAlpha(UiTheme.INK, 225), UiTheme.CYAN);
         routeLinePill.setVisibility(View.GONE);
@@ -948,9 +954,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         if (bus == null) {
             bus = new Bus();
             buses.put(id, bus);
-        }        else if (bus.pos != null) {
-            // Measure against the feed's own timestamps: roughly half the fleet repeats its previous
-            // fix between two of our polls, so the poll interval is the wrong denominator.
+        } else if (bus.pos != null) {
             bus.speedKph = VehicleSpeed.estimate(
                     bus.pos.latitude, bus.pos.longitude, ArrivalAlerts.parseIso(bus.pos.recordedAt),
                     lat, lon, ArrivalAlerts.parseIso(pos.recordedAt), bus.speedKph, now);
@@ -976,23 +980,12 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             map.getOverlays().add(marker);
             bus.marker = marker;
         }
-        bus.marker.setIcon(busIcon(pos.lineName, pos.occupancy));
+        bus.marker.setIcon(busIcon(pos.lineName, pos.occupancy, pos.bearing));
         bus.marker.setEnabled(isBusVisible(pos));
         glideMarkerTo(bus, lat, lon, isNewMarker);
         scheduleRefresh();
     }
 
-    /**
-     * Slides a bus marker from its previous fix to the new one instead of jumping.
-     *
-     * BODS reports a position every 15 seconds, so the marker is lerped across the whole
-     * interval with a ValueAnimator, which keeps the vehicle moving along the road at roughly the
-     * speed the vehicle is really travelling. The duration comes from that speed (see
-     * {@link MarkerGlide}) rather than a fixed span, so the marker keeps moving between fixes
-     * instead of performing a short burst and then standing still. A brand new marker or a stationary
-     * vehicle is placed directly, and a fix that leaps kilometres (bad GPS, a re-positioned vehicle)
-     * is snapped rather than slid across the map: neither has anything sensible to glide from.
-     */
     private void glideMarkerTo(Bus bus, double lat, double lon, boolean firstFix) {
         if (bus.marker == null || map == null) {
             return;
@@ -1012,8 +1005,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         }
         ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
         animator.setDuration(MarkerGlide.durationMs(distance, bus.speedKph, bus.fixIntervalMs));
-        // Constant speed, not ease in/out: a new fix restarts the glide from wherever the marker has
-        // got to, and easing at every restart makes the marker pulse instead of run.
         animator.setInterpolator(new LinearInterpolator());
         animator.addUpdateListener(animation -> {
             float t = (float) animation.getAnimatedValue();
@@ -1026,12 +1017,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         animator.start();
     }
 
-    /**
-     * One redraw per frame, however many markers are gliding.
-     *
-     * Every glide used to call {@code map.invalidate()} from its own update listener, so a dozen
-     * moving buses queued a dozen redraws into the same frame and the map did that work repeatedly.
-     */
     private void invalidateMapForAnimation() {
         if (map == null || mapInvalidatePosted) {
             return;
@@ -1099,20 +1084,11 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         }
     }
 
-    /**
-     * A fresh BODS snapshot is about to stream in.
-     *
-     * Vehicles are deliberately kept rather than wiped: keeping them is what lets a marker glide
-     * from its previous fix to the new one, and what keeps speed estimation working across polls.
-     * Anything the snapshot does not re-report is removed by {@link #endSweep()}, which matches the
-     * old behaviour of a vehicle vanishing from the map as soon as the feed drops it.
-     */
     private void beginSweep() {
         sweepStartMs = System.currentTimeMillis();
         sweepPending = true;
     }
 
-    /** Ends a snapshot: any vehicle it did not re-report has left the feed. */
     private void endSweep() {
         if (!sweepPending) {
             return;
@@ -1132,6 +1108,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             }
         }
         if (!changed) {
+            renderStopBoard();
             return;
         }
         if (followId != null && !buses.containsKey(followId)) {
@@ -1148,15 +1125,20 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         return showBuses && (routeFilter == null || routeFilter.equalsIgnoreCase(pos.lineName));
     }
 
+    private boolean shouldShowStopsOnMap() {
+        return showStops && (map == null || map.getZoomLevelDouble() >= MIN_STOP_ZOOM);
+    }
+
     private void applyVisibility() {
         for (Bus bus : buses.values()) {
             if (bus.marker != null && bus.pos != null) {
                 bus.marker.setEnabled(isBusVisible(bus.pos));
             }
         }
+        boolean stopsVisible = shouldShowStopsOnMap();
         for (Stop stop : stops) {
             if (stop.marker != null) {
-                stop.marker.setEnabled(showStops);
+                stop.marker.setEnabled(stopsVisible);
             }
         }
         map.invalidate();
@@ -1264,14 +1246,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
 
     // ------------------------------------------------------------------ route line overlays
 
-    /**
-     * Draws the mapped shape of a route on the map, the way tapping a live bus or a route chip
-     * is meant to work.
-     *
-     * The geometry comes from the OpenStreetMap {@code route=bus} relation for that route via
-     * Overpass (see {@link RouteShapes}); when OSM has no shape for the route the app says so
-     * instead of drawing an invented line.
-     */
     private void showRouteLine(String route) {
         double lat = map != null && map.getMapCenter() != null ? map.getMapCenter().getLatitude() : 51.5;
         double lon = map != null && map.getMapCenter() != null ? map.getMapCenter().getLongitude() : 0.0;
@@ -1305,7 +1279,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
                     routeLineLoadingFor = null;
                 }
                 if (!requested.equalsIgnoreCase(routeLineFor)) {
-                    return; // the user has moved on to another route
+                    return;
                 }
                 if (lines == null) {
                     Toast.makeText(this, "Couldn't load the route line for " + requested,
@@ -1330,7 +1304,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             return;
         }
         List<Polyline> overlays = new ArrayList<>();
-        // a wider dark casing under the coloured line keeps it readable over satellite tiles
         for (List<GeoPoint> points : lines) {
             Polyline casing = new Polyline(map);
             casing.setPoints(points);
@@ -1351,7 +1324,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         map.invalidate();
     }
 
-    /** Hides the route line and forgets which route it belonged to. */
     private void clearRouteLine() {
         routeLineFor = null;
         routeLineLoadingFor = null;
@@ -1369,11 +1341,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         updateRouteLinePill();
     }
 
-    /**
-     * Shows a dismissible "Route N \u2715" pill whenever a route line is on the map. Tapping it - or
-     * the **All** chip - removes the line; without it the only way to get rid of the line was to tap
-     * a different bus.
-     */
     private void updateRouteLinePill() {
         if (routeLinePill == null) {
             return;
@@ -1386,7 +1353,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         }
     }
 
-    /** Keeps route lines at the bottom of the overlay stack, under stops and bus markers. */
     private void sendRouteLinesToBack() {
         if (map == null || routeLineOverlays.isEmpty()) {
             return;
@@ -1397,35 +1363,94 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
 
     // ------------------------------------------------------------------ icons
 
-    private Drawable busIcon(String route, String occupancy) {
-        String key = route + "|" + occupancy;
+    /**
+     * Draws a route badge pill with a directional heading arrow along the outer border when
+     * {@code bearing} is known, quantized to 15-degree steps so the icon cache stays compact.
+     */
+    private Drawable busIcon(String route, String occupancy, float bearing) {
+        boolean hasBearing = !Float.isNaN(bearing) && bearing >= 0f;
+        int step = hasBearing ? (((Math.round(bearing / 15f) * 15) % 360 + 360) % 360) : -1;
+        String key = route + "|" + occupancy + "|" + step;
         BitmapDrawable cached = iconCache.get(key);
         if (cached != null) {
             return cached;
         }
         int fill = UiTheme.occupancyColor(occupancy);
-        int w = dp(50);
-        int h = dp(32);
+        int pillW = dp(48);
+        int pillH = dp(30);
+        int pad = dp(8);
+        int w = pillW + pad * 2;
+        int h = pillH + pad * 2;
+        float cx = w / 2f;
+        float cy = h / 2f;
+
         Bitmap bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(bitmap);
         Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+        // Draw directional heading pointer attached to the edge of the pill
+        if (hasBearing) {
+            double rad = Math.toRadians(step);
+            float dx = (float) Math.sin(rad);
+            float dy = (float) -Math.cos(rad);
+            float px = -dy;
+            float py = dx;
+
+            float halfW = pillW / 2f;
+            float halfH = pillH / 2f;
+            float sx = Math.abs(dx) > 1e-4f ? halfW / Math.abs(dx) : Float.MAX_VALUE;
+            float sy = Math.abs(dy) > 1e-4f ? halfH / Math.abs(dy) : Float.MAX_VALUE;
+            float edge = Math.min(sx, sy);
+            // Pull slightly inward at the 4 rounded corners so the arrow base sits flush
+            if (Math.abs(sx - sy) < dp(6)) {
+                edge -= dp(2f);
+            }
+
+            float tipDist = edge + dp(6.5f);
+            float baseDist = edge - dp(2f);
+            float wing = dp(5.5f);
+
+            Path outerArrow = new Path();
+            outerArrow.moveTo(cx + dx * (tipDist + dp(1.5f)), cy + dy * (tipDist + dp(1.5f)));
+            outerArrow.lineTo(cx + dx * baseDist + px * (wing + dp(1.5f)),
+                    cy + dy * baseDist + py * (wing + dp(1.5f)));
+            outerArrow.lineTo(cx + dx * baseDist - px * (wing + dp(1.5f)),
+                    cy + dy * baseDist - py * (wing + dp(1.5f)));
+            outerArrow.close();
+            paint.setColor(Color.WHITE);
+            canvas.drawPath(outerArrow, paint);
+
+            Path innerArrow = new Path();
+            innerArrow.moveTo(cx + dx * tipDist, cy + dy * tipDist);
+            innerArrow.lineTo(cx + dx * baseDist + px * wing, cy + dy * baseDist + py * wing);
+            innerArrow.lineTo(cx + dx * baseDist - px * wing, cy + dy * baseDist - py * wing);
+            innerArrow.close();
+            paint.setColor(fill);
+            canvas.drawPath(innerArrow, paint);
+        }
+
+        RectF outerRect = new RectF(pad, pad, pad + pillW, pad + pillH);
         paint.setColor(Color.WHITE);
-        canvas.drawRoundRect(new RectF(0, 0, w, h), dp(10), dp(10), paint);
+        canvas.drawRoundRect(outerRect, dp(10), dp(10), paint);
+
+        RectF innerRect = new RectF(pad + dp(2), pad + dp(2), pad + pillW - dp(2), pad + pillH - dp(2));
         paint.setColor(fill);
-        canvas.drawRoundRect(new RectF(dp(2), dp(2), w - dp(2), h - dp(2)), dp(8), dp(8), paint);
+        canvas.drawRoundRect(innerRect, dp(8), dp(8), paint);
+
         double luminance = Color.red(fill) * 0.299 + Color.green(fill) * 0.587 + Color.blue(fill) * 0.114;
         paint.setColor(luminance > 150 ? UiTheme.INK : Color.WHITE);
         paint.setTypeface(Typeface.DEFAULT_BOLD);
         paint.setTextAlign(Paint.Align.CENTER);
-        float size = dp(15);
+        float size = dp(14);
         paint.setTextSize(size);
-        float maxWidth = w - dp(10);
+        float maxWidth = pillW - dp(10);
         while (paint.measureText(route) > maxWidth && size > dp(8)) {
             size -= 1;
             paint.setTextSize(size);
         }
-        float baseline = h / 2f - (paint.descent() + paint.ascent()) / 2f;
-        canvas.drawText(route, w / 2f, baseline, paint);
+        float baseline = cy - (paint.descent() + paint.ascent()) / 2f;
+        canvas.drawText(route, cx, baseline, paint);
+
         BitmapDrawable drawable = new BitmapDrawable(getResources(), bitmap);
         iconCache.put(key, drawable);
         return drawable;
@@ -1535,7 +1560,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         Toast.makeText(this, "Refreshing\u2026", Toast.LENGTH_SHORT).show();
     }
 
-    /** Reference point for "nearest" sorting: the user if known, else the map centre. */
     private double[] refPoint() {
         if (userLocation != null) {
             return new double[]{userLocation.getLatitude(), userLocation.getLongitude()};
@@ -1590,11 +1614,9 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     }
 
     private static final Map<String, List<Stop>> STOP_MEMORY_CACHE = new HashMap<>();
-    private static final long STOP_CACHE_TTL_MS = 24L * 60 * 60 * 1000; // 24 hours
+    private static final long STOP_CACHE_TTL_MS = 24L * 60 * 60 * 1000;
 
     private static String stopCacheKey(double lat, double lon) {
-        // The version suffix retires caches written before stops carried their NaPTAN code: a stop
-        // without one cannot have its timetable looked up, so those lists are worth re-fetching.
         return String.format(Locale.UK, "%.2f_%.2f-v2", Math.round(lat * 100) / 100.0, Math.round(lon * 100) / 100.0);
     }
 
@@ -1710,6 +1732,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         }
         stops.clear();
         stops.addAll(fresh);
+        boolean stopsVisible = shouldShowStopsOnMap();
         for (Stop stop : stops) {
             final Stop target = stop;
             Marker marker = new Marker(map);
@@ -1717,7 +1740,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             marker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER);
             marker.setInfoWindow(null);
             marker.setIcon(stopIcon());
-            marker.setEnabled(showStops);
+            marker.setEnabled(stopsVisible);
             marker.setOnMarkerClickListener((m, mv) -> {
                 showStopSheet(target);
                 return true;
@@ -1725,7 +1748,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             stop.marker = marker;
             map.getOverlays().add(0, marker);
         }
-        // keep the user marker on top
         if (userMarker != null) {
             map.getOverlays().remove(userMarker);
             map.getOverlays().add(userMarker);
@@ -1763,7 +1785,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     private void showStopSheet(Stop stop) {
         LinearLayout card = sheetCard();
 
-        // name with a trailing save star: saving the stop is what puts its board on Favorites
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
@@ -1776,7 +1797,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
                 UiTheme.CYAN);
         star.setOnClickListener(v -> {
             StopFavorites.toggle(this, new StopFavorites.FavoriteStop(
-                    stop.id, stop.name, stop.routes, stop.lat, stop.lon));
+                    stop.id, stop.name, stop.routes, stop.atcoCode, stop.lat, stop.lon));
             boolean nowSaved = StopFavorites.isFavorite(this, stop.id, stop.lat, stop.lon);
             star.setText(nowSaved ? "\u2605 Saved" : "\u2606 Save");
             star.setTextColor(nowSaved ? UiTheme.INK : UiTheme.WHITE);
@@ -1795,14 +1816,18 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             card.addView(tv(formatDistance(meters(userLocation.getLatitude(), userLocation.getLongitude(),
                     stop.lat, stop.lon)) + " from you", 13, UiTheme.TEXT_DIM, false));
         }
-        if (!stop.routes.isEmpty()) {
-            TextView routes = tv("Routes: " + stop.routes, 14, UiTheme.CYAN, false);
-            routes.setPadding(0, dp(8), 0, 0);
-            card.addView(routes);
-        }
+
+        // Interactive route filter chips (filters both live departures and scheduled timetable)
+        HorizontalScrollView routeScroll = new HorizontalScrollView(this);
+        routeScroll.setHorizontalScrollBarEnabled(false);
+        stopRouteFilterRow = new LinearLayout(this);
+        stopRouteFilterRow.setOrientation(LinearLayout.HORIZONTAL);
+        stopRouteFilterRow.setPadding(0, dp(10), 0, dp(2));
+        routeScroll.addView(stopRouteFilterRow);
+        card.addView(routeScroll);
 
         stopBoardTitle = tv("Next departures", 13, UiTheme.TEXT_DIM, false);
-        stopBoardTitle.setPadding(0, dp(16), 0, dp(6));
+        stopBoardTitle.setPadding(0, dp(14), 0, dp(6));
         card.addView(stopBoardTitle);
 
         stopBoardRows = new LinearLayout(this);
@@ -1814,15 +1839,20 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         card.addView(stopBoardNote);
 
         TextView timetableTitle = tv("Timetable", 13, UiTheme.TEXT_DIM, false);
-        timetableTitle.setPadding(0, dp(18), 0, dp(6));
+        timetableTitle.setPadding(0, dp(16), 0, dp(6));
         card.addView(timetableTitle);
+
+        // Day-of-week selector (Today / Mon-Fri / Sat / Sun)
+        stopTimetableDayRow = new LinearLayout(this);
+        stopTimetableDayRow.setOrientation(LinearLayout.HORIZONTAL);
+        stopTimetableDayRow.setPadding(0, 0, 0, dp(8));
+        stopTimetableDayRow.setVisibility(View.GONE);
+        card.addView(stopTimetableDayRow);
 
         stopTimetableRows = new LinearLayout(this);
         stopTimetableRows.setOrientation(LinearLayout.VERTICAL);
         card.addView(stopTimetableRows);
 
-        // The button lives with the times rather than in the action row, which already runs off the
-        // side of a phone screen with three pills in it.
         stopTimetableButton = UiTheme.pillText(this, "Load timetable", UiTheme.WHITE,
                 UiTheme.INK_LIGHT, UiTheme.CYAN);
         stopTimetableButton.setOnClickListener(v -> loadStopTimetable(stop));
@@ -1848,7 +1878,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         TextView notify = UiTheme.pillText(this, "Notify me", UiTheme.WHITE, UiTheme.INK_LIGHT, UiTheme.BLUE);
         notify.setOnClickListener(v -> {
             dialog.dismiss();
-            openAlertSheet(routesAtStop(stop), stop.name, stop.lat, stop.lon);
+            openAlertSheet(timetableRoutes(stop), stop.name, stop.lat, stop.lon);
         });
         TextView show = UiTheme.pillText(this, "Show on map", UiTheme.WHITE, UiTheme.INK_LIGHT, UiTheme.BLUE);
         show.setOnClickListener(v -> {
@@ -1868,38 +1898,145 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
 
         stopBoardStop = stop;
         stopBoardDialog = dialog;
+        stopSheetRouteFilter = null;
+        stopTimetableDayMode = StopTimetables.MODE_TODAY;
+        stopTimetableLoading = false;
+        stopTimetableRequestId++;
         dialog.setOnDismissListener(d -> {
             stopBoardStop = null;
             stopBoardDialog = null;
+            stopRouteFilterRow = null;
+            stopSheetRouteFilter = null;
             stopBoardRows = null;
             stopBoardTitle = null;
             stopBoardNote = null;
+            stopTimetableDayRow = null;
             stopTimetableRows = null;
             stopTimetableNote = null;
             stopTimetableButton = null;
             stopTimetableAll = null;
+            stopTimetableLoading = false;
+            stopTimetableRequestId++;
         });
+        rebuildStopRouteChips(stop);
         renderStopBoard();
         showCachedTimetable(stop);
         dialog.show();
     }
 
+    /** Builds interactive route filter pills at the top of the stop sheet. */
+    private void rebuildStopRouteChips(Stop stop) {
+        if (stopRouteFilterRow == null || stop == null) {
+            return;
+        }
+        List<String> routes = new ArrayList<>();
+        if (stop.routes != null && !stop.routes.trim().isEmpty()) {
+            for (String r : stop.routes.split("[,;]")) {
+                addRoute(routes, r);
+            }
+        }
+        for (String r : StopTimetables.distinctLines(stopTimetableAll)) {
+            addRoute(routes, r);
+        }
+        for (StopDepartures.Departure d : StopDepartures.board(liveVehicles(), stop.lat, stop.lon, stop.routes)) {
+            addRoute(routes, d.route);
+        }
+        Collections.sort(routes, MainActivity::compareRoutes);
+
+        stopRouteFilterRow.removeAllViews();
+        if (routes.isEmpty()) {
+            stopRouteFilterRow.setVisibility(View.GONE);
+            return;
+        }
+        stopRouteFilterRow.setVisibility(View.VISIBLE);
+        if (routes.size() == 1) {
+            TextView only = tv("Route " + routes.get(0), 13, UiTheme.CYAN, true);
+            stopRouteFilterRow.addView(only);
+            return;
+        }
+
+        stopRouteFilterRow.addView(stopRouteChip(stop, "All routes", null));
+        for (String route : routes) {
+            stopRouteFilterRow.addView(stopRouteChip(stop, route, route));
+        }
+    }
+
+    private View stopRouteChip(Stop stop, String label, String routeValue) {
+        boolean selected = (routeValue == null && stopSheetRouteFilter == null)
+                || (routeValue != null && routeValue.equalsIgnoreCase(stopSheetRouteFilter));
+        TextView chip = UiTheme.pillText(this, label,
+                selected ? UiTheme.INK : UiTheme.WHITE,
+                selected ? UiTheme.CYAN : UiTheme.INK_LIGHT,
+                selected ? UiTheme.CYAN : UiTheme.BLUE);
+        chip.setOnClickListener(v -> {
+            stopSheetRouteFilter = routeValue;
+            rebuildStopRouteChips(stop);
+            renderStopBoard();
+            renderStopTimetable();
+        });
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.rightMargin = dp(6);
+        chip.setLayoutParams(lp);
+        return chip;
+    }
+
+    private void rebuildTimetableDayChips() {
+        if (stopTimetableDayRow == null) {
+            return;
+        }
+        if (stopTimetableAll == null || stopTimetableAll.isEmpty() || stopTimetableLoading) {
+            stopTimetableDayRow.setVisibility(View.GONE);
+            return;
+        }
+        stopTimetableDayRow.setVisibility(View.VISIBLE);
+        stopTimetableDayRow.removeAllViews();
+        String[] labels = {"Today", "Mon\u2013Fri", "Sat", "Sun"};
+        int[] modes = {
+                StopTimetables.MODE_TODAY,
+                StopTimetables.MODE_WEEKDAYS,
+                StopTimetables.MODE_SATURDAY,
+                StopTimetables.MODE_SUNDAY
+        };
+        for (int i = 0; i < labels.length; i++) {
+            final int mode = modes[i];
+            boolean selected = stopTimetableDayMode == mode;
+            TextView pill = UiTheme.pillText(this, labels[i],
+                    selected ? UiTheme.INK : UiTheme.WHITE,
+                    selected ? UiTheme.CYAN : UiTheme.INK_LIGHT,
+                    selected ? UiTheme.CYAN : UiTheme.BLUE);
+            pill.setOnClickListener(v -> {
+                stopTimetableDayMode = mode;
+                rebuildTimetableDayChips();
+                renderStopTimetable();
+            });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.rightMargin = dp(6);
+            pill.setLayoutParams(lp);
+            stopTimetableDayRow.addView(pill);
+        }
+    }
+
     /**
-     * Routes a timetable lookup should ask about: the stop's own list, the routes running at it, and
-     * the routes running anywhere the map can see. Without any of these the lookup has to open every
-     * timetable published for the area, which is much slower.
+     * Routes a timetable lookup should ask about: the stop's own OSM route_ref list first,
+     * falling back to live buses actually serving/approaching this stop.
      */
     private List<String> timetableRoutes(Stop stop) {
         List<String> routes = new ArrayList<>();
-        for (String route : stop.routes.split(",")) {
-            addRoute(routes, route);
+        if (stop.routes != null && !stop.routes.trim().isEmpty()) {
+            for (String route : stop.routes.split("[,;]")) {
+                addRoute(routes, route);
+            }
         }
-        for (String route : routesAtStop(stop)) {
-            addRoute(routes, route);
+        List<StopDepartures.Departure> inbound =
+                StopDepartures.board(liveVehicles(), stop.lat, stop.lon, stop.routes);
+        for (StopDepartures.Departure d : inbound) {
+            addRoute(routes, d.route);
         }
-        for (Bus bus : buses.values()) {
-            if (bus.pos != null) {
-                addRoute(routes, bus.pos.lineName);
+        if (routes.isEmpty()) {
+            for (String route : routesAtStop(stop)) {
+                addRoute(routes, route);
             }
         }
         return routes;
@@ -1913,10 +2050,8 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     }
 
     /**
-     * Shows the stop's timetable when it is already cached.
-     *
-     * Fetching one is left to the user, because a single operator's timetable can run to tens of
-     * megabytes: opening a stop must not start that download on its own.
+     * Shows the stop's timetable when it is already cached, or automatically extracts it in the
+     * background if the operator's dataset ZIP is already on disk.
      */
     private void showCachedTimetable(Stop stop) {
         if (stopTimetableRows == null || stopTimetableNote == null) {
@@ -1925,21 +2060,55 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         stopTimetableRows.removeAllViews();
         stopTimetableAll = null;
         if (TextUtils.isEmpty(stop.atcoCode)) {
+            if (stopTimetableButton != null) {
+                stopTimetableButton.setVisibility(View.GONE);
+            }
+            if (stopTimetableDayRow != null) {
+                stopTimetableDayRow.setVisibility(View.GONE);
+            }
             stopTimetableNote.setText("OpenStreetMap has no NaPTAN code for this stop, so there is no "
                     + "published timetable to look up.");
             return;
         }
+        if (stopTimetableButton != null) {
+            stopTimetableButton.setVisibility(View.VISIBLE);
+        }
         stopTimetableAll = StopTimetables.cached(this, stop.atcoCode);
-        if (stopTimetableAll == null) {
-            stopTimetableButton.setText("Load timetable");
-            stopTimetableNote.setText("Times registered by the operators for this stop.");
+        if (stopTimetableAll != null) {
+            stopTimetableButton.setText("Refresh");
+            rebuildStopRouteChips(stop);
+            rebuildTimetableDayChips();
+            renderStopTimetable();
             return;
         }
-        stopTimetableButton.setText("Refresh");
-        renderStopTimetable();
+
+        stopTimetableButton.setText("Load timetable");
+        stopTimetableNote.setText("Times registered by the operators for this stop.");
+
+        // Auto-extract from any operator dataset ZIP already downloaded on disk (zero network cost)
+        final int requestId = stopTimetableRequestId;
+        final String atcoCode = stop.atcoCode;
+        timetableIo.execute(() -> {
+            final List<TxcTimetable.Departure> local =
+                    StopTimetables.departuresFromDiskOnly(getApplicationContext(), atcoCode);
+            if (local != null && !local.isEmpty()) {
+                handler.post(() -> {
+                    if (requestId != stopTimetableRequestId || stopTimetableRows == null) {
+                        return;
+                    }
+                    stopTimetableAll = local;
+                    if (stopTimetableButton != null) {
+                        stopTimetableButton.setText("Refresh");
+                    }
+                    rebuildStopRouteChips(stop);
+                    rebuildTimetableDayChips();
+                    renderStopTimetable();
+                });
+            }
+        });
     }
 
-    /** Fetches the stop's published timetable in the background, showing how the download is going. */
+    /** Fetches the stop's published timetable on its own executor, isolated from Overpass calls. */
     private void loadStopTimetable(Stop stop) {
         if (stopTimetableLoading) {
             return;
@@ -1949,26 +2118,27 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             return;
         }
         stopTimetableLoading = true;
+        final int requestId = ++stopTimetableRequestId;
         if (stopTimetableButton != null) {
             stopTimetableButton.setText("Loading\u2026");
-        }
-        if (stopTimetableButton == null && stopTimetableNote == null) {
-            return;
         }
         if (stopTimetableNote != null) {
             stopTimetableNote.setText("Finding published timetables\u2026");
         }
         final String atcoCode = stop.atcoCode;
         final List<String> routes = timetableRoutes(stop);
-        io.execute(() -> {
+        timetableIo.execute(() -> {
             try {
                 final List<TxcTimetable.Departure> departures = StopTimetables.departures(this,
                         atcoCode, routes, message -> handler.post(() -> {
-                            if (stopTimetableNote != null) {
+                            if (requestId == stopTimetableRequestId && stopTimetableNote != null) {
                                 stopTimetableNote.setText(message);
                             }
                         }));
                 handler.post(() -> {
+                    if (requestId != stopTimetableRequestId) {
+                        return;
+                    }
                     stopTimetableLoading = false;
                     if (stopTimetableButton != null) {
                         stopTimetableButton.setText("Refresh");
@@ -1977,10 +2147,15 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
                         return;
                     }
                     stopTimetableAll = departures;
+                    rebuildStopRouteChips(stop);
+                    rebuildTimetableDayChips();
                     renderStopTimetable();
                 });
             } catch (final Exception e) {
                 handler.post(() -> {
+                    if (requestId != stopTimetableRequestId) {
+                        return;
+                    }
                     stopTimetableLoading = false;
                     if (stopTimetableButton != null) {
                         stopTimetableButton.setText("Load timetable");
@@ -1994,36 +2169,44 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         });
     }
 
-    /** The next scheduled departures from whatever timetable has been loaded for the stop. */
+    /** Renders the scheduled departures for the active day mode and route filter. */
     private void renderStopTimetable() {
         if (stopTimetableRows == null || stopTimetableAll == null || stopTimetableLoading) {
             return;
         }
         stopTimetableRows.removeAllViews();
-        List<TxcTimetable.Departure> today =
-                StopTimetables.today(stopTimetableAll, System.currentTimeMillis());
-        if (today.isEmpty()) {
+        rebuildTimetableDayChips();
+
+        List<StopTimetables.ScheduledRow> rows = StopTimetables.select(
+                stopTimetableAll, System.currentTimeMillis(), stopTimetableDayMode, stopSheetRouteFilter);
+        if (rows.isEmpty()) {
             if (stopTimetableNote != null) {
-                stopTimetableNote.setText("No more scheduled departures today.");
+                stopTimetableNote.setText(stopSheetRouteFilter != null
+                        ? "No scheduled departures for route " + stopSheetRouteFilter + " on this day."
+                        : "No scheduled departures found for this day.");
             }
             return;
         }
-        for (TxcTimetable.Departure departure : today) {
-            stopTimetableRows.addView(timetableRow(departure));
+        boolean hasTomorrow = false;
+        for (StopTimetables.ScheduledRow row : rows) {
+            hasTomorrow |= row.tomorrow;
+            stopTimetableRows.addView(timetableRow(row));
         }
         if (stopTimetableNote != null) {
-            stopTimetableNote.setText("Scheduled times from the operators' published timetables"
-                    + (today.size() == StopTimetables.MAX_ROWS ? ", next " + today.size() : "") + ".");
+            String suffix = hasTomorrow ? " (including tomorrow morning)." : ".";
+            stopTimetableNote.setText("Scheduled times from the operators' published timetables" + suffix);
         }
     }
 
-    private View timetableRow(TxcTimetable.Departure departure) {
+    private View timetableRow(StopTimetables.ScheduledRow item) {
+        TxcTimetable.Departure departure = item.departure;
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(0, dp(6), 0, dp(6));
 
-        row.addView(tv(departure.clock(), 15, UiTheme.CYAN, true));
+        String clockText = item.tomorrow ? "Tom " + departure.clock() : departure.clock();
+        row.addView(tv(clockText, 15, item.tomorrow ? UiTheme.AMBER : UiTheme.CYAN, true));
 
         TextView line = tv(departure.line, 13, UiTheme.WHITE, true);
         line.setPadding(dp(14), 0, dp(14), 0);
@@ -2049,10 +2232,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         return vehicles;
     }
 
-    /**
-     * Fills the open stop sheet with its departure board. Called again at the end of every poll so the
-     * sheet tracks the live feed instead of freezing on whatever was true when it was opened.
-     */
     private void renderStopBoard() {
         if (stopBoardRows == null || stopBoardTitle == null || stopBoardStop == null) {
             return;
@@ -2060,24 +2239,29 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         Stop stop = stopBoardStop;
         stopBoardRows.removeAllViews();
         stopBoardNote.setText("");
-        // keep the scheduled times honest as the clock moves on
         renderStopTimetable();
 
         List<StopDepartures.Vehicle> vehicles = liveVehicles();
+        String effectiveRoutes = stopSheetRouteFilter != null ? stopSheetRouteFilter : stop.routes;
         List<StopDepartures.Departure> board =
-                StopDepartures.board(vehicles, stop.lat, stop.lon, stop.routes);
+                StopDepartures.board(vehicles, stop.lat, stop.lon, effectiveRoutes);
         boolean servingThisStop = !board.isEmpty();
-        if (!servingThisStop) {
-            // Either nothing on this stop's routes is running, or the OSM route names do not match the
-            // feed's line names. Fall back to what is genuinely nearby so the sheet is never a dead end.
+        if (!servingThisStop && stopSheetRouteFilter == null) {
             board = StopDepartures.board(vehicles, stop.lat, stop.lon, "");
         }
-        stopBoardTitle.setText(servingThisStop ? "Next departures" : "Live buses nearby");
+        stopBoardTitle.setText(servingThisStop || stopSheetRouteFilter != null
+                ? "Next departures" : "Live buses nearby");
 
         if (board.isEmpty()) {
-            stopBoardRows.addView(tv(TextUtils.isEmpty(BuildConfig.BODS_API_KEY)
-                    ? "Live buses need a BODS API key."
-                    : "No live buses near this stop right now.", 14, UiTheme.WHITE, false));
+            String emptyMsg;
+            if (TextUtils.isEmpty(BuildConfig.BODS_API_KEY)) {
+                emptyMsg = "Live buses need a BODS API key.";
+            } else if (stopSheetRouteFilter != null) {
+                emptyMsg = "No live buses on route " + stopSheetRouteFilter + " near this stop right now.";
+            } else {
+                emptyMsg = "No live buses near this stop right now.";
+            }
+            stopBoardRows.addView(tv(emptyMsg, 14, UiTheme.WHITE, false));
             return;
         }
 
@@ -2117,9 +2301,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         return busRow(bus, distanceMeters, null);
     }
 
-    /**
-     * @param rightLabel overrides the distance on the right, e.g. a departure board's "4 min"
-     */
     private View busRow(Bus bus, double distanceMeters, String rightLabel) {
         BusPosition p = bus.pos;
         int color = UiTheme.occupancyColor(p.occupancy);
@@ -2325,7 +2506,8 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             double[] ref = refPoint();
             int shown = 0;
             for (Stop stop : stops) {
-                if (stop.name.toLowerCase(Locale.UK).contains(q) && shown < 15) {
+                if ((stop.name.toLowerCase(Locale.UK).contains(q)
+                        || stop.routes.toLowerCase(Locale.UK).contains(q)) && shown < 15) {
                     searchResults.addView(stopRow(stop, meters(ref[0], ref[1], stop.lat, stop.lon)));
                     shown++;
                 }
@@ -2371,10 +2553,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         }
     }
 
-    /**
-     * A saved stop: how far away it is and how many buses are inbound, taken from the same departure
-     * board the stop sheet shows. Tapping it opens that board, so Favorites is one tap from arrivals.
-     */
     private View favoriteStopCard(StopFavorites.FavoriteStop saved, double[] ref) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
@@ -2422,7 +2600,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         return row;
     }
 
-    /** Rebuilds the live Stop shape a saved stop needs in order to show its departure board. */
     private Stop stopShapeFor(StopFavorites.FavoriteStop saved) {
         Stop stop = new Stop();
         stop.id = saved.osmId;
@@ -2434,10 +2611,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         return stop;
     }
 
-    /**
-     * The stop's NaPTAN reference. OpenStreetMap carries it as {@code naptan:AtcoCode}, which is the
-     * same string the published timetables key their stop times by, so no name matching is needed.
-     */
     private static String atcoCodeOf(JSONObject tags) {
         if (tags == null) {
             return "";
@@ -2610,7 +2783,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         return ArrivalAlertStore.isArmedForRoute(this, route);
     }
 
-    /** Re-checks armed alerts against the live buses currently on the map. */
     private void evaluateArrivalAlerts() {
         if (!ArrivalAlertStore.hasAlerts(this)) {
             return;
@@ -2634,7 +2806,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         }
     }
 
-    /** Distinct routes of the live buses currently sitting at a stop. */
     private List<String> routesAtStop(Stop stop) {
         List<String> routes = new ArrayList<>();
         for (Bus bus : buses.values()) {
@@ -2666,10 +2837,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
                 selected ? UiTheme.CYAN : UiTheme.BLUE, 1f, 20f)));
     }
 
-    /**
-     * "Notify me when route 350 is 5 minutes away" picker: choose the route (when the place
-     * serves several) and how close counts as close, then arm the alert.
-     */
     private void openAlertSheet(List<String> routeOptions, String placeLabel, double lat, double lon) {
         if (routeOptions == null || routeOptions.isEmpty()) {
             Toast.makeText(this, "No live route to watch here yet", Toast.LENGTH_SHORT).show();
@@ -2824,5 +2991,4 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             return Integer.MAX_VALUE;
         }
     }
-
 }

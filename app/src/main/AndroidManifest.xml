@@ -13,9 +13,6 @@
     <uses-feature
         android:name="android.hardware.camera"
         android:required="false" />
-    <uses-feature
-        android:name="android.hardware.camera.ar"
-        android:required="false" />
 
     <application
         android:allowBackup="true"
@@ -26,9 +23,6 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.BusTimesLive"
         android:usesCleartextTraffic="false">
-        <meta-data
-            android:name="com.google.ar.core"
-            android:value="optional" />
 
         <service
             android:name=".BusTrackingService"

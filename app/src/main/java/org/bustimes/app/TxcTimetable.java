@@ -17,17 +17,6 @@ import java.util.Set;
 
 /**
  * Reads the scheduled times for one stop out of a TransXChange document.
- *
- * This is the timetables half of the DfT Bus Open Data Service. The live SIRI-VM feed says where
- * vehicles are now and carries no timetable, so a stop's scheduled departures can only come from
- * the TransXChange documents the operators publish.
- *
- * The document is streamed once, and only journey patterns that actually call at the requested stop
- * are kept, because one operator's file can cover hundreds of services. Vehicle journeys are
- * resolved after the whole document has been read, so the result does not depend on the order the
- * file happens to use for its sections.
- *
- * Kept free of Android types so the rules can be unit tested on the JVM.
  */
 final class TxcTimetable {
 
@@ -42,14 +31,11 @@ final class TxcTimetable {
 
     private static final int SECONDS_PER_DAY = 24 * 60 * 60;
 
-    /** One scheduled departure from a stop. */
     static final class Departure {
         final String line;
         final String destination;
-        /** Seconds after midnight. */
         final int secondsOfDay;
         final int daysMask;
-        /** ISO date bounds from the service's operating period, or empty when unbounded. */
         final String validFrom;
         final String validTo;
 
@@ -63,12 +49,10 @@ final class TxcTimetable {
             this.validTo = validTo == null ? "" : validTo;
         }
 
-        /** "13:52". */
         String clock() {
             return formatClock(secondsOfDay);
         }
 
-        /** Whether the service's operating period covers this ISO date. */
         boolean runsOn(String isoDate) {
             if (!validFrom.isEmpty() && isoDate.compareTo(validFrom) < 0) {
                 return false;
@@ -79,13 +63,11 @@ final class TxcTimetable {
 
     private TxcTimetable() { }
 
-    /** Formats seconds after midnight as a 24-hour clock time. */
     static String formatClock(int secondsOfDay) {
         int seconds = ((secondsOfDay % SECONDS_PER_DAY) + SECONDS_PER_DAY) % SECONDS_PER_DAY;
         return String.format(Locale.UK, "%02d:%02d", seconds / 3600, (seconds % 3600) / 60);
     }
 
-    /** Turns {@code 07:35:00} (or {@code 24:10:00}) into seconds after midnight; -1 when unreadable. */
     static int parseClock(String value) {
         if (value == null) {
             return -1;
@@ -105,7 +87,6 @@ final class TxcTimetable {
         }
     }
 
-    /** {@code PT1H2M30S} (and {@code P1DT2H}) in seconds; 0 when unreadable. */
     static int parseDuration(String iso) {
         if (iso == null) {
             return 0;
@@ -128,7 +109,6 @@ final class TxcTimetable {
                     case 'D': total += number * 86400; break;
                     case 'W': total += number * 7 * 86400; break;
                     case 'H': total += number * 3600; break;
-                    // Before the T these are months, which no bus timetable uses; after it, minutes.
                     case 'M': total += number * (inTime ? 60 : 0); break;
                     case 'S': total += number; break;
                     default: break;
@@ -139,7 +119,6 @@ final class TxcTimetable {
         return total;
     }
 
-    /** Day mask for a {@link Calendar} day-of-week constant. */
     static int dayMaskForCalendarDay(int calendarDayOfWeek) {
         switch (calendarDayOfWeek) {
             case Calendar.MONDAY: return MONDAY;
@@ -153,7 +132,6 @@ final class TxcTimetable {
         }
     }
 
-    /** The days a TransXChange day name covers, or 0 when it is not a weekday rule. */
     static int maskForDayName(String name) {
         if (name == null) {
             return 0;
@@ -168,7 +146,8 @@ final class TxcTimetable {
             case "Sunday": return SUNDAY;
             case "MondayToFriday": return MONDAY | TUESDAY | WEDNESDAY | THURSDAY | FRIDAY;
             case "MondayToSaturday": return MONDAY | TUESDAY | WEDNESDAY | THURSDAY | FRIDAY | SATURDAY;
-            case "MondayToSunday": return ALL_DAYS;
+            case "MondayToSunday":
+            case "AllWeek": return ALL_DAYS;
             case "Weekend": return SATURDAY | SUNDAY;
             case "TuesdayToSaturday":
                 return TUESDAY | WEDNESDAY | THURSDAY | FRIDAY | SATURDAY;
@@ -176,9 +155,6 @@ final class TxcTimetable {
         }
     }
 
-    /**
-     * The departures this document schedules from {@code atcoCode}, with no date or day filtering.
-     */
     static List<Departure> parse(InputStream stream, String atcoCode) throws Exception {
         Collector collector = new Collector(atcoCode == null ? "" : atcoCode.trim());
         XmlPullParser parser = XmlPullParserFactory.newInstance().newPullParser();
@@ -187,10 +163,6 @@ final class TxcTimetable {
         return collector.departures();
     }
 
-    /**
-     * The remaining departures for one day: on that weekday, inside the service's operating dates,
-     * at or after {@code fromSeconds}, earliest first, with duplicates collapsed.
-     */
     static List<Departure> upcoming(List<Departure> departures, int todayMask, String isoDate,
             int fromSeconds, int limit) {
         List<Departure> today = new ArrayList<>();
@@ -224,7 +196,6 @@ final class TxcTimetable {
 
     // ------------------------------------------------------------------ parsing
 
-    /** One hop of a journey pattern: from one stop to the next, with the time it takes. */
     private static final class Link {
         final String id;
         final String from;
@@ -239,7 +210,6 @@ final class TxcTimetable {
         }
     }
 
-    /** A route a vehicle journey follows: its stops, and the time between them. */
     private static final class Pattern {
         final String[] stopRefs;
         final String[] linkIds;
@@ -255,7 +225,7 @@ final class TxcTimetable {
 
         int indexOf(String stopRef) {
             for (int i = 0; i < stopRefs.length; i++) {
-                if (stopRefs[i].equals(stopRef)) {
+                if (stopRefs[i].equalsIgnoreCase(stopRef)) {
                     return i;
                 }
             }
@@ -263,8 +233,9 @@ final class TxcTimetable {
         }
     }
 
-    /** One scheduled run, before its stop times are worked out. */
     private static final class Journey {
+        String code = "";
+        String vehicleJourneyRef = "";
         String serviceRef = "";
         String lineRef = "";
         String journeyPatternRef = "";
@@ -272,8 +243,8 @@ final class TxcTimetable {
         int daysMask;
         Map<String, Integer> runOverrides;
 
-        boolean isUsable() {
-            return departureSeconds >= 0 && !journeyPatternRef.isEmpty();
+        boolean hasDepartureTime() {
+            return departureSeconds >= 0;
         }
 
         void addOverride(String linkId, int seconds) {
@@ -297,6 +268,7 @@ final class TxcTimetable {
         private final Map<String, Integer> serviceDays = new HashMap<>();
         private final Map<String, String[]> serviceValid = new HashMap<>();
         private final List<Journey> journeys = new ArrayList<>();
+        private final Map<String, Journey> journeysByCode = new HashMap<>();
         private final List<String> path = new ArrayList<>();
 
         private String text = "";
@@ -329,28 +301,53 @@ final class TxcTimetable {
             do {
                 event = parser.next();
                 if (event == XmlPullParser.START_TAG) {
-                    path.add(parser.getName());
+                    String tag = parser.getName();
+                    // Fast-skip <RouteSections>: it contains tens of thousands of road coordinates
+                    // that are never used for stop timetables.
+                    if ("RouteSections".equals(tag)) {
+                        skipSubtree(parser);
+                        continue;
+                    }
+                    // If no JourneyPattern in this document visits targetStop, skip VehicleJourneys
+                    if ("VehicleJourneys".equals(tag) && patterns.isEmpty()) {
+                        return;
+                    }
+                    path.add(tag);
                     text = "";
                     onStart(parser.getAttributeValue(null, "id"));
                 } else if (event == XmlPullParser.TEXT || event == XmlPullParser.CDSECT) {
                     text = parser.getText();
                 } else if (event == XmlPullParser.END_TAG) {
                     onEnd();
-                    path.remove(path.size() - 1);
+                    if (!path.isEmpty()) {
+                        path.remove(path.size() - 1);
+                    }
                 }
             } while (event != XmlPullParser.END_DOCUMENT);
+        }
+
+        private static void skipSubtree(XmlPullParser parser) throws Exception {
+            int depth = 1;
+            while (depth > 0) {
+                int ev = parser.next();
+                if (ev == XmlPullParser.END_DOCUMENT) {
+                    break;
+                } else if (ev == XmlPullParser.START_TAG) {
+                    depth++;
+                } else if (ev == XmlPullParser.END_TAG) {
+                    depth--;
+                }
+            }
         }
 
         private String leaf() {
             return path.get(path.size() - 1);
         }
 
-        /** The element the current one sits inside. */
         private String parent() {
             return path.size() < 2 ? "" : path.get(path.size() - 2);
         }
 
-        /** True when the element or any of its ancestors has this name. */
         private boolean has(String name) {
             return path.contains(name);
         }
@@ -410,7 +407,7 @@ final class TxcTimetable {
                 case "RunTime":
                     if (has("JourneyPatternTimingLink")) {
                         linkSeconds += parseDuration(value);
-                    } else if (has("VehicleJourneyTimingLink")) {
+                    } else if (journey != null && has("VehicleJourneyTimingLink")) {
                         journey.addOverride(overrideLinkId, parseDuration(value));
                     }
                     break;
@@ -480,6 +477,16 @@ final class TxcTimetable {
                         serviceValid.put(service, new String[] { serviceStart, serviceEnd });
                     }
                     break;
+                case "VehicleJourneyCode":
+                    if (journey != null && "VehicleJourney".equals(parent())) {
+                        journey.code = value;
+                    }
+                    break;
+                case "VehicleJourneyRef":
+                    if (journey != null && "VehicleJourney".equals(parent())) {
+                        journey.vehicleJourneyRef = value;
+                    }
+                    break;
                 case "ServiceRef":
                     if (journey != null && "VehicleJourney".equals(parent())) {
                         journey.serviceRef = value;
@@ -506,8 +513,13 @@ final class TxcTimetable {
                     }
                     break;
                 case "VehicleJourney":
-                    if (journey != null && journey.isUsable()) {
-                        journeys.add(journey);
+                    if (journey != null) {
+                        if (!journey.code.isEmpty()) {
+                            journeysByCode.put(journey.code, journey);
+                        }
+                        if (journey.hasDepartureTime()) {
+                            journeys.add(journey);
+                        }
                     }
                     journey = null;
                     break;
@@ -517,9 +529,9 @@ final class TxcTimetable {
             }
         }
 
-        /** Day rules appear as elements, not text: {@code <DaysOfWeek><MondayToFriday/></DaysOfWeek>}. */
         private void applyDayName() {
-            if (!"DaysOfWeek".equals(parent())) {
+            if (!"DaysOfWeek".equals(parent()) || has("NonOperation")
+                    || has("DaysOfNonOperation")) {
                 return;
             }
             int mask = maskForDayName(leaf());
@@ -554,7 +566,7 @@ final class TxcTimetable {
                     seconds.add(link.seconds);
                 }
             }
-            int index = stops.indexOf(targetStop);
+            int index = indexOfStop(stops, targetStop);
             if (index < 0 || stops.size() != linkIds.size() + 1) {
                 return;
             }
@@ -566,7 +578,43 @@ final class TxcTimetable {
                     linkIds.toArray(new String[0]), runSeconds, destination));
         }
 
-        /** The times this journey gives each stop of its pattern, in pattern order. */
+        private static int indexOfStop(List<String> stops, String target) {
+            for (int i = 0; i < stops.size(); i++) {
+                if (stops.get(i).equalsIgnoreCase(target)) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        /** Resolves inherited fields when a VehicleJourney references another via VehicleJourneyRef. */
+        private void resolveInheritedFields(Journey j) {
+            int hops = 0;
+            Journey parent = j;
+            while ((j.journeyPatternRef.isEmpty() || j.serviceRef.isEmpty()
+                    || j.lineRef.isEmpty() || j.daysMask == 0)
+                    && !parent.vehicleJourneyRef.isEmpty() && hops < 8) {
+                Journey next = journeysByCode.get(parent.vehicleJourneyRef);
+                if (next == null || next == parent) {
+                    break;
+                }
+                if (j.journeyPatternRef.isEmpty()) {
+                    j.journeyPatternRef = next.journeyPatternRef;
+                }
+                if (j.serviceRef.isEmpty()) {
+                    j.serviceRef = next.serviceRef;
+                }
+                if (j.lineRef.isEmpty()) {
+                    j.lineRef = next.lineRef;
+                }
+                if (j.daysMask == 0) {
+                    j.daysMask = next.daysMask;
+                }
+                parent = next;
+                hops++;
+            }
+        }
+
         private List<Departure> timesAlong(Journey journey, Pattern pattern) {
             String[] valid = serviceValid.get(journey.serviceRef);
             int days = journey.daysMask != 0
@@ -579,7 +627,6 @@ final class TxcTimetable {
 
             List<Departure> times = new ArrayList<>();
             int seconds = journey.departureSeconds;
-            // The last stop of a pattern is where the bus ends up, not a departure from it.
             for (int i = 0; i < pattern.stopRefs.length - 1; i++) {
                 if (i > 0) {
                     int run = pattern.linkSeconds[i - 1];
@@ -600,6 +647,10 @@ final class TxcTimetable {
         List<Departure> departures() {
             List<Departure> result = new ArrayList<>();
             for (Journey journey : journeys) {
+                resolveInheritedFields(journey);
+                if (journey.journeyPatternRef.isEmpty()) {
+                    continue;
+                }
                 Pattern pattern = patterns.get(journey.journeyPatternRef);
                 if (pattern == null) {
                     continue;
@@ -615,7 +666,6 @@ final class TxcTimetable {
             }
             return result;
         }
-
 
         private static int maskOrDefault(Integer mask) {
             return mask == null || mask == 0 ? ALL_DAYS : mask;
@@ -636,7 +686,6 @@ final class TxcTimetable {
         return second == null ? "" : second;
     }
 
-    /** {@code Brigg__Cary_Lane} reads as "Brigg, Cary Lane" in the published data. */
     private static String tidy(String value) {
         return value == null ? "" : value.replace("__", ", ").replace('_', ' ').trim();
     }

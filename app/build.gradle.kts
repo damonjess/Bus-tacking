@@ -54,7 +54,6 @@ android {
 
 dependencies {
     implementation("com.google.android.material:material:1.12.0")
-    implementation("com.google.ar:core:1.48.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("org.osmdroid:osmdroid-android:6.1.20")
     implementation("androidx.camera:camera-core:1.3.4")
