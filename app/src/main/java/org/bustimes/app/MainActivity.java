@@ -476,7 +476,11 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         } catch (IllegalArgumentException ignored) {
             // not registered
         }
-        if (!ArrivalAlertStore.hasAlerts(this)) {
+        if (ArrivalAlertStore.hasAlerts(this)) {
+            Intent pauseMap = new Intent(this, BusTrackingService.class);
+            pauseMap.setAction(BusTrackingService.ACTION_STOP_MAP_TRACKING);
+            startService(pauseMap);
+        } else {
             stopService(new Intent(this, BusTrackingService.class));
         }
         try {
@@ -2516,6 +2520,76 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
                 searchResults.addView(note("No matching stops in the area loaded around the map."));
             }
         }
+
+        if (q.length() >= 3) {
+            searchResults.addView(sectionTitle("Places & postcodes"));
+            List<PlaceSearch.Place> cachedPlaces = PlaceSearch.cached(q);
+            if (cachedPlaces != null) {
+                if (cachedPlaces.isEmpty()) {
+                    searchResults.addView(note("No matching UK places found."));
+                } else {
+                    for (PlaceSearch.Place place : cachedPlaces) {
+                        searchResults.addView(placeRow(place));
+                    }
+                }
+            } else {
+                TextView findBtn = UiTheme.pillText(this, "Find \"" + searchInput.getText().toString().trim()
+                        + "\" across the UK", UiTheme.INK, UiTheme.CYAN, UiTheme.CYAN);
+                findBtn.setOnClickListener(v -> {
+                    findBtn.setText("Searching\u2026");
+                    final String queryText = q;
+                    io.execute(() -> {
+                        try {
+                            PlaceSearch.search(queryText);
+                            handler.post(this::rebuildSearch);
+                        } catch (Exception e) {
+                            handler.post(() -> Toast.makeText(this,
+                                    "Couldn't search places right now", Toast.LENGTH_SHORT).show());
+                        }
+                    });
+                });
+                LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                btnLp.bottomMargin = dp(12);
+                searchResults.addView(findBtn, btnLp);
+            }
+        }
+    }
+
+    private View placeRow(PlaceSearch.Place place) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setBackground(UiTheme.ripple(UiTheme.pill(this, UiTheme.INK_LIGHT, Color.parseColor("#24304F"), 1f, 16)));
+        row.setPadding(dp(12), dp(12), dp(12), dp(12));
+        IconView icon = new IconView(this, IconView.TARGET);
+        icon.setIconColor(UiTheme.CYAN);
+        icon.setAccentColor(UiTheme.CYAN);
+        row.addView(icon, new LinearLayout.LayoutParams(dp(26), dp(26)));
+        LinearLayout middle = new LinearLayout(this);
+        middle.setOrientation(LinearLayout.VERTICAL);
+        middle.setPadding(dp(12), 0, dp(8), 0);
+        middle.addView(tv(place.title, 15, UiTheme.WHITE, true));
+        if (!place.subtitle.isEmpty()) {
+            TextView sub = tv(place.subtitle, 12, UiTheme.TEXT_DIM, false);
+            sub.setMaxLines(2);
+            sub.setEllipsize(TextUtils.TruncateAt.END);
+            middle.addView(sub);
+        }
+        row.addView(middle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        row.setOnClickListener(v -> {
+            stopFollowing();
+            setTab(TAB_MAP);
+            map.getController().setZoom(15.5);
+            map.getController().animateTo(new GeoPoint(place.latitude, place.longitude));
+            maybeFetchStops(place.latitude, place.longitude, true);
+            handler.postDelayed(this::refreshFeedForViewport, 350);
+        });
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = dp(10);
+        row.setLayoutParams(lp);
+        return row;
     }
 
     private Set<String> favorites() {

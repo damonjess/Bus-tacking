@@ -2,7 +2,9 @@ package org.bustimes.app;
 
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
 import android.net.Uri;
+import android.os.Build;
 import android.os.IBinder;
 import android.text.TextUtils;
 import android.util.JsonReader;
@@ -29,14 +31,13 @@ import java.util.zip.ZipInputStream;
 public class BusTrackingService extends Service {
     static final String ACTION_BUS_POSITION = "org.bustimes.app.action.BUS_POSITION";
     static final String ACTION_TRACKING_STATUS = "org.bustimes.app.action.TRACKING_STATUS";
-    /** Sent once a full vehicle snapshot has been broadcast, so the map can sweep what it lost. */
     static final String ACTION_POLL_COMPLETE = "org.bustimes.app.action.POLL_COMPLETE";
     static final String ACTION_REFRESH_NOW = "org.bustimes.app.action.REFRESH_NOW";
     static final String ACTION_START_MAP_TRACKING = "org.bustimes.app.action.START_MAP_TRACKING";
     static final String ACTION_STOP_MAP_TRACKING = "org.bustimes.app.action.STOP_MAP_TRACKING";
+    static final String ACTION_DISARM_ALL_ALERTS = "org.bustimes.app.action.DISARM_ALL_ALERTS";
     public static final String ACTION_CLEAR_TRACKING = "org.bustimes.app.CLEAR_TRACKING";
     public static final String EXTRA_BOUNDING_BOX = "bounding_box";
-    /** Fallback when neither the map nor BuildConfig supplies a box (covers Scunthorpe–Humber). */
     public static final String DEFAULT_BOUNDING_BOX = "-0.8500,53.4800,-0.4000,53.7500";
     static final String EXTRA_STATUS_MESSAGE = "status_message";
 
@@ -48,8 +49,8 @@ public class BusTrackingService extends Service {
     private ScheduledExecutorService executorService;
     private ScheduledFuture<?> pollingFuture;
     private boolean mapActive;
+    private boolean inForeground;
     private volatile String activeBoundingBox;
-    /** Vehicles seen in the poll currently being parsed, used to check armed arrival alerts. */
     private final List<BusPosition> pollBuffer = new ArrayList<>();
     private int staleHidden;
 
@@ -63,6 +64,16 @@ public class BusTrackingService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? ACTION_START_MAP_TRACKING : intent.getAction();
 
+        if (ACTION_DISARM_ALL_ALERTS.equals(action)) {
+            ArrivalAlertStore.clear(this);
+            syncForegroundState();
+            if (!mapActive) {
+                stopPolling();
+                stopSelf();
+            }
+            return START_NOT_STICKY;
+        }
+
         if (intent != null && intent.hasExtra(EXTRA_BOUNDING_BOX)) {
             String bbox = intent.getStringExtra(EXTRA_BOUNDING_BOX);
             if (!TextUtils.isEmpty(bbox)) {
@@ -72,9 +83,14 @@ public class BusTrackingService extends Service {
 
         if (ACTION_STOP_MAP_TRACKING.equals(action)) {
             mapActive = false;
-            stopPolling();
-            stopSelf();
-            return START_NOT_STICKY;
+            if (!ArrivalAlertStore.hasAlerts(this)) {
+                syncForegroundState();
+                stopPolling();
+                stopSelf();
+                return START_NOT_STICKY;
+            }
+            syncForegroundState();
+            return START_STICKY;
         }
 
         if (TextUtils.isEmpty(BuildConfig.BODS_API_KEY)) {
@@ -83,15 +99,40 @@ public class BusTrackingService extends Service {
         }
 
         if (ACTION_REFRESH_NOW.equals(action)) {
-            if (mapActive) {
+            syncForegroundState();
+            if (mapActive || ArrivalAlertStore.hasAlerts(this)) {
                 executorService.execute(this::pollBodsVehicleLocations);
             }
             return START_NOT_STICKY;
         }
 
         mapActive = true;
+        syncForegroundState();
         startPolling();
         return START_STICKY;
+    }
+
+    /** Promotes or demotes the service depending on whether arrival alerts are currently armed. */
+    private void syncForegroundState() {
+        List<ArrivalAlert> alerts = ArrivalAlertStore.load(this);
+        if (!alerts.isEmpty() && AlertNotifier.canPost(this)) {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    startForeground(AlertNotifier.WATCH_NOTIFICATION_ID,
+                            AlertNotifier.buildWatchNotification(this, alerts),
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+                } else {
+                    startForeground(AlertNotifier.WATCH_NOTIFICATION_ID,
+                            AlertNotifier.buildWatchNotification(this, alerts));
+                }
+                inForeground = true;
+            } catch (Exception e) {
+                Log.w(TAG, "Could not promote to foreground service", e);
+            }
+        } else if (inForeground) {
+            stopForeground(true);
+            inForeground = false;
+        }
     }
 
     private void startPolling() {
@@ -171,9 +212,9 @@ public class BusTrackingService extends Service {
                         ? String.format(Locale.UK, " (%d old reports hidden)", staleHidden) : "";
                 broadcastStatus(String.format(Locale.UK, "Updated %d BODS vehicle positions%s", count, hidden));
             }
-            // armed arrival alerts are checked against this poll, even with the map off screen
             ArrivalAlerts.evaluate(this, ArrivalAlerts.candidatesFromPositions(new ArrayList<>(pollBuffer)));
             broadcastPollComplete();
+            handler.post(this::checkIfStillNeededAfterPoll);
         } catch (Exception exception) {
             Log.w(TAG, "Stream processing error", exception);
             broadcastStatus("BODS sync failed: " + exception.getMessage());
@@ -184,13 +225,20 @@ public class BusTrackingService extends Service {
         }
     }
 
+    private final android.os.Handler handler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+
+    private void checkIfStillNeededAfterPoll() {
+        syncForegroundState();
+        if (!mapActive && !ArrivalAlertStore.hasAlerts(this)) {
+            stopPolling();
+            stopSelf();
+        }
+    }
+
     private String buildBodsUrl() {
         Uri.Builder builder = Uri.parse(BuildConfig.BODS_API_BASE_URL).buildUpon()
                 .appendQueryParameter("api_key", BuildConfig.BODS_API_KEY);
-        // Prefer the live map viewport (or AR bbox) so panning/zooming actually expands the feed.
-        // BuildConfig is only a static override / CI default; an empty value means "follow the map".
-        // A zero-size box (map measured too early) is ignored rather than asked for, because the
-        // feed answers it with nothing and every marker would disappear.
         String bbox = activeBoundingBox;
         if (!BoundingBoxes.isUsable(bbox)) {
             bbox = BuildConfig.BODS_BOUNDING_BOX;
@@ -198,7 +246,6 @@ public class BusTrackingService extends Service {
         if (!BoundingBoxes.isUsable(bbox)) {
             bbox = DEFAULT_BOUNDING_BOX;
         }
-        // keep the vehicles that can fire an armed alert in the feed, wherever they are
         bbox = ArrivalAlertStore.expandBoundingBox(this, bbox);
         builder.appendQueryParameter("boundingBox", bbox);
         return builder.build().toString();
