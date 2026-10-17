@@ -35,13 +35,21 @@ final class StopFavorites {
         final long osmId;
         final String name;
         final String routes;
+        /** NaPTAN ATCO code, kept so a saved stop can still look its timetable up later. */
+        final String atcoCode;
         final double latitude;
         final double longitude;
 
         FavoriteStop(long osmId, String name, String routes, double latitude, double longitude) {
+            this(osmId, name, routes, "", latitude, longitude);
+        }
+
+        FavoriteStop(long osmId, String name, String routes, String atcoCode,
+                double latitude, double longitude) {
             this.osmId = osmId;
             this.name = name == null ? "" : name;
             this.routes = routes == null ? "" : routes;
+            this.atcoCode = atcoCode == null ? "" : atcoCode;
             this.latitude = latitude;
             this.longitude = longitude;
         }
@@ -56,6 +64,7 @@ final class StopFavorites {
             json.put("id", osmId);
             json.put("name", name);
             json.put("routes", routes);
+            json.put("atco", atcoCode);
             json.put("lat", latitude);
             json.put("lon", longitude);
             return json;
@@ -63,7 +72,7 @@ final class StopFavorites {
 
         static FavoriteStop fromJson(JSONObject json) {
             return new FavoriteStop(json.optLong("id", 0L), json.optString("name", ""),
-                    json.optString("routes", ""),
+                    json.optString("routes", ""), json.optString("atco", ""),
                     json.optDouble("lat", 0d), json.optDouble("lon", 0d));
         }
     }

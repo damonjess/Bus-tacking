@@ -120,8 +120,6 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     private static final int REQ_LOCATION = 41;
     private static final int REQ_NOTIFICATIONS = 42;
 
-    /** How long a bus marker takes to glide between two BODS polls. */
-    private static final long GLIDE_DURATION_MS = 2500L;
     /** Below this the vehicle is stationary; above it the vehicle was re-reported elsewhere. */
     private static final double GLIDE_SNAP_METERS = 5000d;
     private static final double GLIDE_MIN_METERS = 3d;
@@ -134,6 +132,8 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         BusPosition pos;
         long receivedMs;
         float speedKph = Float.NaN;
+        /** Gap between the last two fixes the feed published, or 0 when it is not known. */
+        long fixIntervalMs;
         Marker marker;
         /** Runs while the marker slides from its previous poll position to the latest one. */
         ValueAnimator glide;
@@ -144,6 +144,8 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         long id;
         String name;
         String routes;
+        /** NaPTAN ATCO code from OpenStreetMap, which is how a published timetable is found. */
+        String atcoCode = "";
         double lat;
         double lon;
         Marker marker;
@@ -158,6 +160,8 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+    /** True while a redraw is already queued for the next animation frame. */
+    private boolean mapInvalidatePosted;
 
     private SharedPreferences prefs;
     private LocationManager locationManager;
@@ -217,6 +221,13 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     private TextView stopBoardTitle;
     private TextView stopBoardNote;
     private Stop stopBoardStop;
+
+    // published timetable state for the open stop sheet
+    private LinearLayout stopTimetableRows;
+    private TextView stopTimetableNote;
+    private TextView stopTimetableButton;
+    private List<TxcTimetable.Departure> stopTimetableAll;
+    private boolean stopTimetableLoading;
 
     private final Runnable stopFetchRunnable = () -> {
         if (map == null) return;
@@ -937,12 +948,17 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         if (bus == null) {
             bus = new Bus();
             buses.put(id, bus);
-        } else if (bus.pos != null) {
+        }        else if (bus.pos != null) {
             // Measure against the feed's own timestamps: roughly half the fleet repeats its previous
             // fix between two of our polls, so the poll interval is the wrong denominator.
             bus.speedKph = VehicleSpeed.estimate(
                     bus.pos.latitude, bus.pos.longitude, ArrivalAlerts.parseIso(bus.pos.recordedAt),
                     lat, lon, ArrivalAlerts.parseIso(pos.recordedAt), bus.speedKph, now);
+            long previousRecorded = FixAge.parse(bus.pos.recordedAt);
+            long recorded = FixAge.parse(pos.recordedAt);
+            bus.fixIntervalMs = previousRecorded > 0 && recorded > previousRecorded
+                    ? recorded - previousRecorded
+                    : Math.max(0L, now - bus.receivedMs);
         }
         bus.pos = pos;
         bus.receivedMs = now;
@@ -971,9 +987,11 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
      *
      * BODS reports a position every 15 seconds, so the marker is lerped across the whole
      * interval with a ValueAnimator, which keeps the vehicle moving along the road at roughly the
-     * speed the vehicle is really travelling. A brand new marker or a stationary vehicle is placed
-     * directly, and a fix that leaps kilometres (bad GPS, a re-positioned vehicle) is snapped rather
-     * than slid across the map: neither has anything sensible to glide from.
+     * speed the vehicle is really travelling. The duration comes from that speed (see
+     * {@link MarkerGlide}) rather than a fixed span, so the marker keeps moving between fixes
+     * instead of performing a short burst and then standing still. A brand new marker or a stationary
+     * vehicle is placed directly, and a fix that leaps kilometres (bad GPS, a re-positioned vehicle)
+     * is snapped rather than slid across the map: neither has anything sensible to glide from.
      */
     private void glideMarkerTo(Bus bus, double lat, double lon, boolean firstFix) {
         if (bus.marker == null || map == null) {
@@ -993,17 +1011,38 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             return;
         }
         ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
-        animator.setDuration(GLIDE_DURATION_MS);
+        animator.setDuration(MarkerGlide.durationMs(distance, bus.speedKph, bus.fixIntervalMs));
+        // Constant speed, not ease in/out: a new fix restarts the glide from wherever the marker has
+        // got to, and easing at every restart makes the marker pulse instead of run.
         animator.setInterpolator(new LinearInterpolator());
         animator.addUpdateListener(animation -> {
             float t = (float) animation.getAnimatedValue();
             bus.marker.setPosition(new GeoPoint(
                     fromLat + (lat - fromLat) * t,
                     fromLon + (lon - fromLon) * t));
-            map.invalidate();
+            invalidateMapForAnimation();
         });
         bus.glide = animator;
         animator.start();
+    }
+
+    /**
+     * One redraw per frame, however many markers are gliding.
+     *
+     * Every glide used to call {@code map.invalidate()} from its own update listener, so a dozen
+     * moving buses queued a dozen redraws into the same frame and the map did that work repeatedly.
+     */
+    private void invalidateMapForAnimation() {
+        if (map == null || mapInvalidatePosted) {
+            return;
+        }
+        mapInvalidatePosted = true;
+        map.postOnAnimation(() -> {
+            mapInvalidatePosted = false;
+            if (map != null) {
+                map.invalidate();
+            }
+        });
     }
 
     private void cancelGlide(Bus bus) {
@@ -1554,7 +1593,9 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
     private static final long STOP_CACHE_TTL_MS = 24L * 60 * 60 * 1000; // 24 hours
 
     private static String stopCacheKey(double lat, double lon) {
-        return String.format(Locale.UK, "%.2f_%.2f", Math.round(lat * 100) / 100.0, Math.round(lon * 100) / 100.0);
+        // The version suffix retires caches written before stops carried their NaPTAN code: a stop
+        // without one cannot have its timetable looked up, so those lists are worth re-fetching.
+        return String.format(Locale.UK, "%.2f_%.2f-v2", Math.round(lat * 100) / 100.0, Math.round(lon * 100) / 100.0);
     }
 
     private List<Stop> loadStops(double lat, double lon) throws Exception {
@@ -1586,6 +1627,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
                     stop.name = "Bus stop";
                 }
                 stop.routes = tags == null ? "" : tags.optString("route_ref", "").replace(";", ", ");
+                stop.atcoCode = atcoCodeOf(tags);
                 result.add(stop);
             }
         }
@@ -1626,6 +1668,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
                 stop.lon = obj.getDouble("lon");
                 stop.name = obj.optString("name", "");
                 stop.routes = obj.optString("routes", "");
+                stop.atcoCode = obj.optString("atco", "");
                 result.add(stop);
             }
             return result;
@@ -1648,6 +1691,7 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
                 obj.put("lon", stop.lon);
                 obj.put("name", stop.name);
                 obj.put("routes", stop.routes);
+                obj.put("atco", stop.atcoCode);
                 array.put(obj);
             }
             try (OutputStream out = new FileOutputStream(file)) {
@@ -1769,6 +1813,28 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         stopBoardNote.setPadding(0, dp(6), 0, 0);
         card.addView(stopBoardNote);
 
+        TextView timetableTitle = tv("Timetable", 13, UiTheme.TEXT_DIM, false);
+        timetableTitle.setPadding(0, dp(18), 0, dp(6));
+        card.addView(timetableTitle);
+
+        stopTimetableRows = new LinearLayout(this);
+        stopTimetableRows.setOrientation(LinearLayout.VERTICAL);
+        card.addView(stopTimetableRows);
+
+        // The button lives with the times rather than in the action row, which already runs off the
+        // side of a phone screen with three pills in it.
+        stopTimetableButton = UiTheme.pillText(this, "Load timetable", UiTheme.WHITE,
+                UiTheme.INK_LIGHT, UiTheme.CYAN);
+        stopTimetableButton.setOnClickListener(v -> loadStopTimetable(stop));
+        LinearLayout.LayoutParams timetableButtonLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        timetableButtonLp.topMargin = dp(10);
+        card.addView(stopTimetableButton, timetableButtonLp);
+
+        stopTimetableNote = tv("", 12, UiTheme.TEXT_DIM, false);
+        stopTimetableNote.setPadding(0, dp(6), 0, 0);
+        card.addView(stopTimetableNote);
+
         final BottomSheetDialog dialog = sheetDialog(card);
 
         LinearLayout actions = new LinearLayout(this);
@@ -1808,9 +1874,165 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
             stopBoardRows = null;
             stopBoardTitle = null;
             stopBoardNote = null;
+            stopTimetableRows = null;
+            stopTimetableNote = null;
+            stopTimetableButton = null;
+            stopTimetableAll = null;
         });
         renderStopBoard();
+        showCachedTimetable(stop);
         dialog.show();
+    }
+
+    /**
+     * Routes a timetable lookup should ask about: the stop's own list, the routes running at it, and
+     * the routes running anywhere the map can see. Without any of these the lookup has to open every
+     * timetable published for the area, which is much slower.
+     */
+    private List<String> timetableRoutes(Stop stop) {
+        List<String> routes = new ArrayList<>();
+        for (String route : stop.routes.split(",")) {
+            addRoute(routes, route);
+        }
+        for (String route : routesAtStop(stop)) {
+            addRoute(routes, route);
+        }
+        for (Bus bus : buses.values()) {
+            if (bus.pos != null) {
+                addRoute(routes, bus.pos.lineName);
+            }
+        }
+        return routes;
+    }
+
+    private static void addRoute(List<String> routes, String route) {
+        String trimmed = route == null ? "" : route.trim();
+        if (!trimmed.isEmpty() && !routes.contains(trimmed)) {
+            routes.add(trimmed);
+        }
+    }
+
+    /**
+     * Shows the stop's timetable when it is already cached.
+     *
+     * Fetching one is left to the user, because a single operator's timetable can run to tens of
+     * megabytes: opening a stop must not start that download on its own.
+     */
+    private void showCachedTimetable(Stop stop) {
+        if (stopTimetableRows == null || stopTimetableNote == null) {
+            return;
+        }
+        stopTimetableRows.removeAllViews();
+        stopTimetableAll = null;
+        if (TextUtils.isEmpty(stop.atcoCode)) {
+            stopTimetableNote.setText("OpenStreetMap has no NaPTAN code for this stop, so there is no "
+                    + "published timetable to look up.");
+            return;
+        }
+        stopTimetableAll = StopTimetables.cached(this, stop.atcoCode);
+        if (stopTimetableAll == null) {
+            stopTimetableButton.setText("Load timetable");
+            stopTimetableNote.setText("Times registered by the operators for this stop.");
+            return;
+        }
+        stopTimetableButton.setText("Refresh");
+        renderStopTimetable();
+    }
+
+    /** Fetches the stop's published timetable in the background, showing how the download is going. */
+    private void loadStopTimetable(Stop stop) {
+        if (stopTimetableLoading) {
+            return;
+        }
+        if (TextUtils.isEmpty(stop.atcoCode)) {
+            showCachedTimetable(stop);
+            return;
+        }
+        stopTimetableLoading = true;
+        if (stopTimetableButton != null) {
+            stopTimetableButton.setText("Loading\u2026");
+        }
+        if (stopTimetableButton == null && stopTimetableNote == null) {
+            return;
+        }
+        if (stopTimetableNote != null) {
+            stopTimetableNote.setText("Finding published timetables\u2026");
+        }
+        final String atcoCode = stop.atcoCode;
+        final List<String> routes = timetableRoutes(stop);
+        io.execute(() -> {
+            try {
+                final List<TxcTimetable.Departure> departures = StopTimetables.departures(this,
+                        atcoCode, routes, message -> handler.post(() -> {
+                            if (stopTimetableNote != null) {
+                                stopTimetableNote.setText(message);
+                            }
+                        }));
+                handler.post(() -> {
+                    stopTimetableLoading = false;
+                    if (stopTimetableButton != null) {
+                        stopTimetableButton.setText("Refresh");
+                    }
+                    if (stopTimetableRows == null) {
+                        return;
+                    }
+                    stopTimetableAll = departures;
+                    renderStopTimetable();
+                });
+            } catch (final Exception e) {
+                handler.post(() -> {
+                    stopTimetableLoading = false;
+                    if (stopTimetableButton != null) {
+                        stopTimetableButton.setText("Load timetable");
+                    }
+                    if (stopTimetableNote != null) {
+                        stopTimetableNote.setText(e.getMessage() == null
+                                ? "Could not load the timetable." : e.getMessage());
+                    }
+                });
+            }
+        });
+    }
+
+    /** The next scheduled departures from whatever timetable has been loaded for the stop. */
+    private void renderStopTimetable() {
+        if (stopTimetableRows == null || stopTimetableAll == null || stopTimetableLoading) {
+            return;
+        }
+        stopTimetableRows.removeAllViews();
+        List<TxcTimetable.Departure> today =
+                StopTimetables.today(stopTimetableAll, System.currentTimeMillis());
+        if (today.isEmpty()) {
+            if (stopTimetableNote != null) {
+                stopTimetableNote.setText("No more scheduled departures today.");
+            }
+            return;
+        }
+        for (TxcTimetable.Departure departure : today) {
+            stopTimetableRows.addView(timetableRow(departure));
+        }
+        if (stopTimetableNote != null) {
+            stopTimetableNote.setText("Scheduled times from the operators' published timetables"
+                    + (today.size() == StopTimetables.MAX_ROWS ? ", next " + today.size() : "") + ".");
+        }
+    }
+
+    private View timetableRow(TxcTimetable.Departure departure) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(6), 0, dp(6));
+
+        row.addView(tv(departure.clock(), 15, UiTheme.CYAN, true));
+
+        TextView line = tv(departure.line, 13, UiTheme.WHITE, true);
+        line.setPadding(dp(14), 0, dp(14), 0);
+        row.addView(line);
+
+        row.addView(tv(departure.destination.isEmpty() ? "\u2014" : departure.destination,
+                13, UiTheme.TEXT_DIM, false),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        return row;
     }
 
     /** The live fleet as the departure board sees it. */
@@ -1838,6 +2060,8 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         Stop stop = stopBoardStop;
         stopBoardRows.removeAllViews();
         stopBoardNote.setText("");
+        // keep the scheduled times honest as the clock moves on
+        renderStopTimetable();
 
         List<StopDepartures.Vehicle> vehicles = liveVehicles();
         List<StopDepartures.Departure> board =
@@ -2204,9 +2428,28 @@ public class MainActivity extends AppCompatActivity implements BusDetailsSheet.C
         stop.id = saved.osmId;
         stop.name = saved.name;
         stop.routes = saved.routes;
+        stop.atcoCode = saved.atcoCode;
         stop.lat = saved.latitude;
         stop.lon = saved.longitude;
         return stop;
+    }
+
+    /**
+     * The stop's NaPTAN reference. OpenStreetMap carries it as {@code naptan:AtcoCode}, which is the
+     * same string the published timetables key their stop times by, so no name matching is needed.
+     */
+    private static String atcoCodeOf(JSONObject tags) {
+        if (tags == null) {
+            return "";
+        }
+        String[] keys = { "naptan:AtcoCode", "naptan:ATCOCode", "naptan:atco_code", "naptan:Atco" };
+        for (String key : keys) {
+            String value = tags.optString(key, "").trim();
+            if (!value.isEmpty()) {
+                return value;
+            }
+        }
+        return "";
     }
 
     private void rebuildAccount() {

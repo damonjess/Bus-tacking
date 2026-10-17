@@ -1,5 +1,31 @@
 # Native rewrite (no WebView, no bustimes.org)
 
+## 2026-10: stop timetables, and bus markers that keep moving
+
+**Timetable in the stop card.** The live feed (SIRI-VM) has no timetable at all, so scheduled times
+come from the DfT Bus Open Data timetables, which are TransXChange documents published by operators.
+
+- `TxcTimetable` streams one TransXChange document and returns the times it gives one stop: journey
+  patterns, their run times, per-journey overrides, day-of-week rules and operating periods.
+- `BodsTimetables` lists the datasets for a stop's ATCO area and pulls the stop's times out of a
+  dataset, whether it is served as a zip of documents or a single XML file.
+- `StopTimetables` caches the result per stop for a week and picks the datasets worth trying: those
+  naming one of the stop's routes first, then the rest of the area's timetables smallest first, and
+  it stops as soon as the stop's times appear.
+- Tapping a stop now shows a **Timetable** section with today's next scheduled departures, plus a
+  **Load timetable** / **Refresh** button. Nothing is downloaded until that button is tapped, because
+  one operator's timetable can run to tens of megabytes; the download shows its own percentage.
+- Stops carry their NaPTAN `naptan:AtcoCode` from OpenStreetMap (cached lists bump to `-v2`, so an old
+  cache without the code is re-fetched once), and saved stops keep it too.
+
+**Smoother bus markers.** A marker used to slide for a fixed 2.5 s and then sit still until the next
+15-second poll, which read as a burst of movement followed by a jump.
+
+- `MarkerGlide` times the slide from the vehicle's own speed (falling back to the gap between the
+  last two published fixes), bounded to one feed interval, so a moving bus keeps moving.
+- All glides now share one redraw per animation frame instead of one each, which stops a dozen
+  moving markers queueing a dozen redraws into the same frame.
+
 ## 2026-10 fix: no bus markers when the map viewport was measured too early
 
 **Root cause:** the feed request followed the map viewport, but `MapView` reports a zero-size box until it
